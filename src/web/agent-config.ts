@@ -7,7 +7,11 @@ import { safeJoin } from './sanitize.js'
 
 export const AGENTS_BASE_DIR = join(PROJECT_ROOT, 'agents')
 
-export const DEFAULT_MODEL = 'claude-opus-4-8[1m]'
+const rawDefaultModel = typeof process.env.DEFAULT_MODEL === 'string' ? process.env.DEFAULT_MODEL.trim() : ''
+
+const DEFAULT_MODEL_FALLBACK = 'claude-haiku-4-5-20251001'
+
+export const DEFAULT_MODEL = rawDefaultModel || DEFAULT_MODEL_FALLBACK
 
 // Map short model names to full Claude model IDs (backwards compat with old configs)
 export const MODEL_ALIASES: Record<string, string> = {
