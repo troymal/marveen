@@ -49,7 +49,7 @@ describe('buildManifest brands the PWA manifest, default unchanged', () => {
   it('preserves every non-brand field', () => {
     const m = JSON.parse(buildManifest(raw, 'Marveen'))
     expect(m.description).toBe('AI fleet management dashboard')
-    expect(m.start_url).toBe('/')
+    expect(m.start_url).toBe('.')
     expect(m.icons).toHaveLength(2)
   })
 

@@ -44,8 +44,8 @@ function serveIndexHtml(ctx: RouteContext, webDir: string): void {
     }
     const html = readFileSync(filePath, 'utf-8')
       .replace(
-        /(<script\s+src=")\/app\.js(")/,
-        `$1/app.js?v=${appJsVersion(webDir)}$2`,
+        /(<script\s+src=")app\.js(")/,
+        `$1app.js?v=${appJsVersion(webDir)}$2`,
       )
       // Bake the iOS home-screen label into apple-mobile-web-app-title so an
       // installed PWA shows the configured main-agent name (BRAND_NAME), not the
@@ -90,7 +90,7 @@ export async function tryHandleStatic(ctx: RouteContext, webDir: string): Promis
     // Brand the manifest (name/short_name -> BRAND_NAME, byte-preserving for the
     // shipped default via buildManifest) and, when a main-agent avatar is stored,
     // repoint the install icons at the live avatar so the home-screen / PWA icon
-    // matches the browser favicon (<link rel="icon" href="/api/marveen/avatar">).
+    // matches the browser favicon (<link rel="icon" href="api/marveen/avatar">).
     // The declared icon MIME type is detected from the stored file -- Chrome drops
     // icons whose type lies. Falls back to the static manifest if anything fails.
     try {
@@ -102,8 +102,8 @@ export async function tryHandleStatic(ctx: RouteContext, webDir: string): Promis
       } else {
         const manifest = JSON.parse(branded)
         manifest.icons = [
-          { src: '/api/marveen/avatar', sizes: '192x192', type: avatarType, purpose: 'any' },
-          { src: '/api/marveen/avatar', sizes: '512x512', type: avatarType, purpose: 'any' },
+          { src: 'api/marveen/avatar', sizes: '192x192', type: avatarType, purpose: 'any' },
+          { src: 'api/marveen/avatar', sizes: '512x512', type: avatarType, purpose: 'any' },
         ]
         res.writeHead(200, { 'Content-Type': 'application/manifest+json', 'Cache-Control': 'no-cache' })
         res.end(JSON.stringify(manifest))

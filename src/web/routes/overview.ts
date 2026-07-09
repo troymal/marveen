@@ -130,7 +130,7 @@ export async function tryHandleOverview(ctx: RouteContext): Promise<boolean> {
       role: 'main',
       running: true,
       hasAvatar: mainHasAvatar,
-      avatarUrl: `/api/marveen/avatar`,
+      avatarUrl: `api/marveen/avatar`,
     })
     for (const a of subAgents) {
       const team = readAgentTeam(a)
@@ -140,7 +140,7 @@ export async function tryHandleOverview(ctx: RouteContext): Promise<boolean> {
         role: team.role,
         running: isAgentRunning(a),
         hasAvatar: existsSync(join(agentDir(a), 'avatar.png')),
-        avatarUrl: `/api/agents/${encodeURIComponent(a)}/avatar`,
+        avatarUrl: `api/agents/${encodeURIComponent(a)}/avatar`,
       })
     }
     json(res, {

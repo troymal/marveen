@@ -40,6 +40,6 @@ describe('Run now: REST route', () => {
 describe('Run now: dashboard button', () => {
   it('schedule row has a run action wired to the run endpoint', () => {
     expect(APP).toMatch(/data-action="run"/)
-    expect(APP).toMatch(/\/api\/schedules\/\$\{encodeURIComponent\(task\.name\)\}\/run/)
+    expect(APP).toMatch(/api\/schedules\/\$\{encodeURIComponent\(task\.name\)\}\/run/)
   })
 })

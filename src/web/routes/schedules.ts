@@ -26,8 +26,8 @@ export async function tryHandleSchedules(ctx: RouteContext): Promise<boolean> {
   if (path === '/api/schedules/agents' && method === 'GET') {
     const agentNames = listAgentNames()
     const agents = [
-      { name: MAIN_AGENT_ID, label: BOT_NAME, avatar: '/api/marveen/avatar' },
-      ...agentNames.map(n => ({ name: n, label: n, avatar: `/api/agents/${encodeURIComponent(n)}/avatar` }))
+      { name: MAIN_AGENT_ID, label: BOT_NAME, avatar: 'api/marveen/avatar' },
+      ...agentNames.map(n => ({ name: n, label: n, avatar: `api/agents/${encodeURIComponent(n)}/avatar` }))
     ]
     json(res, agents)
     return true

@@ -34,7 +34,7 @@
   applyLang(localStorage.getItem(LS_KEY) || 'hu')
 
   // Fetch server default (DASHBOARD_LANG) and apply only if localStorage not set.
-  fetch('/api/settings')
+  fetch('api/settings')
     .then(r => r.ok ? r.json() : null)
     .then(data => {
       if (!data || localStorage.getItem(LS_KEY)) return
@@ -97,9 +97,12 @@ function mainAgentId() {
   const originalFetch = window.fetch.bind(window)
   window.fetch = async (input, init) => {
     const url = typeof input === 'string' ? input : (input instanceof Request ? input.url : String(input))
-    // Only attach the token to same-origin API calls. Relative paths always
-    // resolve to same-origin; absolute URLs must match the current origin.
+    // Only attach the token to same-origin API calls. Document-relative paths
+    // (no leading slash -- required so the dashboard also works mounted under a
+    // reverse-proxy path prefix like /dashboard/) always resolve to same-origin;
+    // absolute URLs must match the current origin.
     const isSameOriginApi =
+      url.startsWith('api/') ||
       url.startsWith('/api/') ||
       (url.startsWith(window.location.origin + '/api/'))
     if (isSameOriginApi) {
@@ -545,7 +548,7 @@ function stopActivityPoll() {
 
 async function loadActivity() {
   try {
-    const res = await fetch('/api/agents/activity')
+    const res = await fetch('api/agents/activity')
     if (!res.ok) throw new Error('HTTP ' + res.status)
     const entries = await res.json()
     renderActivity(entries)
@@ -664,7 +667,7 @@ async function loadKanban() {
     // stay populated too. Also covers opening the Kanban page first, before the
     // Agents page populated window._marveen.
     try {
-      const mr = await fetch('/api/marveen')
+      const mr = await fetch('api/marveen')
       if (mr.ok) window._marveen = { ...(window._marveen || {}), ...(await mr.json()) }
     } catch { /* ignore -- aging/WIP/swimlanes/labels just won't render until _marveen loads */ }
     if (!kanbanGroupByInitialized) {
@@ -690,10 +693,10 @@ async function loadKanban() {
       } catch { /* ignore malformed storage */ }
     }
     const [cardsRes, assigneesRes, projectsRes, labelsRes] = await Promise.all([
-      fetch('/api/kanban'),
-      fetch('/api/kanban/assignees'),
-      fetch('/api/kanban-projects'),
-      fetch('/api/kanban/labels'),
+      fetch('api/kanban'),
+      fetch('api/kanban/assignees'),
+      fetch('api/kanban-projects'),
+      fetch('api/kanban/labels'),
     ])
     kanbanCards = await cardsRes.json()
     kanbanAssignees = await assigneesRes.json()
@@ -1335,7 +1338,7 @@ function wireKanbanColumnDnD(col) {
     let sortOrder = idx
 
     try {
-      await fetch(`/api/kanban/${encodeURIComponent(cardId)}/move`, {
+      await fetch(`api/kanban/${encodeURIComponent(cardId)}/move`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status: newStatus, sort_order: sortOrder }),
@@ -1412,7 +1415,7 @@ document.getElementById('saveCardBtn').addEventListener('click', async () => {
 
   try {
     if (editId) {
-      const res = await fetch(`/api/kanban/${encodeURIComponent(editId)}`, {
+      const res = await fetch(`api/kanban/${encodeURIComponent(editId)}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
@@ -1421,7 +1424,7 @@ document.getElementById('saveCardBtn').addEventListener('click', async () => {
       showToast(t('kanban.toast.card_updated'))
     } else {
       data.status = document.getElementById('cardEditStatus').value
-      const res = await fetch('/api/kanban', {
+      const res = await fetch('api/kanban', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
@@ -1452,7 +1455,7 @@ async function renderCardLabelsSection(card) {
 
   let attached = []
   try {
-    attached = await (await fetch(`/api/kanban/${encodeURIComponent(card.id)}/labels`)).json()
+    attached = await (await fetch(`api/kanban/${encodeURIComponent(card.id)}/labels`)).json()
   } catch { /* leave empty -- pill list just stays blank */ }
 
   listEl.innerHTML = ''
@@ -1463,7 +1466,7 @@ async function renderCardLabelsSection(card) {
     pill.innerHTML = `#${escapeHtml(label.name)} <button class="label-pill-remove" title="${t('kanban.label.remove_btn')}" aria-label="${t('kanban.label.remove_btn')}">&times;</button>`
     pill.querySelector('.label-pill-remove').addEventListener('click', async () => {
       try {
-        await fetch(`/api/kanban/${encodeURIComponent(card.id)}/labels/${encodeURIComponent(label.id)}`, { method: 'DELETE' })
+        await fetch(`api/kanban/${encodeURIComponent(card.id)}/labels/${encodeURIComponent(label.id)}`, { method: 'DELETE' })
         renderCardLabelsSection(card)
         loadKanban()
       } catch { showToast(t('kanban.toast.label_remove_error')) }
@@ -1484,7 +1487,7 @@ async function renderCardLabelsSection(card) {
     const labelId = addSelect.value
     if (!labelId) return
     try {
-      await fetch(`/api/kanban/${encodeURIComponent(card.id)}/labels`, {
+      await fetch(`api/kanban/${encodeURIComponent(card.id)}/labels`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ labelId }),
       })
@@ -1518,14 +1521,14 @@ async function renderCardLabelsSection(card) {
     const name = newNameInput.value.trim()
     if (!name) { newNameInput.focus(); return }
     try {
-      const r = await fetch('/api/kanban/labels', {
+      const r = await fetch('api/kanban/labels', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name, color: selectedColor }),
       })
       if (!r.ok) { showToast(t('kanban.toast.label_create_error')); return }
       const newLabel = await r.json()
       kanbanAllLabels.push(newLabel)
-      await fetch(`/api/kanban/${encodeURIComponent(card.id)}/labels`, {
+      await fetch(`api/kanban/${encodeURIComponent(card.id)}/labels`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ labelId: newLabel.id }),
       })
@@ -1606,7 +1609,7 @@ async function showCardDetail(card) {
         return
       }
       try {
-        const r = await fetch(`/api/kanban/${encodeURIComponent(card.id)}`, {
+        const r = await fetch(`api/kanban/${encodeURIComponent(card.id)}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ ...card, assignee: newVal }),
@@ -1656,7 +1659,7 @@ async function showCardDetail(card) {
     parentSelect.onchange = async () => {
       const newParentId = parentSelect.value || null
       const label = newParentId ? t('kanban.toast.parent_updated') : t('kanban.toast.parent_unset')
-      const r = await fetch(`/api/kanban/${encodeURIComponent(card.id)}`, {
+      const r = await fetch(`api/kanban/${encodeURIComponent(card.id)}`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...card, parent_id: newParentId }),
       })
@@ -1670,7 +1673,7 @@ async function showCardDetail(card) {
 
   // Load comments
   try {
-    const res = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/comments`)
+    const res = await fetch(`api/kanban/${encodeURIComponent(card.id)}/comments`)
     const comments = await res.json()
     const list = document.getElementById('commentsList')
     list.innerHTML = ''
@@ -1704,7 +1707,7 @@ async function showCardDetail(card) {
     if (!content) { document.getElementById('commentContent').focus(); return }
     if (!author) { showToast(t('kanban.toast.comment_no_author')); return }
     try {
-      const res = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/comments`, {
+      const res = await fetch(`api/kanban/${encodeURIComponent(card.id)}/comments`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ author, content }),
@@ -1745,7 +1748,7 @@ async function showCardDetail(card) {
   // Archive
   document.getElementById('cardArchiveBtn').onclick = async () => {
     try {
-      await fetch(`/api/kanban/${encodeURIComponent(card.id)}/archive`, { method: 'POST' })
+      await fetch(`api/kanban/${encodeURIComponent(card.id)}/archive`, { method: 'POST' })
       closeModal(cardDetailOverlay)
       showToast(t('kanban.toast.card_archived'))
       loadKanban()
@@ -1758,7 +1761,7 @@ async function showCardDetail(card) {
   document.getElementById('cardDeleteBtn').onclick = async () => {
     if (!confirm(t('kanban.confirm.delete'))) return
     try {
-      await fetch(`/api/kanban/${encodeURIComponent(card.id)}`, { method: 'DELETE' })
+      await fetch(`api/kanban/${encodeURIComponent(card.id)}`, { method: 'DELETE' })
       closeModal(cardDetailOverlay)
       showToast(t('kanban.toast.card_deleted'))
       loadKanban()
@@ -1769,7 +1772,7 @@ async function showCardDetail(card) {
 
   // Load children (subtasks) — only top-level tasks have children (no subtask of subtask)
   try {
-    const childRes = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/children`)
+    const childRes = await fetch(`api/kanban/${encodeURIComponent(card.id)}/children`)
     const children = await childRes.json()
     const section = document.getElementById('cardChildrenSection')
     const list = document.getElementById('cardChildrenList')
@@ -1785,7 +1788,7 @@ async function showCardDetail(card) {
         const title = titleInput.value.trim()
         if (!title) { titleInput.focus(); return }
         try {
-          const r = await fetch('/api/kanban', {
+          const r = await fetch('api/kanban', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ title, parent_id: card.id, status: card.status, priority: card.priority, project: card.project || null, assignee: null }),
           })
@@ -1824,7 +1827,7 @@ async function showCardDetail(card) {
             e.stopPropagation()
             if (!confirm(t('kanban.confirm.delete_subtask', { title: ch.title }))) return
             try {
-              const r = await fetch(`/api/kanban/${encodeURIComponent(ch.id)}`, { method: 'DELETE' })
+              const r = await fetch(`api/kanban/${encodeURIComponent(ch.id)}`, { method: 'DELETE' })
               if (!r.ok) { showToast(t('common.error_delete')); return }
               showToast(t('kanban.toast.subtask_deleted'))
               loadKanban()
@@ -1849,7 +1852,7 @@ async function showCardDetail(card) {
     btn.disabled = true
     btn.textContent = t('kanban.breakdown.generating')
     try {
-      const res = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/breakdown`, { method: 'POST' })
+      const res = await fetch(`api/kanban/${encodeURIComponent(card.id)}/breakdown`, { method: 'POST' })
       const data = await res.json()
       if (!res.ok) { showToast(data.error || 'Hiba'); btn.disabled = false; btn.textContent = 'Breakdown'; return }
       breakdownMode = 'kanban'
@@ -1873,7 +1876,7 @@ async function triggerBreakdown(card) {
   const btn = document.querySelector(`.kanban-card[data-id="${card.id}"] .card-breakdown-btn`)
   if (btn) { btn.disabled = true; btn.textContent = '...' }
   try {
-    const res = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/breakdown`, { method: 'POST' })
+    const res = await fetch(`api/kanban/${encodeURIComponent(card.id)}/breakdown`, { method: 'POST' })
     const data = await res.json()
     if (!res.ok) { showToast(data.error || 'Breakdown hiba'); return }
     breakdownMode = 'kanban'
@@ -1944,7 +1947,7 @@ document.getElementById('breakdownAcceptBtn').addEventListener('click', async ()
   try {
     if (breakdownMode === 'idea') {
       const successCriteria = document.getElementById('breakdownSuccessCriteria')?.value.trim() || undefined
-      const res = await fetch(`/api/ideas/${encodeURIComponent(breakdownIdeaId)}/promote-breakdown`, {
+      const res = await fetch(`api/ideas/${encodeURIComponent(breakdownIdeaId)}/promote-breakdown`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ subtasks: accepted, success_criteria: successCriteria }),
@@ -1956,7 +1959,7 @@ document.getElementById('breakdownAcceptBtn').addEventListener('click', async ()
       loadIdeasPage()
       return
     }
-    const res = await fetch(`/api/kanban/${encodeURIComponent(breakdownCardId)}/breakdown/accept`, {
+    const res = await fetch(`api/kanban/${encodeURIComponent(breakdownCardId)}/breakdown/accept`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ subtasks: accepted }),
@@ -2061,7 +2064,7 @@ function populateAvatarGrid() {
     const item = document.createElement('div')
     item.className = 'avatar-grid-item'
     item.dataset.avatar = avatar
-    item.innerHTML = `<img src="/avatars/${avatar}" alt="${avatar.replace(/^\d+_/, '').replace('.png', '')}">`
+    item.innerHTML = `<img src="avatars/${avatar}" alt="${avatar.replace(/^\d+_/, '').replace('.png', '')}">`
     item.addEventListener('click', () => {
       grid.querySelectorAll('.avatar-grid-item').forEach(i => i.classList.remove('selected'))
       item.classList.add('selected')
@@ -2079,7 +2082,7 @@ let cachedProfiles = null
 async function loadProfiles() {
   if (cachedProfiles) return cachedProfiles
   try {
-    const res = await fetch('/api/profiles')
+    const res = await fetch('api/profiles')
     if (res.ok) cachedProfiles = await res.json()
   } catch {}
   return cachedProfiles || []
@@ -2156,7 +2159,7 @@ document.getElementById('wizardNextBtn').addEventListener('click', async () => {
 
   try {
     // Create agent via API (returns generated content)
-    const res = await fetch('/api/agents', {
+    const res = await fetch('api/agents', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -2181,7 +2184,7 @@ document.getElementById('wizardNextBtn').addEventListener('click', async () => {
     statusEl.textContent = t('agents.soul_md_generating')
 
     // Fetch full agent details to get generated content
-    const detailRes = await fetch(`/api/agents/${encodeURIComponent(createdName)}`)
+    const detailRes = await fetch(`api/agents/${encodeURIComponent(createdName)}`)
     if (detailRes.ok) {
       const detail = await detailRes.json()
       generatedClaudeMd = detail.claudeMd || detail.content || ''
@@ -2195,12 +2198,12 @@ document.getElementById('wizardNextBtn').addEventListener('click', async () => {
     if (selectedAvatarFile) {
       const form = new FormData()
       form.append('avatar', selectedAvatarFile, selectedAvatarFile.name)
-      await fetch(`/api/agents/${encodeURIComponent(createdName)}/avatar`, {
+      await fetch(`api/agents/${encodeURIComponent(createdName)}/avatar`, {
         method: 'POST',
         body: form,
       })
     } else if (selectedAvatar) {
-      await fetch(`/api/agents/${encodeURIComponent(createdName)}/avatar`, {
+      await fetch(`api/agents/${encodeURIComponent(createdName)}/avatar`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ galleryAvatar: selectedAvatar }),
@@ -2242,7 +2245,7 @@ document.getElementById('wizardCreateBtn').addEventListener('click', async () =>
 
   try {
     // Update with edited content
-    const res = await fetch(`/api/agents/${encodeURIComponent(name)}`, {
+    const res = await fetch(`api/agents/${encodeURIComponent(name)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ claudeMd, soulMd }),
@@ -2282,8 +2285,8 @@ function showToast(msg, duration = 3000) {
 async function loadAgents() {
   try {
     const [agentsRes, marveenRes] = await Promise.all([
-      fetch('/api/agents'),
-      fetch('/api/marveen'),
+      fetch('api/agents'),
+      fetch('api/marveen'),
     ])
     agents = await agentsRes.json()
     if (marveenRes.ok) {
@@ -2361,7 +2364,7 @@ async function openMarveenDetail() {
   document.getElementById('agentDetailTitle').textContent = displayName
   const avatar = document.getElementById('agentDetailAvatar')
   avatar.className = 'detail-avatar gradient-1'
-  avatar.innerHTML = `<img src="/api/marveen/avatar?t=${Date.now()}" alt="${escapeHtml(displayName)}">`
+  avatar.innerHTML = `<img src="api/marveen/avatar?t=${Date.now()}" alt="${escapeHtml(displayName)}">`
   document.getElementById('agentDetailName').textContent = displayName
   document.getElementById('agentDetailDesc').textContent = m.description || ''
   document.getElementById('agentDetailModel').textContent = m.model || '-'
@@ -2393,7 +2396,7 @@ async function openMarveenDetail() {
   // Marveen on Telegram instead.
   let mFull = m
   try {
-    const claudeRes = await fetch('/api/marveen')
+    const claudeRes = await fetch('api/marveen')
     if (claudeRes.ok) {
       mFull = await claudeRes.json()
       document.getElementById('editClaudeMd').value = mFull.claudeMd || ''
@@ -2525,7 +2528,7 @@ function renderAgents() {
     mCard.className = 'agent-card marveen-card'
     mCard.innerHTML = `
       <div class="agent-card-top">
-        <div class="agent-avatar gradient-1"><img src="/api/marveen/avatar?t=${Date.now()}" alt="${escapeHtml(displayName)}"></div>
+        <div class="agent-avatar gradient-1"><img src="api/marveen/avatar?t=${Date.now()}" alt="${escapeHtml(displayName)}"></div>
         <div class="agent-card-info">
           <div class="agent-name">${escapeHtml(displayName)} <span class="marveen-badge">${t('agents.main_badge')}</span></div>
           <div class="agent-desc">${escapeHtml(m.description || '')}</div>
@@ -2567,7 +2570,7 @@ function renderAgents() {
     const initial = label.charAt(0).toUpperCase()
     const gradientClass = getAvatarGradient(agent.name)
     const avatarHtml = (agent.hasImage || agent.hasAvatar)
-      ? `<img src="/api/agents/${encodeURIComponent(agent.name)}/avatar?t=${Date.now()}" alt="${escapeHtml(label)}">`
+      ? `<img src="api/agents/${encodeURIComponent(agent.name)}/avatar?t=${Date.now()}" alt="${escapeHtml(label)}">`
       : initial
 
     const modelClass = agent.model && agent.model !== 'inherit' ? agent.model : ''
@@ -2631,7 +2634,7 @@ function renderAgents() {
 // === Agent Detail ===
 async function openAgentDetail(agentName) {
   try {
-    const res = await fetch(`/api/agents/${encodeURIComponent(agentName)}`)
+    const res = await fetch(`api/agents/${encodeURIComponent(agentName)}`)
     if (!res.ok) throw new Error('Not found')
     currentAgent = await res.json()
   } catch (err) {
@@ -2650,7 +2653,7 @@ async function openAgentDetail(agentName) {
   const avatar = document.getElementById('agentDetailAvatar')
   avatar.className = 'detail-avatar ' + gradientClass
   avatar.innerHTML = (currentAgent.hasImage || currentAgent.hasAvatar)
-    ? `<img src="/api/agents/${encodeURIComponent(currentAgent.name)}/avatar" alt="${escapeHtml(detailLabel)}">`
+    ? `<img src="api/agents/${encodeURIComponent(currentAgent.name)}/avatar" alt="${escapeHtml(detailLabel)}">`
     : initial
   document.getElementById('agentDetailName').textContent = detailLabel
   document.getElementById('agentDetailDesc').textContent = currentAgent.description || ''
@@ -2700,7 +2703,7 @@ async function openAgentDetail(agentName) {
   document.getElementById('deleteAgentBtn').onclick = async () => {
     if (!confirm(t('agents.confirm.delete', { name: currentAgent.name }))) return
     try {
-      await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`, { method: 'DELETE' })
+      await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}`, { method: 'DELETE' })
       closeModal(agentDetailOverlay)
       showToast(t('agents.toast.deleted'))
       loadAgents()
@@ -2723,13 +2726,13 @@ function populateDetailAvatarGrid() {
     const item = document.createElement('div')
     item.className = 'avatar-grid-item'
     item.dataset.avatar = avatar
-    item.innerHTML = `<img src="/avatars/${avatar}" alt="${avatar.replace(/^\d+_/, '').replace('.png', '')}">`
+    item.innerHTML = `<img src="avatars/${avatar}" alt="${avatar.replace(/^\d+_/, '').replace('.png', '')}">`
     item.addEventListener('click', async () => {
       if (!currentAgent) return
       grid.querySelectorAll('.avatar-grid-item').forEach(i => i.classList.remove('selected'))
       item.classList.add('selected')
       try {
-        const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}/avatar`, {
+        const res = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}/avatar`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ galleryAvatar: avatar }),
@@ -2737,7 +2740,7 @@ function populateDetailAvatarGrid() {
         if (!res.ok) throw new Error()
         showToast(t('agents.toast.avatar_updated'))
         // Update the detail avatar display
-        document.getElementById('agentDetailAvatar').innerHTML = `<img src="/api/agents/${encodeURIComponent(currentAgent.name)}/avatar?t=${Date.now()}" alt="">`
+        document.getElementById('agentDetailAvatar').innerHTML = `<img src="api/agents/${encodeURIComponent(currentAgent.name)}/avatar?t=${Date.now()}" alt="">`
         document.getElementById('detailAvatarGallery').hidden = true
         loadAgents()
       } catch {
@@ -2753,14 +2756,14 @@ document.getElementById('avatarChangeBtn').addEventListener('click', () => {
   gallery.hidden = !gallery.hidden
   if (!gallery.hidden) {
     const isMarveen = currentAgent && currentAgent.role === 'main'
-    const avatarEndpoint = isMarveen ? '/api/marveen/avatar' : `/api/agents/${encodeURIComponent(currentAgent.name)}/avatar`
+    const avatarEndpoint = isMarveen ? 'api/marveen/avatar' : `api/agents/${encodeURIComponent(currentAgent.name)}/avatar`
 
     const grid = document.getElementById('detailAvatarGrid')
     grid.innerHTML = ''
     for (const avatar of AVATARS) {
       const item = document.createElement('div')
       item.className = 'avatar-grid-item'
-      item.innerHTML = `<img src="/avatars/${avatar}" alt="${avatar.replace(/^\d+_/, '').replace('.png', '')}">`
+      item.innerHTML = `<img src="avatars/${avatar}" alt="${avatar.replace(/^\d+_/, '').replace('.png', '')}">`
       item.addEventListener('click', async () => {
         try {
           const res = await fetch(avatarEndpoint, {
@@ -2770,7 +2773,7 @@ document.getElementById('avatarChangeBtn').addEventListener('click', () => {
           })
           if (!res.ok) throw new Error()
           showToast(t('agents.toast.avatar_updated'))
-          const imgUrl = isMarveen ? `/api/marveen/avatar?t=${Date.now()}` : `/api/agents/${encodeURIComponent(currentAgent.name)}/avatar?t=${Date.now()}`
+          const imgUrl = isMarveen ? `api/marveen/avatar?t=${Date.now()}` : `api/agents/${encodeURIComponent(currentAgent.name)}/avatar?t=${Date.now()}`
           document.getElementById('agentDetailAvatar').innerHTML = `<img src="${imgUrl}" alt="">`
           gallery.hidden = true
           loadAgents()
@@ -2837,14 +2840,14 @@ document.getElementById('avatarChangeBtn').addEventListener('click', () => {
   async function uploadAvatarFile(file) {
     if (!currentAgent) return
     const isMarveen = currentAgent.role === 'main'
-    const endpoint = isMarveen ? '/api/marveen/avatar' : `/api/agents/${encodeURIComponent(currentAgent.name)}/avatar`
+    const endpoint = isMarveen ? 'api/marveen/avatar' : `api/agents/${encodeURIComponent(currentAgent.name)}/avatar`
     const form = new FormData()
     form.append('avatar', file, file.name)
     try {
       const res = await fetch(endpoint, { method: 'POST', body: form })
       if (!res.ok) throw new Error()
       showToast(t('agents.toast.avatar_uploaded'))
-      const imgUrl = isMarveen ? `/api/marveen/avatar?t=${Date.now()}` : `/api/agents/${encodeURIComponent(currentAgent.name)}/avatar?t=${Date.now()}`
+      const imgUrl = isMarveen ? `api/marveen/avatar?t=${Date.now()}` : `api/agents/${encodeURIComponent(currentAgent.name)}/avatar?t=${Date.now()}`
       document.getElementById('agentDetailAvatar').innerHTML = `<img src="${imgUrl}" alt="">`
       document.getElementById('detailAvatarGallery').hidden = true
       resetAvatarUpload()
@@ -2945,7 +2948,7 @@ document.getElementById('marveenRestartBtn').addEventListener('click', async () 
   const btn = document.getElementById('marveenRestartBtn')
   btn.disabled = true
   try {
-    const res = await fetch('/api/marveen/restart', { method: 'POST' })
+    const res = await fetch('api/marveen/restart', { method: 'POST' })
     if (!res.ok) {
       const err = await res.json().catch(() => ({}))
       throw new Error(err.error || t('agents.toast.restart_failed'))
@@ -2966,14 +2969,14 @@ document.getElementById('agentStartBtn').addEventListener('click', async () => {
   btn.querySelector('.btn-loading').hidden = false
 
   try {
-    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}/start`, { method: 'POST' })
+    const res = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}/start`, { method: 'POST' })
     if (!res.ok) {
       const err = await res.json()
       throw new Error(err.error || t('agents.toast.start_failed'))
     }
     showToast(t('agents.toast.started'))
     // Refresh
-    const detailRes = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`)
+    const detailRes = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}`)
     if (detailRes.ok) {
       currentAgent = await detailRes.json()
       updateProcessControl(currentAgent)
@@ -2993,13 +2996,13 @@ document.getElementById('agentStopBtn').addEventListener('click', async () => {
   if (!confirm(t('agents.confirm.stop'))) return
 
   try {
-    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}/stop`, { method: 'POST' })
+    const res = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}/stop`, { method: 'POST' })
     if (!res.ok) {
       const err = await res.json()
       throw new Error(err.error || t('agents.toast.stop_failed'))
     }
     showToast(t('agents.toast.stopped'))
-    const detailRes = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`)
+    const detailRes = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}`)
     if (detailRes.ok) {
       currentAgent = await detailRes.json()
       updateProcessControl(currentAgent)
@@ -3023,7 +3026,7 @@ let currentChannelProvider = 'telegram'
 // a UI nem hardcode-olt 'telegram'-mal indul barmelyik oldalra is navigal a user.
 ;(async function initChannelProviderDefault() {
   try {
-    const res = await fetch('/api/marveen')
+    const res = await fetch('api/marveen')
     if (!res.ok) return
     const data = await res.json()
     if (!data.channelProvider || data.channelProvider === currentChannelProvider) return
@@ -3050,7 +3053,7 @@ function stopChannelAutoPoll() {
 }
 
 function channelApiBase() {
-  return `/api/agents/${encodeURIComponent(currentAgent.name)}/channels/${currentChannelProvider}`
+  return `api/agents/${encodeURIComponent(currentAgent.name)}/channels/${currentChannelProvider}`
 }
 
 function switchAgentTab(tab) {
@@ -3070,7 +3073,7 @@ async function loadOllamaModels() {
   if (!group) return
   group.innerHTML = ''
   try {
-    const res = await fetch('/api/ollama/models')
+    const res = await fetch('api/ollama/models')
     const models = await res.json()
     for (const m of models) {
       const opt = document.createElement('option')
@@ -3087,7 +3090,7 @@ async function loadOllamaModels() {
 // case we hide the optgroup and surface a hint pointing to the Vault page.
 async function loadAvailableModels() {
   try {
-    const res = await fetch('/api/models/available')
+    const res = await fetch('api/models/available')
     if (!res.ok) return
     const data = await res.json()
     const deepseekModels = Array.isArray(data.deepseek) ? data.deepseek : []
@@ -3141,7 +3144,7 @@ function startModelRestartPolling(name, expectedModel, triggeredAt) {
       return
     }
     try {
-      const r = await fetch(`/api/agents/${encodeURIComponent(name)}`)
+      const r = await fetch(`api/agents/${encodeURIComponent(name)}`)
       if (!r.ok) return
       const data = await r.json()
       // The new tmux session's creation timestamp is the reliable "restart
@@ -3179,7 +3182,7 @@ document.getElementById('saveModelBtn').addEventListener('click', async () => {
   const newModel = document.getElementById('editAgentModel').value
   const name = currentAgent.name
   try {
-    const res = await fetch(`/api/agents/${encodeURIComponent(name)}`, {
+    const res = await fetch(`api/agents/${encodeURIComponent(name)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: newModel }),
@@ -3192,7 +3195,7 @@ document.getElementById('saveModelBtn').addEventListener('click', async () => {
     document.getElementById('processDot').className = 'process-dot restarting'
     showToast(t('agents.toast.model_save_restart'))
     loadAgents()
-    const restartRes = await fetch(`/api/agents/${encodeURIComponent(name)}/restart`, { method: 'POST' })
+    const restartRes = await fetch(`api/agents/${encodeURIComponent(name)}/restart`, { method: 'POST' })
     if (!restartRes.ok) {
       document.getElementById('agentDetailModelRestarting').hidden = true
       if (currentAgent) updateProcessControl(currentAgent)
@@ -3209,7 +3212,7 @@ document.getElementById('modelSuggestBtn').addEventListener('click', async () =>
   resultDiv.style.display = 'block'
   resultDiv.textContent = t('agents.model.analyzing')
   try {
-    const res = await fetch('/api/agents/model-suggest', { method: 'POST' })
+    const res = await fetch('api/agents/model-suggest', { method: 'POST' })
     if (!res.ok) throw new Error()
     const { results } = await res.json()
     const entry = results.find(r => r.agent === currentAgent.name)
@@ -3230,7 +3233,7 @@ document.getElementById('analyzeAllModelsBtn').addEventListener('click', async (
   panel.style.display = 'block'
   panel.innerHTML = '<p style="color:var(--text-muted);font-size:13px">' + t('agents.model.analyzing_all') + '</p>'
   try {
-    const res = await fetch('/api/agents/model-suggest', { method: 'POST' })
+    const res = await fetch('api/agents/model-suggest', { method: 'POST' })
     if (!res.ok) throw new Error()
     const { results } = await res.json()
     const changes = results.filter(r => r.changeAdvised)
@@ -3265,7 +3268,7 @@ document.getElementById('analyzeAllModelsBtn').addEventListener('click', async (
         let created = 0
         for (const r of changes) {
           try {
-            await fetch('/api/kanban', {
+            await fetch('api/kanban', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -3301,7 +3304,7 @@ document.getElementById('saveAutoRestartBtn').addEventListener('click', async ()
     handoff: false,
   }
   try {
-    const res = await fetch(`/api/agents/${encodeURIComponent(id)}/auto-restart`, {
+    const res = await fetch(`api/agents/${encodeURIComponent(id)}/auto-restart`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(cfg),
@@ -3322,7 +3325,7 @@ async function loadVoiceConfig(agentName) {
   const controls = document.getElementById('voiceInstalledControls')
   try {
     // Check toolkit installation first
-    const statusR = await fetch('/api/voice/status')
+    const statusR = await fetch('api/voice/status')
     if (!statusR.ok) return
     const status = await statusR.json()
 
@@ -3334,7 +3337,7 @@ async function loadVoiceConfig(agentName) {
     if (banner) banner.hidden = true
     if (controls) controls.hidden = false
 
-    const r = await fetch(`/api/agents/${encodeURIComponent(agentName)}/voice-config`)
+    const r = await fetch(`api/agents/${encodeURIComponent(agentName)}/voice-config`)
     if (!r.ok) return
     const cfg = await r.json()
     voiceModelSel.innerHTML = (cfg.availableVoices || []).map(v =>
@@ -3357,7 +3360,7 @@ document.getElementById('voiceInstallBtn').addEventListener('click', async () =>
   btn.textContent = 'Indítás...'
 
   try {
-    const r = await fetch('/api/voice/install', { method: 'POST' })
+    const r = await fetch('api/voice/install', { method: 'POST' })
     if (!r.ok) throw new Error(await r.text())
     const data = await r.json()
 
@@ -3388,7 +3391,7 @@ document.getElementById('voiceInstallBtn').addEventListener('click', async () =>
     _voiceInstallPollTimer = setInterval(async () => {
       _voiceInstallPollCount++
       try {
-        const sr = await fetch('/api/voice/status')
+        const sr = await fetch('api/voice/status')
         const s = await sr.json()
         if (s.installed) {
           clearInterval(_voiceInstallPollTimer)
@@ -3423,7 +3426,7 @@ document.getElementById('saveVoiceConfigBtn').addEventListener('click', async ()
   const modelEl = document.getElementById('editAgentVoiceModel')
   if (!modeEl || !modelEl) return
   try {
-    const r = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}/voice-config`, {
+    const r = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}/voice-config`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ responseMode: modeEl.value, voiceModel: modelEl.value }),
@@ -3437,7 +3440,7 @@ document.getElementById('saveProfileBtn').addEventListener('click', async () => 
   if (!currentAgent || currentAgent.role === 'main') return
   const profile = document.getElementById('editAgentProfile').value
   try {
-    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}/security`, {
+    const res = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}/security`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ profile }),
@@ -3492,7 +3495,7 @@ document.getElementById('authSharedApplyBtn').addEventListener('click', async ()
   btnLoading.hidden = false
   btn.disabled = true
   try {
-    const base = `/api/agents/${encodeURIComponent(currentAgent.name)}`
+    const base = `api/agents/${encodeURIComponent(currentAgent.name)}`
     const saveRes = await fetch(base, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -3541,7 +3544,7 @@ document.getElementById('authFlowInitBtn').addEventListener('click', async () =>
   btnLoading.hidden = false
   btn.disabled = true
   try {
-    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}/auth/init`, {
+    const res = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}/auth/init`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
     })
@@ -3579,7 +3582,7 @@ document.getElementById('saveAuthModeBtn').addEventListener('click', async () =>
     if (key) payload.apiKey = key
   }
   try {
-    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`, {
+    const res = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -3587,7 +3590,7 @@ document.getElementById('saveAuthModeBtn').addEventListener('click', async () =>
     if (!res.ok) throw new Error()
     showToast(t('agents.toast.auth_mode_saved'))
     loadAgents()
-    const detailRes = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`)
+    const detailRes = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}`)
     if (detailRes.ok) {
       const updated = await detailRes.json()
       currentAgent = updated
@@ -3599,7 +3602,7 @@ document.getElementById('saveAuthModeBtn').addEventListener('click', async () =>
 document.getElementById('saveClaudeMdBtn').addEventListener('click', async () => {
   if (!currentAgent) return
   try {
-    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`, {
+    const res = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ claudeMd: document.getElementById('editClaudeMd').value }),
@@ -3612,7 +3615,7 @@ document.getElementById('saveClaudeMdBtn').addEventListener('click', async () =>
 document.getElementById('saveSoulMdBtn').addEventListener('click', async () => {
   if (!currentAgent) return
   try {
-    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`, {
+    const res = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ soulMd: document.getElementById('editSoulMd').value }),
@@ -3625,7 +3628,7 @@ document.getElementById('saveSoulMdBtn').addEventListener('click', async () => {
 document.getElementById('saveMcpJsonBtn').addEventListener('click', async () => {
   if (!currentAgent) return
   try {
-    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`, {
+    const res = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ mcpJson: document.getElementById('editMcpJson').value }),
@@ -3763,7 +3766,7 @@ function updateChannelTab(agent) {
 async function refreshChannelHealth() {
   if (!currentAgent) return
   try {
-    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}/channel/health`)
+    const res = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}/channel/health`)
     if (!res.ok) return
     const data = await res.json()
     const notice = document.getElementById('chDisconnectedNotice')
@@ -3857,7 +3860,7 @@ document.getElementById('chReconnectBtn').addEventListener('click', async () => 
   btn.disabled = true
   btn.textContent = t('agents.btn.reconnect')
   try {
-    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}/channel/reconnect`, { method: 'POST' })
+    const res = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}/channel/reconnect`, { method: 'POST' })
     const data = await res.json()
     if (data.ok) {
       showToast('Channel-MCP reconnect sikeres')
@@ -3880,7 +3883,7 @@ document.getElementById('chSmokeTestBtn').addEventListener('click', async () => 
   btn.disabled = true
   btn.textContent = t('agents.btn.running')
   try {
-    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent)}/channels/slack/smoke-test`, { method: 'POST' })
+    const res = await fetch(`api/agents/${encodeURIComponent(currentAgent)}/channels/slack/smoke-test`, { method: 'POST' })
     const data = await res.json()
     if (!res.ok) {
       showToast(data.error || 'Smoke-test sikertelen', true)
@@ -4133,7 +4136,7 @@ async function refreshChannelRequests() {
     return
   }
   try {
-    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}/channel-requests`)
+    const res = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}/channel-requests`)
     if (!res.ok) { section.hidden = true; return }
     const items = await res.json()
     if (!items.length) {
@@ -4192,7 +4195,7 @@ async function submitApproveModal() {
   confirmBtn.querySelector('.btn-loading').hidden = false
   confirmBtn.disabled = true
   try {
-    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}/channel-requests/${id}/approve`, {
+    const res = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}/channel-requests/${id}/approve`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ requireMention, allowFromAll }),
@@ -4217,7 +4220,7 @@ async function denyChannelRequest(id, itemEl) {
   if (itemEl) itemEl.dataset.denying = '1'
   if (itemEl) itemEl.remove()
   try {
-    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}/channel-requests/${id}/deny`, { method: 'POST' })
+    const res = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}/channel-requests/${id}/deny`, { method: 'POST' })
     if (!res.ok) throw new Error('Hiba')
     showToast(t('channel.toast.denied'))
     refreshChannelRequests()
@@ -4269,7 +4272,7 @@ async function loadSkills(agentName) {
   listEl.innerHTML = ''
 
   try {
-    const res = await fetch(`/api/agents/${encodeURIComponent(agentName)}/skills`)
+    const res = await fetch(`api/agents/${encodeURIComponent(agentName)}/skills`)
     if (!res.ok) throw new Error()
     const skills = await res.json()
 
@@ -4301,7 +4304,7 @@ async function loadSkills(agentName) {
         delBtn.addEventListener('click', async () => {
           if (!confirm(t('skills.confirm.delete', { name: skill.name }))) return
           try {
-            await fetch(`/api/agents/${encodeURIComponent(agentName)}/skills/${encodeURIComponent(skill.name)}`, { method: 'DELETE' })
+            await fetch(`api/agents/${encodeURIComponent(agentName)}/skills/${encodeURIComponent(skill.name)}`, { method: 'DELETE' })
             showToast(t('skills.toast.deleted'))
             loadSkills(agentName)
           } catch {
@@ -4374,8 +4377,8 @@ document.getElementById('saveSkillBtn').addEventListener('click', async () => {
 
   try {
     const url = isGlobal
-      ? '/api/skills'
-      : `/api/agents/${encodeURIComponent(agentApiName())}/skills`
+      ? 'api/skills'
+      : `api/agents/${encodeURIComponent(agentApiName())}/skills`
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -4419,8 +4422,8 @@ document.getElementById('importSkillBtn').addEventListener('click', async () => 
     const formData = new FormData()
     formData.append('file', skillFile)
     const url = isGlobal
-      ? '/api/skills/import'
-      : `/api/agents/${encodeURIComponent(agentApiName())}/skills/import`
+      ? 'api/skills/import'
+      : `api/agents/${encodeURIComponent(agentApiName())}/skills/import`
     const res = await fetch(url, {
       method: 'POST',
       body: formData,
@@ -4680,7 +4683,7 @@ function cronToMinute(cron) {
 
 async function loadScheduleAgents() {
   try {
-    const res = await fetch('/api/schedules/agents')
+    const res = await fetch('api/schedules/agents')
     scheduleAgents = await res.json()
     const sel = document.getElementById('scheduleAgent')
     sel.innerHTML = ''
@@ -4698,7 +4701,7 @@ async function loadScheduleAgents() {
 async function loadSchedules() {
   try {
     const [schedulesRes] = await Promise.all([
-      fetch('/api/schedules'),
+      fetch('api/schedules'),
       loadScheduleAgents(),
     ])
     schedules = await schedulesRes.json()
@@ -4714,7 +4717,7 @@ async function loadPendingRetries() {
   const container = document.getElementById('pendingRetriesSection')
   if (!container) return
   try {
-    const res = await fetch('/api/schedules/pending')
+    const res = await fetch('api/schedules/pending')
     if (!res.ok) { container.hidden = true; return }
     const rows = await res.json()
     renderPendingRetries(container, Array.isArray(rows) ? rows : [])
@@ -4779,7 +4782,7 @@ function renderPendingRetries(container, rows) {
       if (!id) return
       if (!confirm(t('tasks.confirm.cancel_pending'))) return
       try {
-        const res = await fetch(`/api/schedules/pending/${encodeURIComponent(id)}`, { method: 'DELETE' })
+        const res = await fetch(`api/schedules/pending/${encodeURIComponent(id)}`, { method: 'DELETE' })
         if (!res.ok) throw new Error('cancel failed')
         loadPendingRetries()
       } catch (err) {
@@ -4806,7 +4809,7 @@ const CADENCE_ICON = { 0: '⚡', 1: '☀️', 2: '📅', 3: '🗓️', 5: '•' 
 function makeScheduleRow(task) {
     const row = document.createElement('div')
     row.className = 'schedule-row'
-    const agent = scheduleAgents.find(a => a.name === task.agent) || { name: task.agent || mainAgentId(), avatar: '/api/marveen/avatar', label: task.agent || mainAgentId() }
+    const agent = scheduleAgents.find(a => a.name === task.agent) || { name: task.agent || mainAgentId(), avatar: 'api/marveen/avatar', label: task.agent || mainAgentId() }
 
     row.innerHTML = `
       <div class="schedule-agent-avatar">
@@ -4850,7 +4853,7 @@ function makeScheduleRow(task) {
     row.querySelector('[data-action="run"]').addEventListener('click', async (e) => {
       e.stopPropagation()
       try {
-        const r = await fetch(`/api/schedules/${encodeURIComponent(task.name)}/run`, { method: 'POST' })
+        const r = await fetch(`api/schedules/${encodeURIComponent(task.name)}/run`, { method: 'POST' })
         const data = await r.json().catch(() => ({}))
         if (r.ok) showToast(t('tasks.toast.run_started') + (data.result ? ': ' + data.result : ''))
         else showToast('Hiba: ' + (data.error || r.status))
@@ -4861,7 +4864,7 @@ function makeScheduleRow(task) {
     row.querySelector('[data-action="toggle"]').addEventListener('click', async (e) => {
       e.stopPropagation()
       try {
-        await fetch(`/api/schedules/${encodeURIComponent(task.name)}/toggle`, { method: 'POST' })
+        await fetch(`api/schedules/${encodeURIComponent(task.name)}/toggle`, { method: 'POST' })
         showToast(task.enabled ? t('tasks.toast.toggled_paused') : t('tasks.toast.toggled_resumed'))
         loadSchedules()
       } catch { showToast(t('common.error')) }
@@ -4871,7 +4874,7 @@ function makeScheduleRow(task) {
       e.stopPropagation()
       if (!confirm(t('tasks.confirm.task_delete'))) return
       try {
-        await fetch(`/api/schedules/${encodeURIComponent(task.name)}`, { method: 'DELETE' })
+        await fetch(`api/schedules/${encodeURIComponent(task.name)}`, { method: 'DELETE' })
         showToast(t('tasks.toast.deleted'))
         loadSchedules()
       } catch { showToast(t('common.error_delete')) }
@@ -4926,7 +4929,7 @@ async function openScheduleRunHistory(taskName) {
   body.innerHTML = '<p>' + t('common.loading') + '</p>'
   openModal(scheduleRunHistoryOverlay)
   try {
-    const r = await fetch(`/api/schedules/${encodeURIComponent(taskName)}/runs`)
+    const r = await fetch(`api/schedules/${encodeURIComponent(taskName)}/runs`)
     const runs = await r.json()
     if (!Array.isArray(runs) || runs.length === 0) {
       body.innerHTML = '<p class="hint">' + t('tasks.history.empty') + '</p>'
@@ -4989,7 +4992,7 @@ function renderTimeline(tasks) {
   }
 
   for (const [agentName, agTasks] of Object.entries(agentTasks)) {
-    const agent = scheduleAgents.find(a => a.name === agentName) || { name: agentName, avatar: '/api/marveen/avatar', label: agentName }
+    const agent = scheduleAgents.find(a => a.name === agentName) || { name: agentName, avatar: 'api/marveen/avatar', label: agentName }
 
     const row = document.createElement('div')
     row.className = 'timeline-row'
@@ -5134,7 +5137,7 @@ function renderWeekView(data) {
       const count = tasks.length
 
       tasks.forEach((task, idx) => {
-        const agent = scheduleAgents.find(a => a.name === task.agent) || { name: task.agent || mainAgentId(), avatar: '/api/marveen/avatar' }
+        const agent = scheduleAgents.find(a => a.name === task.agent) || { name: task.agent || mainAgentId(), avatar: 'api/marveen/avatar' }
 
         const card = document.createElement('div')
         card.className = 'week-task-card'
@@ -5229,7 +5232,7 @@ document.getElementById('expandPromptBtn').addEventListener('click', async () =>
 
   try {
     const agent = document.getElementById('scheduleAgent').value
-    const res = await fetch('/api/schedules/expand-questions', {
+    const res = await fetch('api/schedules/expand-questions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ prompt, agent }),
@@ -5284,7 +5287,7 @@ document.getElementById('expandPromptBtn').addEventListener('click', async () =>
       applyBtn.querySelector('.btn-text').hidden = true
       applyBtn.querySelector('.btn-loading').hidden = false
       try {
-        const res2 = await fetch('/api/schedules/expand-prompt', {
+        const res2 = await fetch('api/schedules/expand-prompt', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ prompt, answers: expandAnswers }),
@@ -5337,7 +5340,7 @@ saveScheduleBtn.addEventListener('click', async () => {
   try {
     if (editName) {
       // Update
-      const res = await fetch(`/api/schedules/${encodeURIComponent(editName)}`, {
+      const res = await fetch(`api/schedules/${encodeURIComponent(editName)}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ description, prompt, schedule, agent, type, ...advanced }),
@@ -5349,7 +5352,7 @@ saveScheduleBtn.addEventListener('click', async () => {
       showToast(t('tasks.toast.updated'))
     } else {
       // Create
-      const res = await fetch('/api/schedules', {
+      const res = await fetch('api/schedules', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name, description, prompt, schedule, agent, type, ...advanced }),
@@ -5392,7 +5395,7 @@ const tierColors = { hot: '#dc3c3c', warm: '#d97757', cold: '#6a9bcc', shared: '
 // Populate agent dropdowns from API
 async function loadMemAgents() {
   try {
-    const res = await fetch('/api/schedules/agents')
+    const res = await fetch('api/schedules/agents')
     const agents = await res.json()
     const sel = document.getElementById('memAgentFilter')
     const memSel = document.getElementById('memAgent')
@@ -5480,14 +5483,14 @@ document.getElementById('saveMemBtn').addEventListener('click', async () => {
 
   try {
     if (editId) {
-      await fetch(`/api/memories/${editId}`, {
+      await fetch(`api/memories/${editId}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ content, tier, agent_id: agentId, keywords }),
       })
       showToast(t('memories.toast.updated'))
     } else {
-      await fetch('/api/memories', {
+      await fetch('api/memories', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ agent_id: agentId, content, tier, keywords }),
@@ -5504,7 +5507,7 @@ document.getElementById('saveMemBtn').addEventListener('click', async () => {
 
 async function loadMemStats() {
   try {
-    const res = await fetch('/api/memories/stats')
+    const res = await fetch('api/memories/stats')
     const stats = await res.json()
     const embCount = stats.withEmbedding || 0
     const embPct = stats.total > 0 ? Math.round(embCount / stats.total * 100) : 0
@@ -5520,7 +5523,7 @@ async function loadMemStats() {
       const btn = document.getElementById('memBackfillBtn')
       if (btn) { btn.textContent = t('memories.stat.vectors_gen'); btn.disabled = true }
       try {
-        const r = await fetch('/api/memories/backfill', { method: 'POST' })
+        const r = await fetch('api/memories/backfill', { method: 'POST' })
         const data = await r.json()
         showToast(t('memories.toast.vector_count', { count: data.count }))
         loadMemStats()
@@ -5546,7 +5549,7 @@ async function loadMemories() {
   params.set('limit', '50')
 
   try {
-    const res = await fetch(`/api/memories?${params}`)
+    const res = await fetch(`api/memories?${params}`)
     const memories = await res.json()
     renderMemories(memories)
   } catch (err) {
@@ -5618,7 +5621,7 @@ function renderMemories(memories) {
       e.stopPropagation()
       if (!confirm('Biztosan torlod ezt az emleket?')) return
       try {
-        await fetch(`/api/memories/${mem.id}`, { method: 'DELETE' })
+        await fetch(`api/memories/${mem.id}`, { method: 'DELETE' })
         showToast(t('memories.toast.deleted'))
         loadMemories()
         loadMemStats()
@@ -5684,7 +5687,7 @@ async function loadMemoryGraph() {
   params.set('limit', '200')
 
   try {
-    const res = await fetch(`/api/memories?${params}`)
+    const res = await fetch(`api/memories?${params}`)
     const memories = await res.json()
 
     const emptyEl = document.getElementById('graphEmpty')
@@ -6400,7 +6403,7 @@ async function loadDailyLog() {
   }
 
   try {
-    const datesRes = await fetch(`/api/daily-log/dates?agent=${agent}`)
+    const datesRes = await fetch(`api/daily-log/dates?agent=${agent}`)
     logDates = await datesRes.json()
   } catch {
     logDates = []
@@ -6409,7 +6412,7 @@ async function loadDailyLog() {
   document.getElementById('logCurrentDate').textContent = formatLogDate(currentLogDate)
 
   try {
-    const res = await fetch(`/api/daily-log?agent=${agent}&date=${currentLogDate}`)
+    const res = await fetch(`api/daily-log?agent=${agent}&date=${currentLogDate}`)
     const entries = await res.json()
     renderLogEntries(entries)
   } catch {
@@ -6499,7 +6502,7 @@ document.getElementById('connectorRefreshBtn').addEventListener('click', async (
   const btn = document.getElementById('connectorRefreshBtn')
   btn.disabled = true
   try {
-    const res = await fetch('/api/connectors/refresh', { method: 'POST' })
+    const res = await fetch('api/connectors/refresh', { method: 'POST' })
     const data = await res.json().catch(() => ({}))
     if (!res.ok || !data.ok) {
       showToast(t('updates.error', {msg: data.error || 'HTTP ' + res.status}))
@@ -6537,7 +6540,7 @@ async function loadCatalog() {
   const grid = document.getElementById('catalogGrid')
   grid.innerHTML = `<div class="connector-loading"><span class="spinner"></span> ${t('connectors.catalog_loading')}</div>`
   try {
-    const res = await fetch('/api/mcp-catalog')
+    const res = await fetch('api/mcp-catalog')
     catalogItems = await res.json()
     renderCatalog()
   } catch (err) {
@@ -6658,7 +6661,7 @@ document.getElementById('catalogInstallBtn').addEventListener('click', async () 
   btn.querySelector('.btn-loading').hidden = false
 
   try {
-    const res = await fetch(`/api/mcp-catalog/${encodeURIComponent(item.id)}/install`, {
+    const res = await fetch(`api/mcp-catalog/${encodeURIComponent(item.id)}/install`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ env: envData }),
@@ -6682,7 +6685,7 @@ document.getElementById('catalogInstallBtn').addEventListener('click', async () 
 async function catalogUninstall(item) {
   if (!confirm(t('connectors.confirm.remove', { name: item.name }))) return
   try {
-    const res = await fetch(`/api/mcp-catalog/${encodeURIComponent(item.id)}/uninstall`, { method: 'DELETE' })
+    const res = await fetch(`api/mcp-catalog/${encodeURIComponent(item.id)}/uninstall`, { method: 'DELETE' })
     const data = await res.json()
     if (!res.ok) throw new Error(data.error || 'Hiba')
     showToast(data.message || t('connectors.toast.removed'))
@@ -6754,8 +6757,8 @@ async function loadConnectors() {
     // "Nincsenek MCP connectorok" -- contradicting the info-box that
     // says "A lista a dashboard indulasakor toltodik be".
     const [listRes, statusRes] = await Promise.all([
-      fetch('/api/connectors'),
-      fetch('/api/connectors/status').catch(() => null),
+      fetch('api/connectors'),
+      fetch('api/connectors/status').catch(() => null),
     ])
     connectors = await listRes.json()
     if (statusRes && statusRes.ok) {
@@ -7025,7 +7028,7 @@ function renderConnectors() {
 // --- GitHub repo management ---
 async function loadGitHubRepos() {
   try {
-    const res = await fetch('/api/connectors/github-repos')
+    const res = await fetch('api/connectors/github-repos')
     const data = await res.json()
     const repos = data.repos || []
     document.getElementById('githubRepoCount').textContent = String(repos.length)
@@ -7041,7 +7044,7 @@ async function loadGitHubRepos() {
         btn.disabled = true
         btn.textContent = '...'
         try {
-          const res = await fetch(`/api/connectors/github-repos/${encodeURIComponent(r.name)}`, { method: 'PATCH' })
+          const res = await fetch(`api/connectors/github-repos/${encodeURIComponent(r.name)}`, { method: 'PATCH' })
           const data = await res.json()
           if (data.error) { alert(data.error); return }
           loadConnectors()
@@ -7049,7 +7052,7 @@ async function loadGitHubRepos() {
       })
       item.querySelector('.github-repo-delete').addEventListener('click', async () => {
         if (!confirm(`Torlod: ${r.name.replace('--', '/')}?`)) return
-        await fetch(`/api/connectors/github-repos/${encodeURIComponent(r.name)}`, { method: 'DELETE' })
+        await fetch(`api/connectors/github-repos/${encodeURIComponent(r.name)}`, { method: 'DELETE' })
         loadGitHubRepos()
         loadExternalPaths()
         loadConnectors()
@@ -7080,7 +7083,7 @@ async function loadGitHubRepos() {
     status.className = 'github-repo-status loading'
     status.textContent = t('connectors.cloning')
     try {
-      const res = await fetch('/api/connectors/github-repos', {
+      const res = await fetch('api/connectors/github-repos', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: val }),
@@ -7098,7 +7101,7 @@ async function loadGitHubRepos() {
         if (envValues && Object.keys(envValues).length > 0) {
           let vaultAllOk = true
           for (const [key, value] of Object.entries(envValues)) {
-            const r = await fetch('/api/vault', {
+            const r = await fetch('api/vault', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ id: `github-env-${data.repo.name}-${key}`, label: `${key} (${data.repo.name.replace('--', '/')})`, value }),
@@ -7140,7 +7143,7 @@ async function loadGitHubRepos() {
 // --- Vault management ---
 async function loadVault() {
   try {
-    const res = await fetch('/api/vault')
+    const res = await fetch('api/vault')
     const data = await res.json()
     const secrets = data.secrets || []
     document.getElementById('vaultCount').textContent = String(secrets.length)
@@ -7153,7 +7156,7 @@ async function loadVault() {
       item.innerHTML = `<div class="github-repo-info"><span class="github-repo-name">${escapeHtml(s.label)}</span><span class="github-repo-date">${escapeHtml(s.id)} &middot; ${date}</span></div><button title="Torles" style="background:none;border:none;color:var(--danger);cursor:pointer;font-size:14px;padding:2px 6px">&times;</button>`
       item.querySelector('button').addEventListener('click', async () => {
         if (!confirm(`Torlod: ${s.label}?`)) return
-        const res = await fetch(`/api/vault/${encodeURIComponent(s.id)}`, { method: 'DELETE' })
+        const res = await fetch(`api/vault/${encodeURIComponent(s.id)}`, { method: 'DELETE' })
         if (!res.ok) { showToast('Törlés sikertelen'); return }
         loadVault()
       })
@@ -7178,7 +7181,7 @@ async function loadVault() {
     const id = idInput.value.trim()
     const val = valInput.value
     if (!id || !val) return
-    const res = await fetch('/api/vault', {
+    const res = await fetch('api/vault', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id, label: id, value: val }),
@@ -7245,7 +7248,7 @@ let _sshEditingId = null
 
 async function loadSshServers() {
   try {
-    const res = await fetch('/api/vault/ssh-servers')
+    const res = await fetch('api/vault/ssh-servers')
     const data = await res.json()
     _sshServers = data.servers || []
     renderSshServers()
@@ -7254,7 +7257,7 @@ async function loadSshServers() {
 
 async function loadSshKeys() {
   try {
-    const res = await fetch('/api/vault/ssh-keys')
+    const res = await fetch('api/vault/ssh-keys')
     if (!res.ok) return
     const data = await res.json()
     _sshKeys = data.keys || []
@@ -7297,7 +7300,7 @@ function renderSshKeys() {
       const key = _sshKeys.find(k => k.id === btn.dataset.id)
       if (!key) return
       try {
-        const res = await fetch(`/api/vault/ssh-keys/${encodeURIComponent(btn.dataset.id)}/public-key`)
+        const res = await fetch(`api/vault/ssh-keys/${encodeURIComponent(btn.dataset.id)}/public-key`)
         if (res.ok) {
           const data = await res.json()
           await navigator.clipboard.writeText(data.publicKey || '')
@@ -7310,7 +7313,7 @@ function renderSshKeys() {
   tbody.querySelectorAll('.ssh-key-delete-btn').forEach(btn => {
     btn.addEventListener('click', async () => {
       if (!confirm('Biztosan törlöd ezt a kulcsot?')) return
-      await fetch(`/api/vault/ssh-keys/${encodeURIComponent(btn.dataset.id)}`, { method: 'DELETE' })
+      await fetch(`api/vault/ssh-keys/${encodeURIComponent(btn.dataset.id)}`, { method: 'DELETE' })
       await loadSshKeys()
     })
   })
@@ -7439,7 +7442,7 @@ function renderSshServers() {
       const id = btn.getAttribute('data-id')
       if (!confirm(`Törlöd: ${id}?`)) return
       try {
-        await fetch(`/api/vault/ssh-servers/${encodeURIComponent(id)}`, { method: 'DELETE' })
+        await fetch(`api/vault/ssh-servers/${encodeURIComponent(id)}`, { method: 'DELETE' })
         await loadSshServers()
       } catch { showToast('Törlés sikertelen') }
     })
@@ -7476,7 +7479,7 @@ function renderSshServers() {
       const id = sel.getAttribute('data-id')
       const sshKeyId = sel.value || null
       try {
-        await fetch(`/api/vault/ssh-servers/${encodeURIComponent(id)}`, {
+        await fetch(`api/vault/ssh-servers/${encodeURIComponent(id)}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ sshKeyId }),
@@ -7526,7 +7529,7 @@ function openSshKeygenModal(callback) {
     document.getElementById('sshKeygenFooter').hidden = true
 
     try {
-      const res = await fetch('/api/vault/ssh-keys', {
+      const res = await fetch('api/vault/ssh-keys', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ label, username }),
@@ -7576,7 +7579,7 @@ async function _sshInfoLoadKey(keyId, serverUser) {
 
   let pubkey = ''
   try {
-    const res = await fetch(`/api/vault/ssh-keys/${encodeURIComponent(keyId)}/public-key`)
+    const res = await fetch(`api/vault/ssh-keys/${encodeURIComponent(keyId)}/public-key`)
     if (res.ok) { const d = await res.json(); pubkey = d.publicKey || '' }
   } catch {}
 
@@ -7696,7 +7699,7 @@ function openSshInfoModal(preselectedServerId, { keyOnly = false } = {}) {
 
     if (_sshInfoServerId) {
       try {
-        await fetch(`/api/vault/ssh-servers/${encodeURIComponent(_sshInfoServerId)}`, {
+        await fetch(`api/vault/ssh-servers/${encodeURIComponent(_sshInfoServerId)}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ sshKeyId: keyId }),
@@ -7766,7 +7769,7 @@ function openSshInfoModal(preselectedServerId, { keyOnly = false } = {}) {
     const isEdit = !!_sshEditingId
     try {
       const res = await fetch(
-        isEdit ? `/api/vault/ssh-servers/${encodeURIComponent(_sshEditingId)}` : '/api/vault/ssh-servers',
+        isEdit ? `api/vault/ssh-servers/${encodeURIComponent(_sshEditingId)}` : 'api/vault/ssh-servers',
         {
           method: isEdit ? 'PUT' : 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -7819,8 +7822,8 @@ let _vaultBindings = []
 async function loadVaultPage() {
   try {
     const [secretsRes, bindingsRes] = await Promise.all([
-      fetch('/api/vault'),
-      fetch('/api/vault/bindings'),
+      fetch('api/vault'),
+      fetch('api/vault/bindings'),
     ])
     const secretsData = await secretsRes.json()
     const bindingsData = await bindingsRes.json()
@@ -7854,7 +7857,7 @@ function renderVaultGrid(secrets) {
       const card = btn.closest('.vault-card')
       const existing = card.querySelector('.vault-card-value')
       if (existing) { existing.remove(); btn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg> ${t('vault.btn.show')}`; return }
-      const res = await fetch(`/api/vault/${encodeURIComponent(id)}`)
+      const res = await fetch(`api/vault/${encodeURIComponent(id)}`)
       const data = await res.json()
       if (data.value) {
         const valEl = document.createElement('div')
@@ -7873,7 +7876,7 @@ function renderVaultGrid(secrets) {
       const existing = card.querySelector('.vault-card-edit-form')
       if (existing) { existing.remove(); return }
       card.querySelector('.vault-card-value')?.remove()
-      const res = await fetch(`/api/vault/${encodeURIComponent(id)}`)
+      const res = await fetch(`api/vault/${encodeURIComponent(id)}`)
       const data = await res.json()
       if (!data.value) return
       const form = document.createElement('div')
@@ -7890,7 +7893,7 @@ function renderVaultGrid(secrets) {
         const saveBtn = form.querySelector('.vault-edit-save')
         saveBtn.disabled = true
         saveBtn.textContent = '...'
-        const res = await fetch('/api/vault', {
+        const res = await fetch('api/vault', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ id, label, value: newVal }),
@@ -7917,7 +7920,7 @@ function renderVaultGrid(secrets) {
     btn.addEventListener('click', async () => {
       const id = btn.getAttribute('data-id')
       if (!confirm(`Torlod: ${id}?`)) return
-      const res = await fetch(`/api/vault/${encodeURIComponent(id)}`, { method: 'DELETE' })
+      const res = await fetch(`api/vault/${encodeURIComponent(id)}`, { method: 'DELETE' })
       if (!res.ok) { showToast('Törlés sikertelen'); return }
       loadVaultPage()
       loadVault()
@@ -7944,7 +7947,7 @@ function renderVaultGrid(secrets) {
     const value = document.getElementById('vaultPageValueInput').value
     if (!id || !value) return
     addBtn.disabled = true
-    await fetch('/api/vault', {
+    await fetch('api/vault', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id, label, value }),
@@ -7987,8 +7990,8 @@ function renderVaultGrid(secrets) {
       envVarInput.value = ''
 
       const [secretsRes, connectorsRes] = await Promise.all([
-        fetch('/api/vault'),
-        fetch('/api/connectors'),
+        fetch('api/vault'),
+        fetch('api/connectors'),
       ])
       const secrets = (await secretsRes.json()).secrets || []
       const connectors = await connectorsRes.json()
@@ -8043,7 +8046,7 @@ function renderVaultGrid(secrets) {
     saveBtn.disabled = true
     saveBtn.textContent = t('connectors.save_btn')
     try {
-      const res = await fetch('/api/vault/bindings', {
+      const res = await fetch('api/vault/bindings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ vaultSecretId, envVar, serverName }),
@@ -8085,7 +8088,7 @@ function renderVaultGrid(secrets) {
     scanBtn.disabled = true
     scanBtn.textContent = 'Kereses...'
     try {
-      const res = await fetch('/api/vault/scan')
+      const res = await fetch('api/vault/scan')
       const data = await res.json()
       const findings = data.findings || []
       renderScanResults(findings)
@@ -8103,7 +8106,7 @@ function renderVaultGrid(secrets) {
     syncBtn.disabled = true
     syncBtn.textContent = 'Szinkron...'
     try {
-      const res = await fetch('/api/vault/sync', { method: 'POST' })
+      const res = await fetch('api/vault/sync', { method: 'POST' })
       const data = await res.json()
       if (data.updated > 0) {
         showToast(`${data.updated} .mcp.json frissitve`)
@@ -8169,7 +8172,7 @@ function renderVaultGrid(secrets) {
     const rows = results.querySelectorAll('.vault-scan-row')
     const imports = []
 
-    const scanRes = await fetch('/api/vault/scan')
+    const scanRes = await fetch('api/vault/scan')
     const scanData = await scanRes.json()
     const allFindings = scanData.findings || []
 
@@ -8202,7 +8205,7 @@ function renderVaultGrid(secrets) {
     importBtn.textContent = 'Importalas...'
 
     try {
-      const res = await fetch('/api/vault/import', {
+      const res = await fetch('api/vault/import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ imports }),
@@ -8227,7 +8230,7 @@ function renderVaultGrid(secrets) {
 // --- External project paths management ---
 async function loadExternalPaths() {
   try {
-    const res = await fetch('/api/connectors/external-paths')
+    const res = await fetch('api/connectors/external-paths')
     const data = await res.json()
     const paths = data.paths || []
     document.getElementById('externalPathCount').textContent = String(paths.length)
@@ -8238,7 +8241,7 @@ async function loadExternalPaths() {
       item.className = 'connector-external-item'
       item.innerHTML = `<span>${escapeHtml(p)}</span><button title="Torles">&times;</button>`
       item.querySelector('button').addEventListener('click', async () => {
-        await fetch('/api/connectors/external-paths', {
+        await fetch('api/connectors/external-paths', {
           method: 'DELETE',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ path: p }),
@@ -8265,7 +8268,7 @@ async function loadExternalPaths() {
   addBtn.addEventListener('click', async () => {
     const val = input.value.trim()
     if (!val) return
-    const res = await fetch('/api/connectors/external-paths', {
+    const res = await fetch('api/connectors/external-paths', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: val }),
@@ -8284,7 +8287,7 @@ async function openConnectorDetail(connector) {
 
   // Fetch detailed info
   try {
-    const res = await fetch(`/api/connectors/${encodeURIComponent(connector.name)}`)
+    const res = await fetch(`api/connectors/${encodeURIComponent(connector.name)}`)
     const detail = await res.json()
 
     const statusLabels = { connected: t('connectors.status.connected'), needs_auth: t('connectors.status.needs_auth'), failed: t('connectors.status.failed'), unknown: t('connectors.status.unknown') }
@@ -8309,8 +8312,8 @@ async function openConnectorDetail(connector) {
 
   try {
     const [agentsRes, connectorsRes] = await Promise.all([
-      fetch('/api/schedules/agents'),
-      fetch('/api/connectors'),
+      fetch('api/schedules/agents'),
+      fetch('api/connectors'),
     ])
     const allAgents = await agentsRes.json()
     const allConnectors = await connectorsRes.json()
@@ -8355,7 +8358,7 @@ async function openConnectorDetail(connector) {
   document.getElementById('connectorDeleteBtn').onclick = async () => {
     if (!confirm(`Biztosan torlod: ${connector.name}?`)) return
     try {
-      await fetch(`/api/connectors/${encodeURIComponent(connector.name)}`, { method: 'DELETE' })
+      await fetch(`api/connectors/${encodeURIComponent(connector.name)}`, { method: 'DELETE' })
       closeModal(connectorDetailOverlay)
       showToast(t('connectors.toast.deleted'))
       loadConnectors()
@@ -8369,7 +8372,7 @@ async function openConnectorDetail(connector) {
     const checked = [...document.querySelectorAll('#connectorAgentList input:checked:not(:disabled)')].map(i => i.value)
     const allVisible = [...document.querySelectorAll('#connectorAgentList input:not(:disabled)')].map(i => i.value)
     try {
-      await fetch(`/api/connectors/${encodeURIComponent(connector.name)}/assign`, {
+      await fetch(`api/connectors/${encodeURIComponent(connector.name)}/assign`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ agents: checked, allAgents: allVisible }),
@@ -8402,7 +8405,7 @@ document.getElementById('connectorEnvAddBtn').addEventListener('click', () => {
 
 async function loadNewConnectorAgents() {
   try {
-    const res = await fetch('/api/schedules/agents')
+    const res = await fetch('api/schedules/agents')
     const agents = await res.json()
     const list = document.getElementById('connectorNewAssignList')
     list.innerHTML = ''
@@ -8452,7 +8455,7 @@ document.getElementById('saveConnectorBtn').addEventListener('click', async () =
   btn.querySelector('.btn-loading').hidden = false
 
   try {
-    const res = await fetch('/api/connectors', {
+    const res = await fetch('api/connectors', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),
@@ -8467,7 +8470,7 @@ document.getElementById('saveConnectorBtn').addEventListener('click', async () =
     const checkedAgents = Array.from(document.querySelectorAll('#connectorNewAssignList input[type=checkbox]:checked')).map(cb => cb.value)
     const allAgents = Array.from(document.querySelectorAll('#connectorNewAssignList input[type=checkbox]')).map(cb => cb.value)
     if (checkedAgents.length > 0) {
-      await fetch(`/api/connectors/${encodeURIComponent(savedName)}/assign`, {
+      await fetch(`api/connectors/${encodeURIComponent(savedName)}/assign`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ agents: checkedAgents, allAgents }),
@@ -8523,7 +8526,7 @@ async function loadStatus() {
   listEl.innerHTML = ''
 
   try {
-    const res = await fetch('/api/status')
+    const res = await fetch('api/status')
     const data = await res.json()
 
     // Overall status
@@ -8713,7 +8716,7 @@ memImportSaveBtn.addEventListener('click', async () => {
     memImportStatus.textContent = t('memories.import.importing', { n: allChunks.length })
 
     const agentId = document.getElementById('memImportAgent').value || mainAgentId()
-    const resp = await fetch('/api/memories/import', {
+    const resp = await fetch('api/memories/import', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ agent_id: agentId, chunks: allChunks }),
@@ -8756,7 +8759,7 @@ let migrateFindings = []
 
 async function loadMigrateAgents() {
   try {
-    const res = await fetch('/api/schedules/agents')
+    const res = await fetch('api/schedules/agents')
     const agents = await res.json()
     const sel = document.getElementById('migrateAgent')
     sel.innerHTML = ''
@@ -8780,7 +8783,7 @@ document.getElementById('migrateScanBtn').addEventListener('click', async () => 
   btn.querySelector('.btn-loading').hidden = false
 
   try {
-    const res = await fetch('/api/migrate/scan', {
+    const res = await fetch('api/migrate/scan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sourcePath: path }),
@@ -8875,7 +8878,7 @@ document.getElementById('migrateRunBtn').addEventListener('click', async () => {
   btn.querySelector('.btn-loading').hidden = false
 
   try {
-    const res = await fetch('/api/migrate/run', {
+    const res = await fetch('api/migrate/run', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ findings: migrateFindings, agentId }),
@@ -8959,7 +8962,7 @@ async function loadGlobalSkills() {
   skillsGrid.innerHTML = `<div class="connector-loading"><span class="spinner"></span> ${t('skills.loading')}</div>`
   skillsStats.innerHTML = ''
   try {
-    const res = await fetch('/api/skills')
+    const res = await fetch('api/skills')
     globalSkills = await res.json()
     renderGlobalSkills()
   } catch (err) {
@@ -9029,7 +9032,7 @@ async function openSkillDetail(skillName, displayLabel) {
   document.getElementById('skillDetailTitle').textContent = displayLabel || skillName
 
   try {
-    const res = await fetch(`/api/skills/${encodeURIComponent(skillName)}`)
+    const res = await fetch(`api/skills/${encodeURIComponent(skillName)}`)
     if (!res.ok) throw new Error('Failed to fetch skill detail')
     const detail = await res.json()
 
@@ -9074,7 +9077,7 @@ async function loadTeamGraph() {
   if (!container) return
   container.innerHTML = '<div class="team-empty">' + t('team.loading') + '</div>'
   try {
-    const res = await fetch('/api/team/graph')
+    const res = await fetch('api/team/graph')
     if (!res.ok) throw new Error('HTTP ' + res.status)
     const data = await res.json()
     renderTeamGraph(container, data)
@@ -9100,8 +9103,8 @@ function renderTeamGraph(container, data) {
     const roleLabel = node.role === 'main' ? t('team.role.main') : (node.role === 'leader' ? t('team.role.leader') : t('team.role.member'))
     const running = node.running ? t('team.running') : t('team.stopped')
     const avatarUrl = node.id === mainAgentId
-      ? `/api/marveen/avatar?t=${Date.now()}`
-      : `/api/agents/${encodeURIComponent(node.id)}/avatar?t=${Date.now()}`
+      ? `api/marveen/avatar?t=${Date.now()}`
+      : `api/agents/${encodeURIComponent(node.id)}/avatar?t=${Date.now()}`
     div.innerHTML = `
       <div class="team-node-avatar"><img src="${avatarUrl}" alt="${escapeHtml(node.label || node.id)}" onerror="this.style.display='none'"></div>
       <div class="team-node-name">${escapeHtml(node.label || node.id)}</div>
@@ -9197,7 +9200,7 @@ const MSG_STATUS_META = {
 }
 async function resolveOwnerName() {
   try {
-    const res = await fetch('/api/kanban/assignees')
+    const res = await fetch('api/kanban/assignees')
     if (res.ok) {
       const list = await res.json()
       const owner = Array.isArray(list) ? list.find(a => a.type === 'owner') : null
@@ -9238,8 +9241,8 @@ function chatAvatarHtml(agentName, size = 32) {
   const hasAvatar = chatAgentHasAvatar.get(lower)
   if (!hasAvatar) return chatMonogramEl(agentName, size)
   const src = lower === mainAgentId().toLowerCase()
-    ? `/api/marveen/avatar?t=${Date.now()}`
-    : `/api/agents/${encodeURIComponent(lower)}/avatar?t=${Date.now()}`
+    ? `api/marveen/avatar?t=${Date.now()}`
+    : `api/agents/${encodeURIComponent(lower)}/avatar?t=${Date.now()}`
   return `<img class="chat-avatar" src="${src}" width="${size}" height="${size}" alt="${escapeHtml(agentName)}" data-agent-name="${escapeHtml(agentName)}" onerror="chatImgError(this)">`
 }
 
@@ -9272,8 +9275,8 @@ async function loadChatAgentList() {
   try {
     // Load fleet agents + threads in parallel
     const [agentsRes, threadsRes] = await Promise.all([
-      fetch('/api/agents'),
-      fetch('/api/messages/threads'),
+      fetch('api/agents'),
+      fetch('api/messages/threads'),
     ])
     const agentsRaw = agentsRes.ok ? await agentsRes.json() : []
     const threads = threadsRes.ok ? await threadsRes.json() : []
@@ -9397,7 +9400,7 @@ async function loadChatThread(agentName) {
   // Initial load
   await fetchChatPage(agentName, null, CHAT_PAGE_SIZE, 'replace')
   // Mark thread as read (localStorage last-seen)
-  const threadData = (await fetch('/api/messages/threads').then(r => r.ok ? r.json() : []).catch(() => []))
+  const threadData = (await fetch('api/messages/threads').then(r => r.ok ? r.json() : []).catch(() => []))
     .find(t => t.agent === agentName)
   if (threadData?.lastMessage?.id) {
     chatMarkSeen(agentName, threadData.lastMessage.id)
@@ -9450,7 +9453,7 @@ async function fetchChatPage(agentName, beforeId, limit, mode) {
   if (!container) { chatThreadState.loading = false; return }
   if (loadingIndicator && mode === 'prepend') loadingIndicator.style.display = 'block'
   try {
-    let url = `/api/messages?agent=${encodeURIComponent(agentName)}&limit=${limit}`
+    let url = `api/messages?agent=${encodeURIComponent(agentName)}&limit=${limit}`
     if (beforeId) url += `&before=${beforeId}`
     const res = await fetch(url)
     if (!res.ok) throw new Error('HTTP ' + res.status)
@@ -9518,7 +9521,7 @@ async function sendChatMessage(toAgent) {
   if (btn) btn.disabled = true
   try {
     const from = await resolveOwnerName()
-    const res = await fetch('/api/messages', {
+    const res = await fetch('api/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ from, to: toAgent, content }),
@@ -9600,7 +9603,7 @@ document.getElementById('saveTeamBtn').addEventListener('click', async () => {
   btn.disabled = true
   btn.textContent = t('team.save_saving')
   try {
-    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}/team`, {
+    const res = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}/team`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -9655,7 +9658,7 @@ function formatRelative(ts) {
 
 async function loadOverview() {
   try {
-    const res = await fetch('/api/overview')
+    const res = await fetch('api/overview')
     if (!res.ok) throw new Error('HTTP ' + res.status)
     const d = await res.json()
     // Stats
@@ -9671,7 +9674,7 @@ async function loadOverview() {
     // Team: reuse the hierarchy graph renderer so the overview card shows
     // exactly what the Csapat page does (avatars + reports-to tree).
     try {
-      const tg = await fetch('/api/team/graph')
+      const tg = await fetch('api/team/graph')
       if (tg.ok) {
         const graph = await tg.json()
         renderTeamGraph(document.getElementById('overviewTeamGrid'), graph)
@@ -9713,12 +9716,12 @@ async function loadOverview() {
 async function initSidebarBrand() {
   try {
     const img = document.createElement('img')
-    img.src = '/api/marveen/avatar?t=' + Date.now()
+    img.src = 'api/marveen/avatar?t=' + Date.now()
     img.onload = () => {
       const mark = document.getElementById('sidebarBrandMark')
       if (mark) { mark.textContent = ''; mark.appendChild(img) }
     }
-    const res = await fetch('/api/marveen')
+    const res = await fetch('api/marveen')
     if (res.ok) {
       const m = await res.json()
       const brand = m.brandName || m.name
@@ -9774,7 +9777,7 @@ function renderUpdatesBadge(status) {
 
 async function pollUpdatesBadge() {
   try {
-    const res = await fetch('/api/updates')
+    const res = await fetch('api/updates')
     if (!res.ok) return
     renderUpdatesBadge(await res.json())
   } catch {}
@@ -9788,7 +9791,7 @@ async function loadUpdates() {
   summary.className = 'updates-summary'
   list.innerHTML = ''
   try {
-    const res = await fetch('/api/updates')
+    const res = await fetch('api/updates')
     if (!res.ok) throw new Error('HTTP ' + res.status)
     const data = await res.json()
     renderUpdatesBadge(data)
@@ -9830,7 +9833,7 @@ async function loadUpdates() {
 document.getElementById('updatesCheckBtn').addEventListener('click', async () => {
   const btn = document.getElementById('updatesCheckBtn')
   btn.disabled = true
-  try { await fetch('/api/updates/check', { method: 'POST' }) } catch {}
+  try { await fetch('api/updates/check', { method: 'POST' }) } catch {}
   await loadUpdates()
   btn.disabled = false
 })
@@ -9846,7 +9849,7 @@ async function runUpdate(autoStash) {
     btn.querySelector('.btn-loading').hidden = true
   }
   try {
-    const res = await fetch('/api/updates/apply', {
+    const res = await fetch('api/updates/apply', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ autoStash: autoStash === true }),
@@ -10012,7 +10015,7 @@ document.getElementById('chSlackManifestBtn').addEventListener('click', async ()
   const btn = document.getElementById('chSlackManifestBtn')
   btn.disabled = true
   try {
-    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}/channels/slack/manifest`)
+    const res = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}/channels/slack/manifest`)
     if (!res.ok) throw new Error()
     const data = await res.json()
     showSlackManifestModal(data.manifest, data.instructions)
@@ -10038,7 +10041,7 @@ async function loadRecallPage() {
 
     try {
       // /api/schedules/agents includes the main agent (jarvis); /api/agents lists sub-agents only
-      const res = await fetch('/api/schedules/agents')
+      const res = await fetch('api/schedules/agents')
       if (res.ok) {
         const agents = await res.json()
         const sel = document.getElementById('recallAgent')
@@ -10075,7 +10078,7 @@ async function loadRecallDates() {
   try {
     const agentVal = document.getElementById('recallAgent').value
     const params = agentVal ? `?agent=${encodeURIComponent(agentVal)}&limit=90` : '?limit=90'
-    const res = await fetch('/api/recall/dates' + params)
+    const res = await fetch('api/recall/dates' + params)
     if (!res.ok) return
     const dates = await res.json()
     const dateInput = document.getElementById('recallDate')
@@ -10107,7 +10110,7 @@ async function doRecall() {
   summary.innerHTML = ''
 
   try {
-    const res = await fetch('/api/recall?' + params.toString())
+    const res = await fetch('api/recall?' + params.toString())
     if (!res.ok) {
       const err = await res.json().catch(() => ({}))
       timeline.innerHTML = `<p class="recall-error">${esc(err.error || t('recall.error'))}</p>`
@@ -10205,7 +10208,7 @@ async function loadBgTasksPage() {
       // Use /api/schedules/agents (not /api/agents) so the main agent is a
       // selectable background-task target too -- /api/agents lists sub-agents
       // only, while the backend (spawnBackgroundTask) accepts any agent_id.
-      const res = await fetch('/api/schedules/agents')
+      const res = await fetch('api/schedules/agents')
       if (res.ok) {
         const agents = await res.json()
         const sel = document.getElementById('bgAgent')
@@ -10237,7 +10240,7 @@ async function startBgTask() {
   const btn = document.getElementById('bgStartBtn')
   btn.disabled = true
   try {
-    const res = await fetch('/api/background-tasks', {
+    const res = await fetch('api/background-tasks', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ agent_id: agent, prompt }),
@@ -10266,7 +10269,7 @@ async function loadBgTasks() {
     const params = new URLSearchParams()
     if (agentVal) params.set('agent', agentVal)
     if (showAll) params.set('all', 'true')
-    const res = await fetch('/api/background-tasks?' + params.toString())
+    const res = await fetch('api/background-tasks?' + params.toString())
     if (!res.ok) { list.innerHTML = `<p style="color:var(--danger)">${t('bgTasks.error')}</p>`; return }
     const tasks = await res.json()
 
@@ -10305,7 +10308,7 @@ async function loadBgTasks() {
 
 async function viewBgTask(id) {
   try {
-    const res = await fetch(`/api/background-tasks/${id}`)
+    const res = await fetch(`api/background-tasks/${id}`)
     if (!res.ok) { showToast(t('bgTasks.load_error')); return }
     const task = await res.json()
     const output = task.liveOutput || task.output || t('bgTasks.no_output')
@@ -10329,7 +10332,7 @@ async function viewBgTask(id) {
 async function cancelBgTask(id) {
   if (!confirm(t('bgTasks.cancel.confirm'))) return
   try {
-    const res = await fetch(`/api/background-tasks/${id}`, { method: 'DELETE' })
+    const res = await fetch(`api/background-tasks/${id}`, { method: 'DELETE' })
     if (res.ok) {
       showToast(t('bgTasks.toast.stopped'))
       loadBgTasks()
@@ -10353,7 +10356,7 @@ async function loadAutonomy() {
   grid.innerHTML = `<p style="color:var(--text-muted);font-size:13px">${t('autonomy.loading')}</p>`
 
   try {
-    const res = await fetch('/api/autonomy')
+    const res = await fetch('api/autonomy')
     if (!res.ok) throw new Error('fetch failed')
     const config = await res.json()
 
@@ -10413,7 +10416,7 @@ async function loadAutonomy() {
 
 async function setAutonomyLevel(key, level) {
   try {
-    const res = await fetch('/api/autonomy', {
+    const res = await fetch('api/autonomy', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ key, level }),
@@ -10476,7 +10479,7 @@ async function loadSettings() {
   updateSettingsSaveBar()
 
   try {
-    const res = await fetch('/api/settings')
+    const res = await fetch('api/settings')
     if (!res.ok) throw new Error('fetch failed')
     const { settings } = await res.json()
 
@@ -10609,7 +10612,7 @@ async function saveAllSettings() {
     errorEl.textContent = ''
     const raw = type === 'int' ? Number(input.value) : input.value
     try {
-      const res = await fetch('/api/settings', {
+      const res = await fetch('api/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ key, value: raw }),
@@ -10688,7 +10691,7 @@ document.getElementById('settingsResetBtn')?.addEventListener('click', resetAllS
   async function checkStatus() {
     showState('Loading')
     try {
-      const res = await fetch('/api/connectors-hu/status')
+      const res = await fetch('api/connectors-hu/status')
       if (!res.ok) throw new Error('HTTP ' + res.status)
       const data = await res.json()
       if (data.installed && data.configured) {
@@ -10716,7 +10719,7 @@ document.getElementById('settingsResetBtn')?.addEventListener('click', resetAllS
     installBtn.addEventListener('click', async () => {
       showState('Installing')
       try {
-        const res = await fetch('/api/connectors-hu/install', { method: 'POST' })
+        const res = await fetch('api/connectors-hu/install', { method: 'POST' })
         const data = await res.json().catch(() => ({}))
         if (!res.ok || !data.ok) throw new Error(data.error || t('connectors.error.install'))
         showState('Token')
@@ -10737,7 +10740,7 @@ document.getElementById('settingsResetBtn')?.addEventListener('click', resetAllS
       }
       showState('Configuring')
       try {
-        const res = await fetch('/api/connectors-hu/configure', {
+        const res = await fetch('api/connectors-hu/configure', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ token: token.trim() }),
@@ -10802,7 +10805,7 @@ async function loadTokenUsage() {
   if (from) params.set('from', from)
   if (to) params.set('to', to)
 
-  const summaryRes = await fetch('/api/token-usage/summary?' + params)
+  const summaryRes = await fetch('api/token-usage/summary?' + params)
   if (!summaryRes.ok) return
   const summary = await summaryRes.json()
   summary.sort((a, b) => {
@@ -10827,7 +10830,7 @@ async function loadTokenUsage() {
   const bucketMin = period === '1h' ? 5 : 60
   const tlParams = new URLSearchParams(params)
   tlParams.set('bucket', String(bucketMin))
-  const tlRes = await fetch('/api/token-usage/timeline?' + tlParams)
+  const tlRes = await fetch('api/token-usage/timeline?' + tlParams)
   if (!tlRes.ok) return
   const timeline = await tlRes.json()
   renderTuTimeline(timeline, agent)
@@ -11422,7 +11425,7 @@ async function tuFetchDetails() {
   if (!tuDetailSearch) params.set('min_tokens', minTokens)
   if (tuDetailSearch) params.set('q', tuDetailSearch)
   params.set('limit', '200')
-  const detailRes = await fetch('/api/token-usage?' + params)
+  const detailRes = await fetch('api/token-usage?' + params)
   if (!detailRes.ok) return
   const details = await detailRes.json()
   renderTuDetails(details)
@@ -11433,7 +11436,7 @@ document.getElementById('tuCollectBtn')?.addEventListener('click', async () => {
   btn.disabled = true
   btn.textContent = t('tokenUsage.collect_btn.collecting')
   try {
-    const res = await fetch('/api/token-usage/collect', { method: 'POST' }).then(r => r.json())
+    const res = await fetch('api/token-usage/collect', { method: 'POST' }).then(r => r.json())
     btn.textContent = t('tokenUsage.collect_done', { n: res.inserted || 0 })
     setTimeout(() => { btn.textContent = t('tokenUsage.collect_btn.collect'); btn.disabled = false }, 2000)
     loadTokenUsage()
@@ -11470,7 +11473,7 @@ async function loadIdeasPage() {
   // 'active' = new+reviewed, fetched unfiltered then narrowed client-side
   if (statusFilter && statusFilter !== 'active') params.set('status', statusFilter)
   if (categoryFilter) params.set('category', categoryFilter)
-  const [ideasRes, catsRes] = await Promise.all([fetch('/api/ideas?' + params), fetch('/api/ideas/categories')])
+  const [ideasRes, catsRes] = await Promise.all([fetch('api/ideas?' + params), fetch('api/ideas/categories')])
   ideas = await ideasRes.json()
   if (statusFilter === 'active') ideas = ideas.filter(i => i.status === 'new' || i.status === 'reviewed')
   const cats = await catsRes.json()
@@ -11593,9 +11596,9 @@ async function saveIdea() {
     effort: effortRaw ? parseInt(effortRaw) : null,
   }
   if (ideaEditId) {
-    await fetch(`/api/ideas/${ideaEditId}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    await fetch(`api/ideas/${ideaEditId}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
   } else {
-    await fetch('/api/ideas', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body, status: 'new' }) })
+    await fetch('api/ideas', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body, status: 'new' }) })
   }
   closeModal(document.getElementById('ideaModalOverlay'))
   loadIdeasPage()
@@ -11603,7 +11606,7 @@ async function saveIdea() {
 
 async function deleteIdeaItem(id) {
   if (!confirm(t('kanban.confirm.delete'))) return
-  await fetch(`/api/ideas/${id}`, { method: 'DELETE' })
+  await fetch(`api/ideas/${id}`, { method: 'DELETE' })
   loadIdeasPage()
 }
 
@@ -11646,7 +11649,7 @@ document.getElementById('ideaDetailScoreSave')?.addEventListener('click', async 
   const impact = document.getElementById('ideaDetailImpact').value
   const effort = document.getElementById('ideaDetailEffort').value
   try {
-    const res = await fetch(`/api/ideas/${encodeURIComponent(ideaDetailId)}`, {
+    const res = await fetch(`api/ideas/${encodeURIComponent(ideaDetailId)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -11670,7 +11673,7 @@ document.getElementById('ideaDetailScoreSave')?.addEventListener('click', async 
 async function loadIdeaComments(id) {
   const list = document.getElementById('ideaCommentsList')
   try {
-    const res = await fetch(`/api/ideas/${encodeURIComponent(id)}/comments`)
+    const res = await fetch(`api/ideas/${encodeURIComponent(id)}/comments`)
     const data = await res.json()
     if (!data.comments || !data.comments.length) {
       list.innerHTML = `<div style="color:var(--text-muted);font-size:12px;padding:6px 0">${t('ideas.comments.empty')}</div>`
@@ -11694,7 +11697,7 @@ document.getElementById('ideaCommentSubmit')?.addEventListener('click', async ()
   const content = document.getElementById('ideaCommentContent').value.trim()
   if (!content) { document.getElementById('ideaCommentContent').focus(); return }
   try {
-    const res = await fetch(`/api/ideas/${encodeURIComponent(ideaDetailId)}/comments`, {
+    const res = await fetch(`api/ideas/${encodeURIComponent(ideaDetailId)}/comments`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content }),
@@ -11720,7 +11723,7 @@ function openIdeaPromote(id) {
 
 async function promoteIdea(phase) {
   if (!ideasPromoteId) return
-  const res = await fetch(`/api/ideas/${ideasPromoteId}/promote`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ phase }) })
+  const res = await fetch(`api/ideas/${ideasPromoteId}/promote`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ phase }) })
   const data = await res.json()
   ideasPromoteId = null
   closeModal(document.getElementById('ideaPromoteOverlay'))
@@ -11730,7 +11733,7 @@ async function promoteIdea(phase) {
 
 async function setIdeaStatus(id, status) {
   try {
-    const res = await fetch(`/api/ideas/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status }) })
+    const res = await fetch(`api/ideas/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status }) })
     if (!res.ok) { showToast(t('ideas.toast.status_error')); return }
     loadIdeasPage()
   } catch { showToast(t('ideas.toast.status_error')) }
@@ -11745,11 +11748,11 @@ async function openIdeaBreakdown(id) {
   // populated by loadKanban(). If the user lands here without visiting the board,
   // fetch it so the AI-suggested assignees are selectable.
   if (!kanbanAssignees.length) {
-    try { kanbanAssignees = await (await fetch('/api/kanban/assignees')).json() } catch { /* dropdown falls back to "nincs" */ }
+    try { kanbanAssignees = await (await fetch('api/kanban/assignees')).json() } catch { /* dropdown falls back to "nincs" */ }
   }
   showToast(t('ideas.toast.ai_elaborating'))
   try {
-    const res = await fetch(`/api/ideas/${id}/breakdown`, { method: 'POST', headers: { 'Content-Type': 'application/json' } })
+    const res = await fetch(`api/ideas/${id}/breakdown`, { method: 'POST', headers: { 'Content-Type': 'application/json' } })
     const data = await res.json()
     if (!res.ok) { showToast(data.error || 'Breakdown hiba'); return }
     if (!data.subtasks || !data.subtasks.length) { showToast('Az AI nem adott vissza alfeladatot'); return }
@@ -11784,7 +11787,7 @@ async function handleAgentLogin(agentName, btn) {
   const origText = btn.textContent
   btn.textContent = phase === 'start' ? t('agents.auth.btn_starting') : t('agents.auth.btn_confirming')
   try {
-    const res = await fetch(`/api/agents/${encodeURIComponent(agentName)}/login`, {
+    const res = await fetch(`api/agents/${encodeURIComponent(agentName)}/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ phase }),
@@ -11837,7 +11840,7 @@ function openTerminalModal(agentName) {
   title.textContent = agentName + ' - Terminal'
 
   // Read the current server-side gate so the modal reflects reality on open.
-  fetch('/api/terminal-input')
+  fetch('api/terminal-input')
     .then(r => r.ok ? r.json() : { enabled: false })
     .then(d => { terminalInputEnabled = d.enabled === true; syncTerminalInputToggleUI() })
     .catch(() => { terminalInputEnabled = false; syncTerminalInputToggleUI() })
@@ -11889,7 +11892,7 @@ function openTerminalModal(agentName) {
     term.write('\x1b[3J\x1b[2J\x1b[H' + latestPane)
   }
   const token = localStorage.getItem('marveen-dashboard-token') || ''
-  const sse = new EventSource(`/api/agents/${encodeURIComponent(agentName)}/pane/stream?token=${encodeURIComponent(token)}`)
+  const sse = new EventSource(`api/agents/${encodeURIComponent(agentName)}/pane/stream?token=${encodeURIComponent(token)}`)
   sse.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data)
@@ -11925,7 +11928,7 @@ function openTerminalModal(agentName) {
     }
     const special = ESC_TO_SPECIAL[data]
     const body = special ? { special } : { keys: data }
-    fetch(`/api/agents/${encodeURIComponent(agentName)}/keys`, {
+    fetch(`api/agents/${encodeURIComponent(agentName)}/keys`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     }).catch(() => {})
@@ -11953,7 +11956,7 @@ document.getElementById('terminalClose')?.addEventListener('click', () => {
 // state, POST it, then reconcile with the server's authoritative response.
 document.getElementById('terminalInputToggle')?.addEventListener('change', (e) => {
   const desired = e.target.checked === true
-  fetch('/api/terminal-input', {
+  fetch('api/terminal-input', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ enabled: desired }),
   })
@@ -11998,7 +12001,7 @@ async function loadConversation() {
   const container = document.getElementById('conversationContainer')
   const token = localStorage.getItem('marveen-dashboard-token') || ''
   try {
-    const r = await fetch(`/api/agents/${encodeURIComponent(conversationAgentName)}/conversation?limit=${CONVERSATION_PAGE_SIZE}&offset=0`, {
+    const r = await fetch(`api/agents/${encodeURIComponent(conversationAgentName)}/conversation?limit=${CONVERSATION_PAGE_SIZE}&offset=0`, {
       headers: { 'Authorization': 'Bearer ' + token },
     })
     const d = await r.json()
@@ -12022,7 +12025,7 @@ async function loadOlderConversation() {
   const token = localStorage.getItem('marveen-dashboard-token') || ''
   try {
     const offset = conversationEntries.length
-    const r = await fetch(`/api/agents/${encodeURIComponent(conversationAgentName)}/conversation?limit=${CONVERSATION_PAGE_SIZE}&offset=${offset}`, {
+    const r = await fetch(`api/agents/${encodeURIComponent(conversationAgentName)}/conversation?limit=${CONVERSATION_PAGE_SIZE}&offset=${offset}`, {
       headers: { 'Authorization': 'Bearer ' + token },
     })
     const d = await r.json()
@@ -12201,7 +12204,7 @@ async function loadDocs() {
   listEl.innerHTML = '<p class="muted">' + t('docs.loading') + '</p>'
   let docs = []
   try {
-    const res = await fetch('/api/docs')
+    const res = await fetch('api/docs')
     docs = await res.json()
     if (!Array.isArray(docs)) docs = []
   } catch (e) {
@@ -12236,7 +12239,7 @@ async function openDoc(name) {
   if (!contentEl) return
   contentEl.innerHTML = '<p class="muted">' + t('docs.loading') + '</p>'
   try {
-    const res = await fetch('/api/docs/' + encodeURIComponent(name))
+    const res = await fetch('api/docs/' + encodeURIComponent(name))
     if (!res.ok) throw new Error('HTTP ' + res.status)
     const doc = await res.json()
     const content = doc.content || ''
@@ -12302,7 +12305,7 @@ function downloadMarkdown(name, content) {
     if (host === 'localhost' || host === '127.0.0.1') {
       qrBox.innerHTML = `<p class="muted">${t('mobile_login.generating')}</p>`
       try {
-        const r = await fetch('/api/network-info', { headers: { 'Authorization': 'Bearer ' + token } })
+        const r = await fetch('api/network-info', { headers: { 'Authorization': 'Bearer ' + token } })
         const info = r.ok ? await r.json() : {}
         if (info.lan_ip) {
           base = 'http://' + info.lan_ip + ':' + (info.port || window.location.port || '3420')
@@ -12315,7 +12318,7 @@ function downloadMarkdown(name, content) {
         return
       }
     }
-    const url = base + '/?token=' + token
+    const url = base + window.location.pathname + '?token=' + token
     try {
       const qr = qrcode(0, 'M') // typeNumber 0 = auto-fit, ECC level M
       qr.addData(url)
@@ -12419,7 +12422,7 @@ function downloadMarkdown(name, content) {
     const commentsBox = document.getElementById('archivedDetailComments')
     commentsBox.innerHTML = ''
     try {
-      const res = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/comments`)
+      const res = await fetch(`api/kanban/${encodeURIComponent(card.id)}/comments`)
       const comments = res.ok ? await res.json() : []
       if (Array.isArray(comments) && comments.length > 0) {
         for (const c of comments) {
@@ -12442,7 +12445,7 @@ function downloadMarkdown(name, content) {
       restoreBtn.disabled = true
       restoreBtn.textContent = t('archived.btn.restoring')
       try {
-        const resp = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/unarchive`, { method: 'POST' })
+        const resp = await fetch(`api/kanban/${encodeURIComponent(card.id)}/unarchive`, { method: 'POST' })
         if (resp.ok) {
           closeModal(document.getElementById('archivedDetailOverlay'))
           doArchivedSearch()
@@ -12461,7 +12464,7 @@ function downloadMarkdown(name, content) {
 
   async function populateArchivedProjects() {
     try {
-      const r = await fetch('/api/kanban-projects')
+      const r = await fetch('api/kanban-projects')
       if (!r.ok) return
       const projects = await r.json()
       const sel = document.getElementById('archivedProject')
@@ -12495,7 +12498,7 @@ function downloadMarkdown(name, content) {
     if (to) params.set('to', Math.floor(new Date(to + 'T23:59:59').getTime() / 1000))
 
     try {
-      const r = await fetch('/api/kanban/archived?' + params.toString())
+      const r = await fetch('api/kanban/archived?' + params.toString())
       if (!r.ok) { list.innerHTML = '<p class="naplo-empty error">' + t('archived.error.http', {status: r.status}) + '</p>'; return }
       const data = await r.json()
       const cards = data.cards || []
@@ -12518,7 +12521,7 @@ function downloadMarkdown(name, content) {
           btn.disabled = true
           btn.textContent = '...'
           try {
-            const resp = await fetch(`/api/kanban/${id}/unarchive`, { method: 'POST' })
+            const resp = await fetch(`api/kanban/${id}/unarchive`, { method: 'POST' })
             if (resp.ok) {
               const cardEl = btn.closest('.archived-card')
               if (cardEl) cardEl.style.opacity = '0.4'
@@ -12624,7 +12627,7 @@ function downloadMarkdown(name, content) {
     params.set('limit', '200')
 
     try {
-      const res = await fetch('/api/audit-log?' + params.toString())
+      const res = await fetch('api/audit-log?' + params.toString())
       if (!res.ok) { timeline.innerHTML = `<p class="naplo-empty error">Hiba: ${res.status}</p>`; return }
       const data = await res.json()
       const entries = data.entries || []
