@@ -89,6 +89,24 @@ ensure_block_in_rc() {
 
 INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# CLI flag parsing -- runs before the interactive wizard.
+# WEB_PORT can also be set as an env var (env var wins if --port is not given).
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --port|--web-port)
+      if [[ -z "${2:-}" || "${2}" == --* ]]; then
+        echo "Error: --port requires a numeric argument (e.g. --port 3421)" >&2; exit 1
+      fi
+      WEB_PORT="$2"; shift 2 ;;
+    --help|-h)
+      echo "Usage: $0 [--port <N>]"
+      echo "  --port <N>   Dashboard port (default: 3420). Also settable via WEB_PORT env var."
+      exit 0 ;;
+    *) echo "Unknown option: $1 (use --help for usage)" >&2; exit 1 ;;
+  esac
+done
+WEB_PORT="${WEB_PORT:-3420}"
+
 clear
 echo ""
 echo -e "${BOLD}  ▐▛███▜▌   Marveen${NC}"
@@ -268,13 +286,65 @@ echo -e "${BOLD}$(_t section_2_linux)${NC}"
 ensure_in_rc '.local/bin' 'export PATH="$HOME/.local/bin:$PATH"'
 export PATH="$HOME/.local/bin:$PATH"
 
-if command -v claude &>/dev/null; then
-  ok "claude mar telepitve: $(claude --version 2>/dev/null || echo 'ok')"
+# Does an installed claude actually LAUNCH? On an AVX-less x86 host the official
+# installer's Bun standalone binary SIGILLs / hangs on start, so `command -v`
+# alone is not enough -- we verify it runs (with a timeout so a hanging Bun
+# binary cannot wedge the installer).
+_claude_runs() { command -v claude >/dev/null 2>&1 && timeout 25 claude --version </dev/null >/dev/null 2>&1; }
+
+# Pinned Node-based fallback for AVX-less hosts. @2.1.110 is the LAST version
+# that ships bin=cli.js (a `#!/usr/bin/env node` entrypoint) running without
+# AVX -- 2.1.120+ bundles only the Bun ELF binary, so DO NOT use latest here.
+# Unlike the old 2.0.76 pin, 2.1.110 also understands `--channels`, which
+# channels.sh requires to boot the bot. Verified on the AVX-less pilot VPS.
+CLAUDE_PIN="2.1.110"
+
+if _claude_runs; then
+  ok "claude mar telepitve es fut: $(claude --version 2>/dev/null || echo 'ok')"
 else
-  echo -e "  Claude Code telepitese (~/.local/bin)..."
-  curl -fsSL https://claude.ai/install.sh | bash
+  # AVX pre-flight: the official installer's Bun binary needs AVX. Only x86
+  # (has a `flags :` line in /proc/cpuinfo) can lack it; ARM (`Features :`, no
+  # `avx`) runs the arm64 Bun binary fine, so it takes the official path.
+  if grep -qE '^flags[[:space:]]*:' /proc/cpuinfo 2>/dev/null && ! grep -qiw avx /proc/cpuinfo 2>/dev/null; then
+    warn "A CPU nem tamogatja az AVX-et; a hivatalos installer Bun-binaryja elszallna (SIGILL)."
+    echo -e "  ${DIM}Pinnelt Node-verzio telepitese: @${CLAUDE_PIN} (nehany legfrissebb Claude Code fix kimaradhat, de fut AVX nelkul).${NC}"
+    # The auto-updater would replace the pinned Node cli.js with the latest
+    # Bun binary on first run -> SIGILL. Disable it persistently (rc files for
+    # interactive shells; channels.sh exports it for the agent sessions).
+    ensure_in_rc 'DISABLE_AUTOUPDATER' 'export DISABLE_AUTOUPDATER=1'
+    export DISABLE_AUTOUPDATER=1
+    if command -v npm >/dev/null 2>&1; then
+      npm install -g "@anthropic-ai/claude-code@${CLAUDE_PIN}" || warn "npm install sikertelen (@${CLAUDE_PIN})."
+    else
+      warn "npm nem elerheto; a pinnelt hivatalos installert probalom (@${CLAUDE_PIN})."
+      curl -fsSL https://claude.ai/install.sh | bash -s "${CLAUDE_PIN}" || warn "pinnelt install.sh sikertelen."
+    fi
+  else
+    echo -e "  Claude Code telepitese (hivatalos installer, ~/.local/bin)..."
+    curl -fsSL https://claude.ai/install.sh | bash
+  fi
   hash -r
-  ok "claude telepitve -> ~/.local/bin/claude"
+  # Verify the install actually launches -- surfaces an AVX crash HERE with a
+  # clear message instead of a cryptic SIGILL at first agent-spawn.
+  if _claude_runs; then
+    ok "claude telepitve es fut: $(claude --version 2>/dev/null || echo 'ok')"
+  else
+    echo -e "  ${RED}HIBA:${NC} claude telepitve, de nem indul (valoszinuleg AVX-hianyos CPU + Bun-binary)."
+    if command -v npm >/dev/null 2>&1; then
+      echo -e "  ${DIM}Probald manualisan: npm install -g @anthropic-ai/claude-code@${CLAUDE_PIN}${NC}"
+    else
+      echo -e "  ${DIM}Telepits nvm+node-ot, majd: npm install -g @anthropic-ai/claude-code@${CLAUDE_PIN}${NC}"
+    fi
+  fi
+fi
+
+# Channel inbound org-policy gate: ensure the system managed-settings enable
+# channels. claude-code >= 2.1.205 silently drops channel-plugin INBOUND
+# notifications on a team/enterprise org unless managed-settings has
+# channelsEnabled:true (harmless / no-op on a personal org). Idempotent.
+if [ -f "$INSTALL_DIR/scripts/ensure-managed-channels-enabled.sh" ]; then
+  echo -e "  Managed-settings channel-kapu ellenorzese..."
+  bash "$INSTALL_DIR/scripts/ensure-managed-channels-enabled.sh" || true
 fi
 
 # Linuxbrew (ha telepitve van)
@@ -656,6 +726,7 @@ BOT_NAME=${BOT_NAME}
 BRAND_NAME=${BRAND_NAME}
 MAIN_AGENT_ID=${MAIN_AGENT_ID}
 SERVICE_ID=${SERVICE_ID}
+WEB_PORT=${WEB_PORT:-3420}
 ENVEOF
 )
 if [ "$CHANNEL_PROVIDER" = "telegram" ]; then
@@ -675,6 +746,18 @@ if [ -n "${CLAUDE_AUTH_ENV_LINE:-}" ]; then
   echo "$CLAUDE_AUTH_ENV_LINE" >> "$INSTALL_DIR/.env"
 fi
 chmod 600 "$INSTALL_DIR/.env"
+# Fleet setup-token file: per-agent config-dir isolation and the credentials
+# guard are BOTH gated on store/.claude-oauth-token; without it every
+# sub-agent silently falls back to the shared rotating
+# ~/.claude/.credentials.json (2026-07-15 bootcamp bug family). Parity with
+# the dashboard wizard (/api/onboarding/claude-auth) and scripts/auth.sh.
+# Shape-gated (a garbage paste must not poison every sub-agent launch) and
+# written under umask 077 (no 644 window before a chmod).
+if [ -n "${OAUTH_TOKEN_INPUT:-}" ] && printf '%s' "$OAUTH_TOKEN_INPUT" | grep -Eq '^sk-ant-oat01-[A-Za-z0-9_-]{40,}$'; then
+  mkdir -p "$INSTALL_DIR/store"
+  (umask 077 && printf '%s' "$OAUTH_TOKEN_INPUT" > "$INSTALL_DIR/store/.claude-oauth-token")
+  ok "Fleet setup-token eltarolva (store/.claude-oauth-token) -- per-agent izolacio aktiv"
+fi
 ok ".env letrehozva (chmod 600)"
 
 # CLAUDE.md generalasa template-bol
@@ -684,6 +767,7 @@ if [ -f "$INSTALL_DIR/templates/CLAUDE.md.template" ]; then
     -e "s/{{CHAT_ID}}/$CHAT_ID/g" \
     -e "s/{{BOT_NAME}}/$BOT_NAME/g" \
     -e "s/{{MAIN_AGENT_ID}}/$MAIN_AGENT_ID/g" \
+    -e "s/{{WEB_PORT}}/${WEB_PORT:-3420}/g" \
     "$INSTALL_DIR/templates/CLAUDE.md.template" >"$INSTALL_DIR/CLAUDE.md"
   ok "CLAUDE.md generalva"
 else
@@ -1174,6 +1258,11 @@ cat >"$SYSTEMD_DIR/${CHAN_UNIT}.service" <<EOF
 [Unit]
 Description=${BOT_NAME} Channels (Telegram bridge)
 After=network.target
+# StartLimit* belong in [Unit], not [Service] (systemd logs "Unknown key
+# StartLimitIntervalSec in section [Service]" and ignores them there), so the
+# crash-loop throttle only applies when they live here.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -1191,8 +1280,6 @@ ExecStartPre=$INSTALL_DIR/scripts/ensure-native-modules.sh
 ExecStart=$INSTALL_DIR/scripts/channels.sh
 Restart=on-failure
 RestartSec=10
-StartLimitIntervalSec=300
-StartLimitBurst=5
 StandardOutput=append:$INSTALL_DIR/store/channels.log
 StandardError=append:$INSTALL_DIR/store/channels.error.log
 Environment=PATH=$HOME/.local/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin
@@ -1234,6 +1321,57 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
+# marveen-host-watchdog.service -- host/WSL-VM restart detector (btime-based).
+# Distinguishes a whole-VM restart (all units down at once, NOT an app crash)
+# from a service crash, and Telegrams it. See scripts/host-restart-watchdog.sh.
+cat >"$SYSTEMD_DIR/${SERVICE_ID}-host-watchdog.service" <<EOF
+[Unit]
+Description=${BOT_NAME} host/WSL-VM restart watchdog (btime-based)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$INSTALL_DIR/scripts/host-restart-watchdog.sh
+Environment=MARVEEN_STORE=$INSTALL_DIR/store
+Environment=TELEGRAM_ENV=$HOME/.claude/channels/telegram/.env
+Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=$HOME
+${TZ_LINE}
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+EOF
+
+# marveen-notify@.service -- templated app-crash notifier, fired by OnFailure=
+# drop-ins on the dashboard/channels units. OnFailure => app crash (vs the
+# host-watchdog's btime-change => host restart).
+cat >"$SYSTEMD_DIR/${SERVICE_ID}-notify@.service" <<EOF
+[Unit]
+Description=${BOT_NAME} app-crash notifier for %i
+
+[Service]
+Type=oneshot
+ExecStart=$INSTALL_DIR/scripts/unit-fail-notify.sh %i
+Environment=TELEGRAM_ENV=$HOME/.claude/channels/telegram/.env
+Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=$HOME
+${TZ_LINE}
+StandardOutput=journal
+StandardError=journal
+EOF
+
+# OnFailure drop-ins: wire the app-crash notifier onto the two long-running units.
+for u in "${DASH_UNIT}" "${CHAN_UNIT}"; do
+  mkdir -p "$SYSTEMD_DIR/${u}.service.d"
+  cat >"$SYSTEMD_DIR/${u}.service.d/onfailure.conf" <<EOF
+[Unit]
+OnFailure=${SERVICE_ID}-notify@%n.service
+EOF
+done
+
 # 1. linger eloszor: ez engedelyezi a user systemd sessiont boot utan is,
 #    es headless-en az aktualis script futasa alatt is szukseges lehet
 if loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
@@ -1262,7 +1400,7 @@ fi
 SVCFAIL=0
 if pidof systemd >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
   systemctl --user daemon-reload
-  systemctl --user enable "${DASH_UNIT}" "${CHAN_UNIT}" "${MORN_UNIT}.timer" 2>/dev/null || true
+  systemctl --user enable "${DASH_UNIT}" "${CHAN_UNIT}" "${MORN_UNIT}.timer" "${SERVICE_ID}-host-watchdog.service" 2>/dev/null || true
   ok "systemd unitok generalva es engedelyezve"
   systemctl --user start "${DASH_UNIT}" "${CHAN_UNIT}" 2>/dev/null || true
   sleep 2
@@ -1419,7 +1557,7 @@ if [ "$DO_MIGRATE" = "i" ]; then
   if [ -f "$INSTALL_DIR/scripts/migrate.sh" ]; then
     "$INSTALL_DIR/scripts/migrate.sh"
   else
-    warn "A migrate.sh nem talalhato. Hasznald a dashboardot: http://localhost:3420 -> Koltoztes"
+    warn "A migrate.sh nem talalhato. Hasznald a dashboardot: http://localhost:${WEB_PORT:-3420} -> Koltoztes"
   fi
 fi
 
@@ -1452,10 +1590,10 @@ if [ -f "$INSTALL_DIR/store/.dashboard-token" ]; then
   DASH_TOKEN=$(cat "$INSTALL_DIR/store/.dashboard-token")
 fi
 if [ -n "$DASH_TOKEN" ]; then
-  echo -e "  ${BOLD}Dashboard:${NC} ${BLUE}http://localhost:3420/?token=${DASH_TOKEN}${NC}"
+  echo -e "  ${BOLD}Dashboard:${NC} ${BLUE}http://localhost:${WEB_PORT:-3420}/?token=${DASH_TOKEN}${NC}"
   echo -e "  ${DIM}$(_t dash.token_hint)${NC}"
 else
-  echo -e "  ${BOLD}Dashboard:${NC} http://localhost:3420"
+  echo -e "  ${BOLD}Dashboard:${NC} http://localhost:${WEB_PORT:-3420}"
   echo -e "  ${DIM}(A tokenes URL-t a szerver logban talalod)${NC}"
 fi
 echo ""
