@@ -1019,6 +1019,19 @@ export function touchMemory(id: number): void {
   ).run(now, id)
 }
 
+// Mark a batch of memories as just-recalled (bumps accessed_at only). Used by
+// the agent-memory read endpoint so that accessed_at reflects real usage --
+// without this, agent memories keep accessed_at == created_at forever and any
+// "not accessed in N days" staleness check (e.g. the Dream Engine hygiene pass)
+// treats even freshly-recalled memories as stale. Salience is intentionally
+// left untouched here; this is a lightweight recency stamp, not a ranking bump.
+export function touchMemoriesAccessed(ids: number[]): void {
+  if (ids.length === 0) return
+  const now = Math.floor(Date.now() / 1000)
+  const placeholders = ids.map(() => '?').join(',')
+  db.prepare(`UPDATE memories SET accessed_at = ? WHERE id IN (${placeholders})`).run(now, ...ids)
+}
+
 export function decayMemories(): void {
   const oneWeekAgo = Math.floor(Date.now() / 1000) - 7 * 86400
   // Gentler decay: 0.5% per day, only for memories older than 1 week
@@ -1634,6 +1647,30 @@ export function getKanbanSeqByIdPrefix(prefix: string): number | null {
   ).all(prefix) as { seq: number }[]
   if (rows.length !== 1) return null
   return rows[0].seq
+}
+
+// Find an active (non-archived) kanban card by exact title match, or
+// undefined when none exists.
+export function findActiveKanbanCardByTitle(title: string): KanbanCard | undefined {
+  return db.prepare(
+    'SELECT rowid AS seq, * FROM kanban_cards WHERE title = ? AND archived_at IS NULL LIMIT 1'
+  ).get(title) as KanbanCard | undefined
+}
+
+// Move the first active kanban card whose title equals `taskName` to the
+// 'waiting' status, appending it at the end of the waiting column.
+// Returns the card id when a match was found and updated, null otherwise.
+// Used by the scheduled-task fire-timeout watchdog when alerting about a
+// potentially stuck task.
+export function markScheduledTaskKanbanWaiting(taskName: string): string | null {
+  const card = findActiveKanbanCardByTitle(taskName)
+  if (!card) return null
+  const maxResult = db.prepare(
+    "SELECT MAX(sort_order) as m FROM kanban_cards WHERE status = 'waiting' AND archived_at IS NULL"
+  ).get() as { m: number | null }
+  const sortOrder = (maxResult.m ?? 0) + 100
+  moveKanbanCard(card.id, 'waiting', sortOrder, 'scheduler')
+  return card.id
 }
 
 export function addKanbanComment(cardId: string, author: string, content: string): KanbanComment {
