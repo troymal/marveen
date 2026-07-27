@@ -89,6 +89,10 @@ marveen-mail-ugyfelkod
 __pycache__/
 *.pyc
 
+# Claude Code Channels runtime config/session dir (sessions, history, tokens,
+# plugins, skills). Per-install runtime state -- never source, never commit.
+.channels-config/
+
 
 # Jetbrains idea
 .idea/

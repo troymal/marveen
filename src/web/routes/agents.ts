@@ -8,6 +8,7 @@ import { createAgentMessage, listPendingChannelRequests, updateChannelRequestSta
 import { classifyAgentMessage, wrapAgentMessageForDelivery } from '../agent-message-wrap.js'
 import { ensureFederationClaudeMdSection } from '../federation/onboarding.js'
 import { atomicWriteFileSync } from '../atomic-write.js'
+import { CHANNEL_PLUGIN_IDS } from '../plugin-ids.js'
 import { getSecret, setSecret, deleteSecret, listSecrets } from '../vault.js'
 import { loadOpenRouterCatalog, fetchAllOpenRouterModels, loadCuratedManual, addCuratedManual, removeCuratedManual } from '../openrouter-models.js'
 import {
@@ -49,6 +50,7 @@ import {
   writeAgentTeam,
   sanitizeTeamConfig,
   cleanupTeamReferences,
+  reportsToCreatesCycle,
   type TeamConfig,
 } from '../agent-team.js'
 import {
@@ -115,7 +117,7 @@ import {
 } from '../profiles.js'
 import { sanitizeAgentName, safeJoin } from '../sanitize.js'
 import { parseMultipart } from '../multipart.js'
-import { readBody, json, serveFile } from '../http-helpers.js'
+import { readBody, json, jsonMaybeGzip, serveFile } from '../http-helpers.js'
 import {
   exportAgentBundle,
   importAgentBundle,
@@ -244,14 +246,7 @@ export function setAgentEnabledPlugins(name: string, provider: ChannelProviderTy
     try { existing = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { /* overwrite */ }
   }
   const plugins = (existing.enabledPlugins ?? {}) as Record<string, boolean>
-  const allPlugins: Record<ChannelProviderType, string> = {
-    telegram: 'telegram@claude-plugins-official',
-    slack: 'slack-channel@marveen-marketplace',
-    discord: 'discord@claude-plugins-official',
-    googlechat: 'googlechat@claude-channel-googlechat',
-    teams: 'teams@marveen-marketplace',
-  }
-  for (const [p, pluginKey] of Object.entries(allPlugins)) {
+  for (const [p, pluginKey] of Object.entries(CHANNEL_PLUGIN_IDS)) {
     plugins[pluginKey] = p === provider
   }
   existing.enabledPlugins = plugins
@@ -555,7 +550,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   }
 
   if (path === '/api/agents' && method === 'GET') {
-    json(res, listAgentSummaries())
+    jsonMaybeGzip(req, res, listAgentSummaries())
     return true
   }
 
@@ -623,7 +618,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
       entries.push({ name, isMain: false, running, state, tail: tailOf(pane) })
     }
 
-    json(res, entries)
+    jsonMaybeGzip(req, res, entries)
     return true
   }
 
@@ -808,7 +803,8 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   if (avatarUploadMatch && method === 'GET') {
     const name = decodeURIComponent(avatarUploadMatch[1])
     const avatarPath = findAvatarForAgent(name)
-    if (avatarPath) { serveFile(req, res, avatarPath); return true }
+    // 1h client cache: see /api/marveen/avatar for the staleness trade-off.
+    if (avatarPath) { serveFile(req, res, avatarPath, { cacheSeconds: 3600 }); return true }
     res.writeHead(404); res.end()
     return true
   }
@@ -1191,7 +1187,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
         : (n.id === MAIN_AGENT_ID ? null : MAIN_AGENT_ID)
       if (reports) edges.push({ from: reports, to: n.id })
     }
-    json(res, { nodes, edges, mainAgentId: MAIN_AGENT_ID })
+    jsonMaybeGzip(req, res, { nodes, edges, mainAgentId: MAIN_AGENT_ID })
     return true
   }
 
@@ -1222,9 +1218,21 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
         ? data.trustFrom.filter((x: unknown) => typeof x === 'string')
         : (current.trustFrom ?? []),
     }
+    // Reject a reportsTo that would create a reporting cycle (e.g. dragging a
+    // manager under its own report in the Team graph). Keep the current parent
+    // and flag it so the UI can explain why the drop was ignored.
+    let cycleRejected = false
+    if (
+      proposed.reportsTo &&
+      proposed.reportsTo !== current.reportsTo &&
+      reportsToCreatesCycle(name, proposed.reportsTo, readAgentTeam, MAIN_AGENT_ID)
+    ) {
+      proposed.reportsTo = current.reportsTo
+      cycleRejected = true
+    }
     const { team: next, warnings } = sanitizeTeamConfig(name, proposed)
     writeAgentTeam(name, next)
-    json(res, { ok: true, team: next, warnings })
+    json(res, { ok: true, team: next, warnings, cycleRejected })
     return true
   }
 
