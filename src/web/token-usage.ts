@@ -32,7 +32,11 @@ function discoverAgentSources(): AgentTranscriptSource[] {
     try { stat = statSync(full) } catch { continue }
     if (!stat.isDirectory()) continue
 
-    const agentMatch = entry.match(/-agents-([a-z]+)$/)
+    // sanitizeAgentName() allows [a-z0-9-], so the old /([a-z]+)$/ silently
+    // skipped every agent with a digit or a hyphen in its name -- the whole
+    // per-project worker fleet (davinci-ocura, vermeer-fressa, ...) never
+    // appeared in the token monitor at all. Not zero usage: no rows.
+    const agentMatch = entry.match(/-agents-([a-z0-9-]+)$/)
     if (agentMatch) {
       sources.push({ agent: agentMatch[1], projectDir: full })
     } else if (entry === mainDirName) {
@@ -77,7 +81,7 @@ interface ParsedCall {
   cacheCreationTokens: number
   /** Tokens in thinking content blocks (estimated from char length / 4). */
   thinkingTokens: number
-  /** Model identifier from the API response, e.g. "claude-sonnet-4-6". */
+  /** Model identifier from the API response, e.g. "claude-sonnet-5". */
   model: string | null
   contentPreview: string
   toolName: string | null

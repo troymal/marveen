@@ -280,6 +280,18 @@ body {
 .sb-group.open .sb-group-chevron { transform: rotate(90deg); }
 .sb-group-items { display: flex; flex-direction: column; gap: 2px; }
 .sb-group:not(.open) .sb-group-items { display: none; }
+/* Docs pinned to the sidebar bottom, just above the lang/theme row. Sits
+ * outside the scrolling .sidebar-nav (flex:1), so it stays visible however
+ * long the open group list gets. Separator reuses the .sidebar-footer
+ * border-top pattern. */
+.sidebar-docs {
+  padding-top: 12px;
+  padding-bottom: 12px;
+  margin-top: 8px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+}
 .sidebar-footer {
   padding-top: 12px;
   border-top: 1px solid var(--border);
@@ -2782,6 +2794,33 @@ main.kanban-active { max-width: none; padding-left: 16px; padding-right: 16px; }
   color: var(--text);
 }
 .approvals-pending-banner[hidden] { display: none; }
+
+/* Wizard step 3: the agent was created but its personality is a placeholder.
+   Warning tone, not danger: nothing failed for the operator to undo, the agent
+   works. Same token set as .approvals-pending-banner so the two read as one
+   family. */
+.wizard-pending-banner {
+  padding: 10px 14px;
+  margin-bottom: 14px;
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--warning, #d4a52c) 12%, transparent);
+  border: 1px solid var(--warning, #d4a52c);
+  font-size: 13px;
+  color: var(--text);
+}
+.wizard-pending-banner[hidden] { display: none; }
+.wizard-pending-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.wizard-pending-body { line-height: 1.5; }
+.wizard-pending-detail {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+  word-break: break-word;
+}
+.wizard-pending-detail[hidden] { display: none; }
 
 .approvals-stats {
   display: flex;
@@ -6399,6 +6438,11 @@ main.kanban-active { max-width: none; padding-left: 16px; padding-right: 16px; }
   font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;
   background: var(--border); color: var(--text-muted); border-radius: 4px; padding: 1px 6px;
 }
+.act-mode-badge {
+  font-size: 10px; font-weight: 600; letter-spacing: 0.02em;
+  background: rgba(234,179,8,0.16); color: #a16207;
+  border-radius: 4px; padding: 1px 6px; white-space: nowrap;
+}
 .activity-badge { font-size: 12px; font-weight: 600; border-radius: 999px; padding: 2px 10px; }
 .activity-badge.act-working {
   background: rgba(34,197,94,0.15); color: #16a34a;
@@ -7085,11 +7129,17 @@ body {
 .updates-version-details .updates-commit-list { padding: 10px 0 2px; }
 /* First-run onboarding wizard */
 .onboarding-overlay { z-index: 10000; }
-.onboarding-modal { max-width: 540px; width: 92%; position: relative; }
+/* The base .modal ships zero padding (other modals pad via .modal-header /
+   .modal-body); the onboarding wizard renders its content directly, so it
+   needs its own inner padding -- without it the title and inputs sit flush
+   against the modal edge (first screen every fresh install sees). */
+.onboarding-modal { max-width: 540px; width: 92%; position: relative; padding: 24px 26px 22px; }
+@media (max-width: 600px) { .onboarding-modal { padding: 18px 16px 16px; } }
 .onboarding-modal .modal-close { position: absolute; top: 12px; right: 12px; }
 .onboarding-modal h2 { margin: 0 0 4px; }
 .onb-sub { color: var(--text-muted); font-size: 13px; margin: 0 0 16px; }
-.onboarding-steps { display: flex; gap: 8px; margin-bottom: 18px; }
+.onboarding-steps { display: flex; gap: 8px; margin-bottom: 10px; }
+.onb-flow-note { font-size: 12px; color: var(--text-muted); background: var(--bg-input); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; margin: 0 0 14px; }
 .onboarding-step { flex: 1; display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-muted); padding: 6px 8px; border-radius: 8px; background: var(--bg-input); border: 1px solid var(--border); }
 .onboarding-step.active { color: var(--text); border-color: var(--accent); }
 .onboarding-step.done { opacity: 0.55; }
@@ -7303,64 +7353,3 @@ body {
   vertical-align: middle;
 }
 
-/* === OTel Trace Waterfall (card def5a189) === */
-.chat-upper-pane {
-  display: flex;
-  flex-direction: column;
-  min-height: 180px;
-  overflow: hidden;
-}
-.trace-resize-handle {
-  height: 5px;
-  background: var(--border);
-  cursor: row-resize;
-  flex-shrink: 0;
-  transition: background 0.15s;
-}
-.trace-resize-handle:hover, .trace-resize-handle.dragging { background: var(--accent); }
-.trace-waterfall-panel {
-  display: flex;
-  flex-direction: column;
-  min-height: 140px;
-  overflow: hidden;
-  border-top: 1px solid var(--border);
-  background: var(--bg-card);
-}
-.trace-waterfall-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 14px;
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
-  background: var(--bg-card);
-}
-.trace-waterfall-title { font-size: 11px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.06em; }
-.trace-select { font-size: 12px; padding: 3px 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); max-width: 320px; flex: 1; }
-.trace-status-badge { font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 8px; }
-.trace-status-ok { background: color-mix(in srgb, var(--accent) 15%, transparent); color: var(--accent); }
-.trace-status-error { background: color-mix(in srgb, var(--danger) 15%, transparent); color: var(--danger); }
-.trace-status-running { background: color-mix(in srgb, #f59e0b 15%, transparent); color: #f59e0b; }
-.trace-waterfall-body {
-  flex: 1;
-  overflow: auto;
-  position: relative;
-}
-.trace-waterfall-empty {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  height: 80px;
-  font-size: 12px;
-  color: var(--text-muted);
-}
-/* Waterfall SVG rows */
-.trace-wf-svg { display: block; width: 100%; }
-.trace-wf-row-bg:nth-child(odd) { fill: color-mix(in srgb, var(--text) 3%, transparent); }
-.trace-wf-label { font-size: 11px; fill: var(--text); font-family: monospace; }
-.trace-wf-bar { rx: 3; }
-.trace-wf-bar-running { stroke: #f59e0b; stroke-width: 1.5; stroke-dasharray: 4 2; }
-.trace-wf-bar-error { opacity: 0.85; }
-.trace-wf-axis-line { stroke: var(--border); }
-.trace-wf-axis-label { font-size: 9px; fill: var(--text-muted); }
-.trace-bottleneck { stroke: var(--danger); stroke-width: 1.5; stroke-dasharray: 3 2; }

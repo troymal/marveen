@@ -376,6 +376,15 @@ window._i18n.hu = {
   'agents.wizard.desc_label':    'Írd le szabadon, mit szeretnél hogy csináljon ez az ügynök',
   'agents.wizard.profile_label': 'Biztonsági profil',
   'agents.wizard.gen_hint':      'Ez néhány másodpercig tarthat',
+  // Shown on step 3 when the backend answered personalityPending:true. State, not
+  // error: the agent exists and works, only its personality text is a placeholder.
+  // "ügynök", not "ágens": the wizard modal above this banner is titled
+  // "Új ügynök létrehozása", and two words for the same thing on one screen reads
+  // as carelessness. The product-wide split (hu.js: 66 x ügynök, 31 x ágens) is a
+  // separate decision, tracked on its own card.
+  'agents.wizard.pending_title': 'Az ügynök elkészült, a személyisége viszont sablonból jött',
+  'agents.wizard.pending_body':  'Az ügynök létrejött és működik, nem veszett el semmi. A személyiségét nem sikerült legenerálni, ezért amit alább látsz, az egy sablon. Átírhatod most itt, vagy később bármikor az ügynök beállításainál.',
+  'agents.wizard.pending_detail': 'Ami nem sikerült: {detail}',
   'agents.model.inherit':        'Öröklött (alapértelmezett)',
   'agents.model.fable5':         'Fable 5 (legújabb)',
   'agents.model.opus5':          'Opus 5 (legújabb Opus)',
@@ -456,6 +465,7 @@ window._i18n.hu = {
   'activity.error_load':         'Nem sikerült lekérni az aktivitást',
   'activity.empty':              'Nincs ügynök.',
   'activity.badge.main':         'fő',
+  'activity.tooltip.mode':       'Jogosultsági mód: {mode}. Ebben a módban az ágens megáll és jóváhagyásra vár, mielőtt eszközt hívna -- ha senki nem figyeli, órákig állhat úgy, hogy közben tétlennek látszik.',
   'activity.loading':            'Betöltés…',
   'activity.state.working':      'dolgozik',
   'activity.state.idle':         'várakozik',
@@ -1493,6 +1503,9 @@ window._i18n.hu = {
   'onboarding.identity.save_btn': 'Mentés és tovább',
   'onboarding.identity.empty':   'Mindkét név megadása kötelező.',
   'onboarding.identity.saved':   'Név elmentve.',
+  'onboarding.identity.saved_restarted': 'Név elmentve, az ügynök újraindul az új névvel -- egy pillanat.',
+  'onboarding.identity.saved_restart_failed': 'A név elmentve, de az ügynök újraindítása nem sikerült. Indítsd újra kézzel (Linux: systemctl --user restart marveen-channels), aztán térj vissza ide.',
+  'onboarding.identity.saved_restart_needed': 'Név elmentve. A futó ügynök a következő újraindításakor veszi fel az új nevet.',
   'onboarding.title':            'Marveen beállítása',
   'onboarding.subtitle':         'Fejezd be a beállítást innen, a dashboardból, SSH nélkül.',
   'onboarding.saving':           'Mentés...',
@@ -1507,8 +1520,16 @@ window._i18n.hu = {
   'onboarding.step1.token_empty':'Illeszd be a tokent.',
   'onboarding.step1.saved_verified':   'Token elmentve és ellenőrizve.',
   'onboarding.step1.saved_unverified': 'Token elmentve (az ellenőrzés nem futott le, ettől még jó lehet).',
+  'onboarding.flow_note': 'A négy lépés egymásra épül: a mentések után a rendszer magától újraindul, és a 4. lépés (párosítás) után kezd válaszolni. Addig a hiányzó lépésekre hivatkozó üzenetek normálisak.',
+  'onboarding.step2.saved_restarted': 'Bot token elmentve, az ügynök újraindul az új bottal -- egy pillanat.',
+  'onboarding.step3.svc_up': 'A bot-szolgáltatás fut, jöhet a párosítás.',
+  'onboarding.step3.svc_starting': 'A bot-szolgáltatás még indul -- ha a párosító kód nem érkezik meg azonnal, várj pár másodpercet és frissíts.',
+  'onboarding.flow_note_last': 'Ez az utolsó lépés: a párosítás után a rendszer élesben elindul.',
+  'onboarding.step1.saved_restarted': 'Token elmentve, az ügynök újraindult az új hitelesítéssel.',
+  'onboarding.step1.saved_restart_failed': 'A token elmentve, de az ügynök újraindítása nem sikerült. Indítsd újra kézzel (Linux: systemctl --user restart marveen-channels), aztán térj vissza ide.',
   'onboarding.step1.launching':  'Indítás...',
   'onboarding.step1.launched':   'Ügynökök indítása folyamatban...',
+  'onboarding.step1.launch_slow':'Az ügynökök még nem álltak fel a várt időn belül. Lassabb gépen a hidegindítás pár percig is eltarthat: várj egy kicsit, majd frissítsd az oldalt. Ha 10 perc után sincs változás, nézd meg a store/channels-failures.log fájlt.',
   'onboarding.step2.tab':        'Telegram bot',
   'onboarding.step2.desc':       'Add meg a Telegram bot tokenjét (a BotFather-től).',
   'onboarding.step2.token_label':'Telegram bot token',
@@ -1727,6 +1748,7 @@ window._i18n.hu = {
   'auth.bridge.desc':              'Illeszd be a Bridge alkalmazásban megjelenő kulcs-sort (ssh-ed25519 ... marveen-remote:...), adj nevet az eszköznek, és a kapott csomagot másold vissza a Bridge-be. Az eszköz saját, külön visszavonható kulcsot kap.',
   'auth.bridge.key_placeholder':   'ssh-ed25519 ... marveen-remote:...',
   'auth.bridge.name_placeholder':  'Eszköz neve (pl. Szabi laptopja)',
+  'auth.bridge.host_placeholder':  'Cél-cím (opcionális -- alapértelmezés: Tailscale-cím ha van, különben LAN)',
   'auth.bridge.enroll':            'Párosítás',
   'auth.bridge.confirm':           'Párosítod "{name}" eszközt? SSH-alagút + saját eszközkulcs hozzáférést kap a dashboardhoz.',
   'auth.bridge.working':           'Párosítás folyamatban...',
@@ -1734,14 +1756,5 @@ window._i18n.hu = {
   'auth.bridge.repaired':          'Eszköz újrapárosítva (a korábbi kulcsa visszavonva).',
   'auth.bridge.bundle_hint':       'Másold ki most, és illeszd be a Bridge-be -- a csomag többé nem jeleníthető meg. Cél-cím: {host}.',
   'auth.bridge.err_empty':         'A kulcs-sor és az eszköznév is kötelező.',
-
-  'trace.loading':                'Betöltés...',
-  'trace.no_traces':              'Nincs trace ehhez az ágenshez',
-  'trace.no_spans':               'Nincs span ebben a trace-ben',
-  'trace.load_error':             'Trace betöltési hiba',
-  'trace.status.ok':              'OK',
-  'trace.status.error':           'Hiba',
-  'trace.status.running':         'Fut',
-  'trace.status.timeout':         'Timeout',
 
 }

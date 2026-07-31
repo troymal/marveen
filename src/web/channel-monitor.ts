@@ -3,6 +3,7 @@ import { hostname } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync, spawn } from 'node:child_process'
 import { resolveFromPath } from '../platform.js'
+import { WEB_PORT } from '../config.js'
 import { logger } from '../logger.js'
 import { MAIN_AGENT_ID, SERVICE_ID, BOT_NAME, CHANNEL_PROVIDER, PROJECT_ROOT, RESPAWN_ENABLED } from '../config.js'
 import { agentDir, listAgentNames, readAgentChannelProvider } from './agent-config.js'
@@ -13,6 +14,8 @@ import {
   captureParkedInputView,
   clearInputBuffer,
   dismissResumeSummaryModalIfPresent,
+  dismissModelConsentDialogIfPresent,
+  stampFableOverageConsentSharedRoots,
   isAgentRunning,
   sendPromptToSession,
   startAgentProcess,
@@ -28,7 +31,7 @@ import { reapChannelOrphans, reapDetachedChannelClaudes, collectPollerEvidence }
 import { probeTelegramConflict } from './channel-conflict-probe.js'
 import { schedulePluginUnlockAfterRespawn, wasPluginConfirmedAbsent, clearPluginAbsent } from './channel-plugin-unlock.js'
 import {
-  detectPaneState, decidePaneErrorAlert, detectsBlockingMenu, detectsFirstRunGate, type PaneErrorAlertState, type PaneState,
+  detectPaneState, decidePaneErrorAlert, detectsBlockingMenu, detectsFirstRunGate, detectsModelConsentDialog, type PaneErrorAlertState, type PaneState,
   stuckInputSignature, decideStuckInputRecovery, parkedChannelInput,
   parkedInputText, shouldClearTruncatedPreamble,
   parkedInputRowCount, submitLanded, decideStuckInputAction,
@@ -175,7 +178,9 @@ const AGENT_BUSY_DEFER_MAX_MS = 30 * 60 * 1000 // 30m
 // fresh (re-stamped by each post-respawn probe, cleared on recovery).
 const PLUGIN_ABSENT_MAX_RESTART_ATTEMPTS = 1
 const PLUGIN_ABSENT_TTL_MS = 15 * 60 * 1000
-const PLUGIN_ALERT_DEDUP_MS = 30 * 60 * 1000
+// Re-alert cadence while the main plugin is STILL down. The first alert is the
+// informative one; keep repeats to a few hours (owner request 2026-07-30).
+const PLUGIN_ALERT_DEDUP_MS = 3 * 60 * 60 * 1000
 
 // Stuck channel-input recovery (MAIN session only). A channel notification
 // delivered while Boss is busy can be parked as plain text at the ❯ prompt
@@ -359,6 +364,11 @@ async function performStuckInputAction(
           await clearInputBuffer(session)
           await sendPromptToSession(session, text)
         } else {
+          // FABLEFALL1: a bare Enter on the model consent dialog confirms its
+          // DEFAULT option, which switches the model. Answer the dialog safely
+          // first (no-op when absent); an Enter on the then-idle prompt is
+          // harmless.
+          await dismissModelConsentDialogIfPresent(session)
           execFileSync(TMUX, ['send-keys', '-t', session, 'Enter'], { timeout: 5000 })
         }
         submitted = true
@@ -373,6 +383,10 @@ async function performStuckInputAction(
         await clearInputBuffer(session)
         break
       case 'enter':
+        // FABLEFALL1: same guard as the reinject-plain fallback above -- a bare
+        // Enter must never reach the model consent dialog (its default SWITCHES
+        // the model). No-op when the dialog is absent.
+        await dismissModelConsentDialogIfPresent(session)
         execFileSync(TMUX, ['send-keys', '-t', session, 'Enter'], { timeout: 5000 })
         submitted = true
         break
@@ -430,7 +444,7 @@ const paneErrorState: Map<string, PaneErrorAlertState> = new Map()
 // spell alive across brief non-error blips (null capture, mid-flight
 // busy) so a flapping but genuinely wedged session still alerts.
 const PANE_ERROR_CONFIRM_MS = 120_000
-const PANE_ERROR_DEDUP_MS = 30 * 60 * 1000
+const PANE_ERROR_DEDUP_MS = 3 * 60 * 60 * 1000
 const PANE_ERROR_CLEAR_MS = 5 * 60 * 1000
 
 // Per-session tracking for a session parked in a blocking interactive menu
@@ -477,7 +491,7 @@ async function triggerMarveenMemorySave(): Promise<void> {
     `mulva hard restart lesz a ${MAIN_CHANNELS_SESSION} session-on (a beszelgetes elveszik).`,
     `MOST mentsd el a ${BOT_NAME} memoriaba amit a kovetkezo sessionnek tudnia kell:`,
     'aktiv feladatok (category hot), friss dontesek/preferenciak (warm), tanulsagok (cold).',
-    'Hasznald: curl -s -X POST http://localhost:3420/api/memories ... (lasd CLAUDE.md).',
+    `Hasznald: curl -s -X POST http://localhost:${WEB_PORT}/api/memories ... (lasd CLAUDE.md).`,
     'Ha kesz vagy, irj egy rovid napi naplo bejegyzest is a /api/daily-log-ra. Utana eleg.',
   ].join(' ')
   try {
@@ -859,14 +873,21 @@ export function mainChannelsSessionExists(): boolean {
   }
 }
 
-export function createMainChannelsSession(): boolean {
+// Discriminated result instead of a boolean: 'grace' (already kicked, session
+// is booting -- benign) and 'script-missing'/'spawn-failed' (the install is
+// broken) must NOT look alike to callers. The onboarding launch endpoint
+// reports the former as "starting" and the latter as a hard error; a boolean
+// collapsed both into a silent false success (PR #779 review).
+export type MainSessionCreateResult = 'started' | 'grace' | 'script-missing' | 'spawn-failed'
+
+export function createMainChannelsSession(): MainSessionCreateResult {
   const now = Date.now()
   if (marveenLastSessionCreate && now - marveenLastSessionCreate < MAIN_SESSION_CREATE_GRACE_MS) {
-    return false
+    return 'grace'
   }
   if (!existsSync(CHANNELS_SCRIPT)) {
     logger.error({ script: CHANNELS_SCRIPT }, 'Cannot recreate main channels session: channels.sh missing')
-    return false
+    return 'script-missing'
   }
   try {
     // Detached + unref'd: channels.sh is a long-lived supervisor (it tails the
@@ -885,10 +906,10 @@ export function createMainChannelsSession(): boolean {
     writeRespawnStamp()
     logger.warn({ session: MAIN_CHANNELS_SESSION }, 'Main channels session absent -- recreating via channels.sh')
     sendAlert(`♻️ A ${MAIN_CHANNELS_SESSION} session eltunt -- ujrainditom (channels.sh). Enelkul minden utemezett feladat csendben kimaradna.`)
-    return true
+    return 'started'
   } catch (err) {
     logger.error({ err }, 'Failed to recreate main channels session via channels.sh')
-    return false
+    return 'spawn-failed'
   }
 }
 
@@ -979,6 +1000,11 @@ function schedulePostResumePluginGuard(provider: ChannelProviderType): void {
 }
 
 export function hardRestartMarveenChannels(): { ok: boolean; error?: string } {
+  // FABLEFALL1: the restarted session boots from the main/worker shared config
+  // roots, which the per-agent spawn-time stamp never covers -- stamp them now
+  // so the model consent dialog cannot render on the fresh boot (change-only,
+  // no-op when already stamped).
+  try { stampFableOverageConsentSharedRoots() } catch { /* backstop handlers remain */ }
   // macOS: bounce the launchd job when the plist exists. If the channels session
   // is NOT managed by launchd on this install (plist absent -- only
   // com.jarvis.dashboard exists), fall through to the respawn-pane path below.
@@ -1369,6 +1395,10 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
     logger.info({ host: hostname() }, 'Channel plugin monitor disabled (respawn is production-only)')
     return null
   }
+  // FABLEFALL1 boot pass: stamp the main/worker shared config roots that the
+  // per-agent spawn path never reaches, so an already-running unstamped install
+  // heals on the next dashboard boot instead of never.
+  try { stampFableOverageConsentSharedRoots() } catch { /* backstop handlers remain */ }
 
   const mainProvider = getMainAgentProvider()
 
@@ -1474,13 +1504,28 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
             sendAlert(`🧭 A(z) ${label} session a Claude Code első-indítási képernyőjén parkolt (${firstRunGate}); automatikusan továbbléptettem. A várakozó ütemezett feladatok a következő körben kézbesítődnek.`)
           }
         } else {
-          logger.warn({ session: t.session, agent: label }, 'Session parked in a blocking interactive menu -- sending Escape to recover')
-          try {
-            execFileSync(TMUX, ['send-keys', '-t', t.session, 'Escape'], { timeout: 5000 })
-          } catch (err) {
-            logger.warn({ err, session: t.session }, 'Menu-recovery Escape failed')
+          // FABLEFALL1: the model usage-credit consent dialog is indistinguishable
+          // from a stuck menu out here -- its footer says "Esc to cancel", so
+          // detectsBlockingMenu matches it. But Escape on that dialog is recorded
+          // as choice:"cancelled" and the CLI still continues on the FALLBACK
+          // model (measured: 59 ms Escape->fallback-record at a customer; 5 events
+          // and 514 silent Sonnet turns on this install). Probe for the dialog
+          // first and answer it safely (option 1, keep the configured model);
+          // only a genuine menu gets the blind Escape.
+          const paneNow = capturePane(t.session)
+          if (paneNow != null && detectsModelConsentDialog(paneNow)) {
+            logger.warn({ session: t.session, agent: label }, 'Blocking "menu" is the model usage-credit consent dialog -- answering it safely instead of Escape')
+            await dismissModelConsentDialogIfPresent(t.session)
+            sendAlert(`🎛️ A(z) ${label} session a modell-hozzájárulás dialóguson parkolt; az 1-es opcióval (a beállított modell megtartása) továbbléptettem. Modellváltás NEM történt.`)
+          } else {
+            logger.warn({ session: t.session, agent: label }, 'Session parked in a blocking interactive menu -- sending Escape to recover')
+            try {
+              execFileSync(TMUX, ['send-keys', '-t', t.session, 'Escape'], { timeout: 5000 })
+            } catch (err) {
+              logger.warn({ err, session: t.session }, 'Menu-recovery Escape failed')
+            }
+            sendAlert(`⌨️ A(z) ${label} session beragadt egy interaktiv menube (pl. /mcp) es nem dolgozott fel uzeneteket. Kikuldtem egy Escape-et, visszateritettem a prompthoz. Ha ismetlodik: tmux attach -t ${t.session}`)
           }
-          sendAlert(`⌨️ A(z) ${label} session beragadt egy interaktiv menube (pl. /mcp) es nem dolgozott fel uzeneteket. Kikuldtem egy Escape-et, visszateritettem a prompthoz. Ha ismetlodik: tmux attach -t ${t.session}`)
         }
       }
     }
@@ -1526,7 +1571,7 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
           // with no supervising service, and every scheduled main-agent task
           // silently skips (scheduler !sessionExists branch).
           if (!mainChannelsSessionExists()) {
-            if (shouldEscalateMarveenDown() && createMainChannelsSession()) {
+            if (shouldEscalateMarveenDown() && createMainChannelsSession() === 'started') {
               marveenDownState = null
               marveenSuspectFirstSeen = null
             }

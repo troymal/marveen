@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { readEnvFile } from './env.js'
+import { DISTRIBUTION_DEFAULT_AGENT_MODEL } from './config-registry.js'
 import { getProviderType, getChannelToken, getChannelChatId, type ChannelProviderType } from './channel-provider.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -103,6 +104,15 @@ export const APP_TZ = appTz.tz
 // -> circular), so the loud reporting lives in startScheduleRunner.
 export const APP_TZ_INVALID = appTz.invalid
 
+// The model new agents are scaffolded with, and the model the background worker
+// sessions run. One key so an install that standardises on a newer model does
+// not have to patch three separate literals in src/ (which an update would then
+// clobber). Deliberately NOT applied to existing agents: agent-config.json keeps
+// whatever model it was created with, so raising this never silently
+// reconfigures a running fleet.
+export const DEFAULT_AGENT_MODEL =
+  cfg('DEFAULT_AGENT_MODEL') || DISTRIBUTION_DEFAULT_AGENT_MODEL
+
 export const TELEGRAM_BOT_TOKEN = env['TELEGRAM_BOT_TOKEN'] ?? ''
 export const ALLOWED_CHAT_ID = env['ALLOWED_CHAT_ID'] ?? ''
 
@@ -140,6 +150,23 @@ export const BRAND_NAME = env['BRAND_NAME'] ?? BOT_NAME
 export function resolveBrandName(brandEnv: string | undefined, botName: string): string {
   const b = (brandEnv ?? '').trim()
   return b || botName
+}
+
+// Per-call reads of the two display names, so a wizard rename shows up on the
+// dashboard without a process restart. BOT_NAME/BRAND_NAME above are frozen at
+// module load; the identity/label routes read these instead. Display only --
+// MAIN_AGENT_ID / SERVICE_ID stay the boot-time constants (they key tmux
+// sessions, service units and DB rows, and are never rewritten at runtime).
+export function currentBotName(): string {
+  const b = (readEnvFile(['BOT_NAME'])['BOT_NAME'] ?? '').trim()
+  return b || BOT_NAME
+}
+export function currentBrandName(): string {
+  return resolveBrandName(readEnvFile(['BRAND_NAME'])['BRAND_NAME'], currentBotName())
+}
+export function currentOwnerName(): string {
+  const o = (readEnvFile(['OWNER_NAME'])['OWNER_NAME'] ?? '').trim()
+  return o || OWNER_NAME
 }
 
 // Pure derivation of the OS service id from a brand slug and the agent id:

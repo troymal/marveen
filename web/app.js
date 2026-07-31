@@ -50,7 +50,7 @@ function avatarBust() { return _avatarEpoch ? `?t=${_avatarEpoch}` : '' }
   // server default was silently dead code. Microtasks run after the whole
   // classic script has evaluated, when window.fetch is the wrapped version.
   queueMicrotask(() => {
-    fetch('/api/settings')
+    fetch('api/settings')
       .then(r => r.ok ? r.json() : null)
       .then(data => {
         if (!data || localStorage.getItem(LS_KEY)) return
@@ -162,7 +162,7 @@ function mainAgentId() {
   async function handleAuthFailure() {
     let status = null
     try {
-      const r = await originalFetch('/api/auth/status')
+      const r = await originalFetch('api/auth/status')
       if (r.ok) status = await r.json()
     } catch { /* offline or probe failed -- fall through to token flows */ }
     if (status && status.login_available) {
@@ -217,7 +217,7 @@ function mainAgentId() {
       if (!username || !password) { errEl.textContent = tr('auth.login.err_empty', 'Enter a username and password.'); return }
       submitEl.disabled = true
       try {
-        const r = await originalFetch('/api/auth/login', {
+        const r = await originalFetch('api/auth/login', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ username, password }),
@@ -435,9 +435,9 @@ const SIDEBAR_GROUPS_LS_KEY = 'marveen.sidebarGroups'
 // naplo under system) or relabeling a group is a one-line change right here.
 const SIDEBAR_GROUPS = [
   { key: 'team',        labelKey: 'nav.group.team',        pages: ['agents', 'activity', 'messages', 'tasks', 'bgTasks'] },
-  { key: 'knowledge',   labelKey: 'nav.group.knowledge',   pages: ['memories', 'naplo', 'skills', 'research', 'ideas'] },
+  { key: 'knowledge',   labelKey: 'nav.group.knowledge',   pages: ['memories', 'skills', 'research', 'ideas'] },
   { key: 'stats',       labelKey: 'nav.group.stats',       pages: ['costs', 'tokenUsage'] },
-  { key: 'system',      labelKey: 'nav.group.system',      pages: ['status', 'updates', 'settings', 'vault'] },
+  { key: 'system',      labelKey: 'nav.group.system',      pages: ['status', 'naplo', 'updates', 'settings', 'vault'] },
   { key: 'connections', labelKey: 'nav.group.connections', pages: ['connectors', 'federation', 'migrate'] },
 ]
 const sidebarGroupEls = document.querySelectorAll('.sb-group[data-group]')
@@ -751,6 +751,16 @@ function renderActivity(entries) {
     const meta = { ...metaRaw, label: typeof metaRaw.label === 'function' ? metaRaw.label() : metaRaw.label }
     const tail = (a.tail || []).map((l) => escapeHtml(l)).join('\n')
     const mainBadge = a.isMain ? '<span class="act-main-badge">' + t('activity.badge.main') + '</span>' : ''
+    // Permission-mode chip. Shown for every mode EXCEPT the ones that let the
+    // agent work on its own -- inverted on purpose: an unfamiliar mode is
+    // exactly the one worth surfacing, so a future Claude Code mode shows up
+    // here instead of hiding behind a list nobody remembered to extend.
+    // Without this an agent parked in an ask-first mode renders as plain
+    // 'idle', which is how one sat unusable for hours on 2026-07-27.
+    const AUTONOMOUS_MODES = ['bypass permissions', 'accept edits', 'auto mode']
+    const modeChip = a.mode && !AUTONOMOUS_MODES.includes(a.mode)
+      ? '<span class="act-mode-badge" title="' + escapeHtml(t('activity.tooltip.mode', { mode: a.mode })) + '">' + escapeHtml(a.mode) + '</span>'
+      : ''
     const canOpen = !!a.running
     const termIcon = canOpen
       ? '<svg class="act-term-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" title="' + t('activity.tooltip.terminal') + '"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>'
@@ -760,6 +770,7 @@ function renderActivity(entries) {
         '<div class="activity-card-head">' +
           '<span class="activity-name">' + escapeHtml(a.name) + mainBadge + '</span>' +
           '<span style="display:flex;align-items:center;gap:8px">' +
+            modeChip +
             termIcon +
             '<span class="activity-badge ' + meta.cls + '" title="' + escapeHtml(meta.tip || '') + '">' + meta.label + '</span>' +
           '</span>' +
@@ -1740,7 +1751,7 @@ async function kanbanTouchEnd(e) {
   // that is a reorder within the column, which is just as valid a move.
   if (!newStatus) return
   try {
-    const r = await fetch(`/api/kanban/${encodeURIComponent(cardId)}/move`, {
+    const r = await fetch(`api/kanban/${encodeURIComponent(cardId)}/move`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ status: newStatus, sort_order: sortOrder }),
@@ -2040,7 +2051,7 @@ async function showCardDetail(card) {
       const newVal = sel.value
       if (newVal === current) { restore(current); return }
       try {
-        const r = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/move`, {
+        const r = await fetch(`api/kanban/${encodeURIComponent(card.id)}/move`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ status: newVal, sort_order: 0 }),
@@ -2493,6 +2504,11 @@ let wizardStep = 1
 let generatedClaudeMd = ''
 let generatedSoulMd = ''
 let wizardCreatedName = ''
+// Set from the POST /api/agents response when the backend fell back to a template
+// because personality generation failed. It answers 200 in that case (the agent
+// EXISTS and works), so `res.ok` alone cannot tell the operator anything -- without
+// reading this field the wizard would look exactly like a full success.
+let wizardPersonalityPending = null
 
 // === Modal helpers ===
 function openModal(overlay) {
@@ -2592,7 +2608,7 @@ function populateProfileSelect(selectEl, descEl, selected) {
 // sees the guardrail context before saving.
 function populatePlanSelect(selectEl, descEl, selected) {
   if (!selectEl) return
-  fetch('/api/claude-plans')
+  fetch('api/claude-plans')
     .then(res => (res.ok ? res.json() : []))
     .catch(() => [])
     .then((plans) => {
@@ -2630,6 +2646,32 @@ function populatePlanSelect(selectEl, descEl, selected) {
     })
 }
 
+// Paints (or clears) the step-3 notice from wizardPersonalityPending. Called from
+// resetWizard() too, so a later successful run can never inherit a stale banner.
+function renderWizardPendingBanner() {
+  const banner = document.getElementById('wizardPendingBanner')
+  if (!banner) return
+  if (!wizardPersonalityPending) {
+    banner.hidden = true
+    return
+  }
+  document.getElementById('wizardPendingTitle').textContent = t('agents.wizard.pending_title')
+  document.getElementById('wizardPendingBody').textContent = t('agents.wizard.pending_body')
+  const detailEl = document.getElementById('wizardPendingDetail')
+  const detail = wizardPersonalityPending.detail
+  // The cause is shown, but only when the server actually sent one: an empty
+  // string here would render "A hiba oka: " with nothing after it, which reads
+  // like the UI lost something.
+  if (detail) {
+    detailEl.textContent = t('agents.wizard.pending_detail', { detail })
+    detailEl.hidden = false
+  } else {
+    detailEl.textContent = ''
+    detailEl.hidden = true
+  }
+  banner.hidden = false
+}
+
 function resetWizard() {
   wizardStep = 1
   agentName.value = ''
@@ -2643,6 +2685,8 @@ function resetWizard() {
   generatedClaudeMd = ''
   generatedSoulMd = ''
   wizardCreatedName = ''
+  wizardPersonalityPending = null
+  renderWizardPendingBanner()
   document.getElementById('wizardClaudeMd').value = ''
   document.getElementById('wizardSoulMd').value = ''
   populateProfileSelect(
@@ -2703,6 +2747,12 @@ document.getElementById('wizardNextBtn').addEventListener('click', async () => {
     // like "étrendíró" still resolves to the real agent dir "etrendiro".
     const createdName = result.name || name
     wizardCreatedName = createdName
+    // 200 + personalityPending means the agent was created but its personality
+    // came from a template. Captured here and painted when step 3 opens, where
+    // the operator both sees the placeholder text and can rewrite it.
+    wizardPersonalityPending = result.personalityPending
+      ? { detail: result.detail || '', warning: result.warning || '' }
+      : null
     statusEl.textContent = t('agents.soul_md_generating')
 
     // Fetch full agent details to get generated content
@@ -2737,6 +2787,7 @@ document.getElementById('wizardNextBtn').addEventListener('click', async () => {
       wizardStep = 3
       document.getElementById('wizardClaudeMd').value = generatedClaudeMd
       document.getElementById('wizardSoulMd').value = generatedSoulMd
+      renderWizardPendingBanner()
       updateWizardUI()
     }, 600)
   } catch (err) {
@@ -2810,9 +2861,9 @@ async function loadAgents() {
     // null): it must NEVER take down the Agents page -- including on an
     // older backend where the route 404s.
     const [agentsRes, marveenRes, fedStatus] = await Promise.all([
-      fetch('/api/agents'),
-      fetch('/api/marveen'),
-      fetch('/api/federation/status').then((r) => (r.ok ? r.json() : null)).catch(() => null),
+      fetch('api/agents'),
+      fetch('api/marveen'),
+      fetch('api/federation/status').then((r) => (r.ok ? r.json() : null)).catch(() => null),
     ])
     agents = await agentsRes.json()
     if (fedStatus && Array.isArray(fedStatus.peers)) federatedPeerStatus = fedStatus.peers
@@ -2972,7 +3023,24 @@ async function openMarveenDetail() {
   openModal(agentDetailOverlay)
 }
 
+// `readOnly` is really "this modal is showing the MAIN agent" -- it is called
+// with true from openMarveenDetail and false from openAgentDetail, which makes
+// it the one hook both open-paths share. Anything that must differ for the main
+// agent belongs here; putting it in openAgentDetail alone silently no-ops for
+// the main agent, whose panel never runs that function.
 function applyMarveenReadonlyMode(readOnly) {
+  // The Team tab describes a SUB-agent's place in the hierarchy: role
+  // (leader | member), who it reports to, who it delegates to. None of it
+  // applies to the main agent, which has no team record and cannot have one.
+  // Its role is 'main', a tier ABOVE leader, and it is an implicit trusted peer
+  // of every agent (see isTrustedPeer), so there is nothing to configure. Shown
+  // anyway, the tab printed the literal fallback "member" and invited the
+  // operator to promote the main agent to 'leader' -- a demotion, and one that
+  // cannot be saved either way: the PUT targets /api/agents/<main>/team, which
+  // 404s because no agents/<main>/ directory exists. Hide the whole tab, same
+  // reasoning as claudePlanGroup.
+  const teamTabBtn = document.querySelector('#agentTabNav .tab-btn[data-tab="team"]')
+  if (teamTabBtn) teamTabBtn.hidden = readOnly
   const textareaIds = ['editClaudeMd', 'editSoulMd', 'editMcpJson']
   // saveModelBtn stays VISIBLE but disabled for Marveen, so the settings tab
   // doesn't look like the row is missing -- the other save buttons (tied to
@@ -3205,7 +3273,7 @@ async function refreshAgentTerminalBusy() {
   if (!agentsGrid) return
   let entries
   try {
-    const res = await fetch('/api/agents/activity')
+    const res = await fetch('api/agents/activity')
     if (!res.ok) return
     entries = await res.json()
   } catch { return }
@@ -3407,7 +3475,7 @@ async function openAgentDetail(agentName) {
       'Mégse = nem, biztonságosan megosztható (csak identitás + viselkedés).'
     )
     const name = currentAgent.name
-    const url = `/api/agents/${encodeURIComponent(name)}/export${withSecrets ? '?secrets=1' : ''}`
+    const url = `api/agents/${encodeURIComponent(name)}/export${withSecrets ? '?secrets=1' : ''}`
     try {
       const res = await fetch(url)
       if (!res.ok) {
@@ -3493,7 +3561,7 @@ document.getElementById('avatarChangeBtn').addEventListener('click', () => {
           if (!res.ok) throw new Error()
           showToast(t('agents.toast.avatar_updated'))
           bumpAvatarEpoch()
-          const imgUrl = isMarveen ? `/api/marveen/avatar${avatarBust()}` : `api/agents/${encodeURIComponent(currentAgent.name)}/avatar${avatarBust()}`
+          const imgUrl = isMarveen ? `api/marveen/avatar${avatarBust()}` : `api/agents/${encodeURIComponent(currentAgent.name)}/avatar${avatarBust()}`
           document.getElementById('agentDetailAvatar').innerHTML = `<img src="${imgUrl}" alt="">`
           gallery.hidden = true
           loadAgents()
@@ -3914,8 +3982,8 @@ async function openOpenrouterModal() {
     // Load the full model list (cached) and the current curated set in parallel
     // so the checkboxes render already ticked for the manual models in the list.
     const [allRes, curRes] = await Promise.all([
-      openrouterAllModels ? Promise.resolve(null) : fetch('/api/openrouter/models'),
-      fetch('/api/openrouter/manual'),
+      openrouterAllModels ? Promise.resolve(null) : fetch('api/openrouter/models'),
+      fetch('api/openrouter/manual'),
     ])
     if (allRes) {
       if (!allRes.ok) throw new Error('fetch failed')
@@ -3988,7 +4056,7 @@ async function toggleCuratedModel(id, name, checked) {
     countEl.textContent = `${total} · ${openrouterCurated.size} kézi listán`
   }
   try {
-    const res = await fetch('/api/openrouter/manual', {
+    const res = await fetch('api/openrouter/manual', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id, name, checked }),
@@ -4198,7 +4266,7 @@ if (exportAllAgentsBtn) {
       'OK = igen, csak saját gépek közötti átvitelhez.\n' +
       'Mégse = nem, biztonságosan megosztható (csak identitás + viselkedés).'
     )
-    const url = `/api/agents/export-all${withSecrets ? '?secrets=1' : ''}`
+    const url = `api/agents/export-all${withSecrets ? '?secrets=1' : ''}`
     try {
       const res = await fetch(url)
       if (!res.ok) {
@@ -4237,7 +4305,7 @@ if (importAgentBtn && importAgentFile) {
       const form = new FormData()
       form.append('file', file)
       if (overwrite) form.append('overwrite', '1')
-      const res = await fetch('/api/agents/import', { method: 'POST', body: form })
+      const res = await fetch('api/agents/import', { method: 'POST', body: form })
       const data = await res.json().catch(() => ({}))
       return { res, data }
     }
@@ -4440,7 +4508,7 @@ document.getElementById('savePlanBtn').addEventListener('click', async () => {
   if (!currentAgent || currentAgent.role === 'main') return
   const claudePlan = document.getElementById('editAgentPlan').value
   try {
-    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`, {
+    const res = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ claudePlan }),
@@ -4577,7 +4645,7 @@ document.getElementById('memoryIsolationToggle').addEventListener('change', asyn
   if (!currentAgent || currentAgent.role === 'main') return
   const enabled = e.target.checked
   try {
-    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`, {
+    const res = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ memoryIsolation: enabled }),
@@ -5517,7 +5585,7 @@ document.getElementById('scheduleType').addEventListener('change', () => {
 // window.location.port which reflects the browser-side URL (e.g. 8443 for a
 // tailscale-serve HTTPS PWA) and would be wrong in agent curl prompts.
 let __serverPort = 3420
-fetch('/api/network-info').then(r => r.ok ? r.json() : {}).then(info => {
+fetch('api/network-info').then(r => r.ok ? r.json() : {}).then(info => {
   if (info.port) __serverPort = info.port
 }).catch(() => {})
 
@@ -9632,7 +9700,7 @@ async function loadCosts() {
   const mutedStyle = 'color:var(--text-muted);font-size:13px'
   el.innerHTML = `<div style="${mutedStyle}">${t('costs.loading')}</div>`
   try {
-    const res = await fetch('/api/costs/summary')
+    const res = await fetch('api/costs/summary')
     const s = await res.json()
     if (!res.ok) throw new Error(s?.error || 'request failed')
 
@@ -10029,7 +10097,7 @@ document.getElementById('fleetExportBtn').addEventListener('click', async () => 
     const headers = {}
     if (password) headers['X-Vault-Password'] = password
 
-    const res = await fetch('/api/fleet/export', { headers })
+    const res = await fetch('api/fleet/export', { headers })
     if (!res.ok) {
       const data = await res.json().catch(() => ({}))
       showToast(data.error || t('fleet.export.error'))
@@ -10089,7 +10157,7 @@ document.getElementById('fleetDryRunBtn').addEventListener('click', async () => 
     const headers = { 'Content-Type': 'application/json' }
     if (password) headers['X-Vault-Password'] = password
 
-    const res = await fetch('/api/fleet/import', { method: 'POST', headers, body: text })
+    const res = await fetch('api/fleet/import', { method: 'POST', headers, body: text })
     const data = await res.json()
 
     const wc = data.wouldCreate || {}
@@ -10169,7 +10237,7 @@ document.getElementById('fleetApplyBtn').addEventListener('click', async () => {
     const headers = { 'Content-Type': 'application/json' }
     if (password) headers['X-Vault-Password'] = password
 
-    const res = await fetch('/api/fleet/import?apply=true', { method: 'POST', headers, body: fleetLastBody })
+    const res = await fetch('api/fleet/import?apply=true', { method: 'POST', headers, body: fleetLastBody })
     const data = await res.json()
 
     if (!res.ok) throw new Error(data.error || t('fleet.import.error'))
@@ -10268,8 +10336,8 @@ async function loadGlobalSkills() {
   skillsStats.innerHTML = ''
   try {
     const [globalRes, localRes] = await Promise.all([
-      fetch('/api/skills'),
-      fetch('/api/skills/local'),
+      fetch('api/skills'),
+      fetch('api/skills/local'),
     ])
     globalSkills = await globalRes.json()
     localAgentSkills = localRes.ok ? await localRes.json() : []
@@ -10309,7 +10377,7 @@ async function loadGlobalSkills() {
   if (exportBtn) {
     exportBtn.addEventListener('click', () => {
       const a = document.createElement('a')
-      a.href = '/api/skills/export'
+      a.href = 'api/skills/export'
       a.download = 'skills-export.zip'
       document.body.appendChild(a)
       a.click()
@@ -10498,8 +10566,8 @@ async function openSkillDetail(skillName, displayLabel, agentId = null) {
 
   try {
     const detailUrl = agentId
-      ? `/api/skills/${encodeURIComponent(skillName)}?agent=${encodeURIComponent(agentId)}`
-      : `/api/skills/${encodeURIComponent(skillName)}`
+      ? `api/skills/${encodeURIComponent(skillName)}?agent=${encodeURIComponent(agentId)}`
+      : `api/skills/${encodeURIComponent(skillName)}`
     const res = await fetch(detailUrl)
     if (!res.ok) throw new Error('Failed to fetch skill detail')
     const detail = await res.json()
@@ -10622,8 +10690,8 @@ async function openSkillDetail(skillName, displayLabel, agentId = null) {
       saveBtn.disabled = true
       try {
         const putUrl = _skillDetailCurrentAgentId
-          ? `/api/skills/${encodeURIComponent(_skillDetailCurrentName)}?agent=${encodeURIComponent(_skillDetailCurrentAgentId)}`
-          : `/api/skills/${encodeURIComponent(_skillDetailCurrentName)}`
+          ? `api/skills/${encodeURIComponent(_skillDetailCurrentName)}?agent=${encodeURIComponent(_skillDetailCurrentAgentId)}`
+          : `api/skills/${encodeURIComponent(_skillDetailCurrentName)}`
         const res = await fetch(putUrl, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
@@ -10669,7 +10737,7 @@ async function saveTeamReportsTo(childId, parentId, ctx) {
   if (parentOf.get(childId) === parentId) return  // already the parent
   if (descendantsOf(childId).has(parentId)) { showToast(t('team.drop.cycle')); return }
   try {
-    const r = await fetch(`/api/agents/${encodeURIComponent(childId)}/team`, {
+    const r = await fetch(`api/agents/${encodeURIComponent(childId)}/team`, {
       method: 'PUT', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ reportsTo: parentId }),
     })
@@ -10922,7 +10990,23 @@ function chatAvatarHtml(agentName, size = 32) {
   return `<img class="chat-avatar" src="${src}" width="${size}" height="${size}" alt="${escapeHtml(agentName)}" data-agent-name="${escapeHtml(agentName)}" onerror="chatImgError(this)">`
 }
 
+// Guard against the boot race: the Messages page can be opened before the
+// initial /api/marveen fetch resolves window._marveen. Until it does,
+// mainAgentId() returns the literal 'marveen' FALLBACK, which IS a real agent
+// id on a default install but is NOT one wherever the main agent was renamed
+// -- composing to it creates a phantom "marveen" thread that sits pending
+// forever and shows up as a duplicate of the true main agent (whatever id this
+// install actually uses). Resolve _marveen before rendering any chat target.
+async function ensureMarveenLoaded() {
+  if (window._marveen?.agentId) return
+  try {
+    const r = await fetch('api/marveen')
+    if (r.ok) window._marveen = { ...(window._marveen || {}), ...(await r.json()) }
+  } catch { /* sidebar falls back to the literal id -- best effort */ }
+}
+
 async function loadMessagesPage() {
+  await ensureMarveenLoaded()
   await loadChatAgentList()
 }
 
@@ -10970,9 +11054,9 @@ async function loadChatAgentList() {
     // Load fleet agents + threads in parallel (the federation status fetch is
     // failure-proof: it must never take down the Messages page)
     const [agentsRes, threadsRes, fedStatus] = await Promise.all([
-      fetch('/api/agents'),
-      fetch('/api/messages/threads'),
-      fetch('/api/federation/status').then((r) => (r.ok ? r.json() : null)).catch(() => null),
+      fetch('api/agents'),
+      fetch('api/messages/threads'),
+      fetch('api/federation/status').then((r) => (r.ok ? r.json() : null)).catch(() => null),
     ])
     const agentsRaw = agentsRes.ok ? await agentsRes.json() : []
     const threads = threadsRes.ok ? await threadsRes.json() : []
@@ -11003,8 +11087,12 @@ async function loadChatAgentList() {
     for (const t of threads) {
       if (t.agent) threadIndex.set(t.agent, { lastMsg: t.lastMessage, count: t.count || 0 })
     }
-    // Also include thread agents not in fleet (e.g. the owner's own direct msgs)
+    // Also include thread agents not in fleet (e.g. the owner's own direct msgs).
+    // Suppress the literal 'marveen' fallback id when it is NOT the real main
+    // agent: a stale phantom thread (from the boot-race bug) would otherwise
+    // render as a duplicate of the true main agent.
     for (const t of threads) {
+      if (t.agent === 'marveen' && mainAgentId() !== 'marveen') continue
       if (t.agent && !fleetNames.includes(t.agent) && !CHAT_SYSTEM_AGENTS.has(t.agent)) {
         fleetNames.push(t.agent)
       }
@@ -11088,31 +11176,18 @@ async function loadChatThread(agentName) {
   const threadDisplayName = owner && agentName === owner ? owner + ' (te)' : chatDisplayName(agentName)
 
   panel.innerHTML = `
-    <div class="chat-upper-pane" id="chatUpperPane" style="flex:1 1 55%;min-height:180px">
-      <div class="chat-thread-header">
-        ${chatAvatarHtml(agentName, 32)}
-        <span class="chat-thread-title">${escapeHtml(threadDisplayName)}</span>
-        <button class="btn-secondary btn-compact" style="margin-left:auto" onclick="loadChatThread('${escapeHtml(agentName)}')">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
-        </button>
-      </div>
-      <div class="chat-bubbles" id="chatBubbles"><div class="chat-loading-indicator" id="chatLoadingTop" style="display:none;text-align:center;padding:8px;font-size:11px;color:var(--text-muted)">${t('messages.loading')}</div></div>
-      <div class="chat-compose">
-        <div class="chat-compose-row">
-          <textarea id="chatComposeText" class="chat-compose-input" rows="2" placeholder="${t('messages.placeholder', { agent: escapeHtml(chatDisplayName(agentName)) })}"></textarea>
-          <button class="btn-primary btn-compact chat-send-btn" id="chatSendBtn">${t('messages.send_btn')}</button>
-        </div>
-      </div>
+    <div class="chat-thread-header">
+      ${chatAvatarHtml(agentName, 32)}
+      <span class="chat-thread-title">${escapeHtml(threadDisplayName)}</span>
+      <button class="btn-secondary btn-compact" style="margin-left:auto" onclick="loadChatThread('${escapeHtml(agentName)}')">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+      </button>
     </div>
-    <div class="trace-resize-handle" id="traceResizeHandle"></div>
-    <div class="trace-waterfall-panel" id="traceWaterfallPanel" style="flex:0 0 45%;min-height:140px">
-      <div class="trace-waterfall-header">
-        <span class="trace-waterfall-title">Trace</span>
-        <select class="trace-select" id="traceSelect"><option value="">-- ${t('trace.loading')} --</option></select>
-        <span id="traceStatusBadge"></span>
-      </div>
-      <div class="trace-waterfall-body" id="traceWaterfallBody">
-        <div class="trace-waterfall-empty">${t('trace.no_traces')}</div>
+    <div class="chat-bubbles" id="chatBubbles"><div class="chat-loading-indicator" id="chatLoadingTop" style="display:none;text-align:center;padding:8px;font-size:11px;color:var(--text-muted)">${t('messages.loading')}</div></div>
+    <div class="chat-compose">
+      <div class="chat-compose-row">
+        <textarea id="chatComposeText" class="chat-compose-input" rows="2" placeholder="${t('messages.placeholder', { agent: escapeHtml(chatDisplayName(agentName)) })}"></textarea>
+        <button class="btn-primary btn-compact chat-send-btn" id="chatSendBtn">${t('messages.send_btn')}</button>
       </div>
     </div>
   `
@@ -11146,158 +11221,6 @@ async function loadChatThread(agentName) {
         fetchChatPage(agentName, chatThreadState.minLoadedId, CHAT_LOAD_MORE, 'prepend')
       }
     })
-  }
-
-  // Resize handle: drag to split chat / waterfall vertically
-  initTraceResizeHandle()
-
-  // Load trace waterfall for this agent
-  loadTraceWaterfall(agentName)
-}
-
-// --- Trace Waterfall (card def5a189) ---
-const AGENT_COLORS = ['#d97757','#00C2A8','#818cf8','#22c55e','#f59e0b','#ec4899','#06b6d4','#a855f7']
-function agentColor(name) {
-  return AGENT_COLORS[name.split('').reduce((a,c) => a + c.charCodeAt(0), 0) % AGENT_COLORS.length]
-}
-
-function initTraceResizeHandle() {
-  const handle = document.getElementById('traceResizeHandle')
-  const upper  = document.getElementById('chatUpperPane')
-  const lower  = document.getElementById('traceWaterfallPanel')
-  if (!handle || !upper || !lower) return
-  let dragging = false, startY = 0, startUpper = 0
-  handle.addEventListener('mousedown', e => {
-    dragging = true; startY = e.clientY; startUpper = upper.offsetHeight
-    handle.classList.add('dragging'); e.preventDefault()
-  })
-  window.addEventListener('mousemove', e => {
-    if (!dragging) return
-    const dy = e.clientY - startY
-    const newH = Math.max(120, startUpper + dy)
-    upper.style.flex = `0 0 ${newH}px`
-  })
-  window.addEventListener('mouseup', () => {
-    if (dragging) { dragging = false; handle.classList.remove('dragging') }
-  })
-}
-
-async function loadTraceWaterfall(agentName) {
-  const sel = document.getElementById('traceSelect')
-  const body = document.getElementById('traceWaterfallBody')
-  if (!sel || !body) return
-  try {
-    const res = await fetch('/api/traces?limit=100')
-    if (!res.ok) throw new Error(res.status)
-    const all = await res.json()
-    // Show traces that involve this agent (as root or any span)
-    const relevant = all.filter(tr => tr.root_agent === agentName)
-    sel.innerHTML = relevant.length === 0
-      ? `<option value="">${t('trace.no_traces')}</option>`
-      : relevant.map(tr => {
-          const dt = tr.start_ms ? new Date(tr.start_ms).toLocaleString('hu-HU', {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : ''
-          const dur = tr.end_ms && tr.start_ms ? `${((tr.end_ms - tr.start_ms)/1000).toFixed(1)}s` : '...'
-          return `<option value="${escapeHtml(tr.trace_id)}">[${dt}] ${escapeHtml(tr.root_operation)} ${dur} (${tr.span_count} span)</option>`
-        }).join('')
-    sel.addEventListener('change', () => {
-      if (sel.value) renderTraceWaterfall(sel.value)
-      else body.innerHTML = `<div class="trace-waterfall-empty">${t('trace.no_traces')}</div>`
-    })
-    if (relevant.length > 0) renderTraceWaterfall(relevant[0].trace_id)
-  } catch {
-    body.innerHTML = `<div class="trace-waterfall-empty">${t('trace.load_error')}</div>`
-  }
-}
-
-async function renderTraceWaterfall(traceId) {
-  const body = document.getElementById('traceWaterfallBody')
-  const badge = document.getElementById('traceStatusBadge')
-  if (!body) return
-
-  // Re-render when the resize handle moves the panel boundary (debounced 60ms)
-  if (body._traceObsId !== traceId) {
-    if (body._traceResizeObs) body._traceResizeObs.disconnect()
-    let _rTimer = null
-    const ro = new ResizeObserver(() => {
-      clearTimeout(_rTimer)
-      _rTimer = setTimeout(() => renderTraceWaterfall(traceId), 60)
-    })
-    ro.observe(body)
-    body._traceResizeObs = ro
-    body._traceObsId = traceId
-  }
-
-  try {
-    const res = await fetch(`/api/traces/${encodeURIComponent(traceId)}`)
-    if (!res.ok) throw new Error(res.status)
-    const { spans } = await res.json()
-    if (!spans || !spans.length) {
-      body.innerHTML = `<div class="trace-waterfall-empty">${t('trace.no_spans')}</div>`
-      return
-    }
-    // Compute time range
-    const minMs = Math.min(...spans.map(s => s.start_ms))
-    const maxRaw = Math.max(...spans.map(s => s.end_ms || s.start_ms + 1))
-    const totalMs = Math.max(maxRaw - minMs, 1)
-    const now = Date.now()
-
-    // Layout: measure actual container so bars fill the full width and height
-    const svgW = body.clientWidth || 600
-    const LABEL_W = 110, AXIS_H = 18, PAD_R = 8
-    const ROW_H = Math.max(24, Math.floor((body.clientHeight - AXIS_H) / spans.length))
-    const barArea = svgW - LABEL_W - PAD_R
-    const svgH = spans.length * ROW_H + AXIS_H
-
-    // Badge
-    const hasError = spans.some(s => s.status === 'error')
-    const hasRunning = spans.some(s => s.status === 'running')
-    if (badge) {
-      const cls = hasError ? 'trace-status-error' : hasRunning ? 'trace-status-running' : 'trace-status-ok'
-      const lbl = hasError ? t('trace.status.error') : hasRunning ? t('trace.status.running') : t('trace.status.ok')
-      badge.innerHTML = `<span class="trace-status-badge ${cls}">${lbl}</span>`
-    }
-
-    // Find bottleneck span (longest duration)
-    const durations = spans.map(s => (s.end_ms || now) - s.start_ms)
-    const maxDur = Math.max(...durations)
-
-    let rows = ''
-    spans.forEach((s, i) => {
-      const y = i * ROW_H + AXIS_H
-      const startOff = s.start_ms - minMs
-      const dur = (s.end_ms || now) - s.start_ms
-      const x = LABEL_W + (startOff / totalMs) * barArea
-      const w = Math.max(3, (dur / totalMs) * barArea)
-      const color = agentColor(s.agent_id)
-      const isBottleneck = dur === maxDur && spans.length > 1
-      const isRunning = s.status === 'running'
-      const isError = s.status === 'error'
-      const label = s.agent_id.length > 13 ? s.agent_id.slice(0,12) + '…' : s.agent_id
-      const durLabel = dur >= 1000 ? `${(dur/1000).toFixed(1)}s` : `${dur}ms`
-      rows += `<rect class="trace-wf-row-bg" x="0" y="${y}" width="${svgW}" height="${ROW_H}"/>`
-      rows += `<text class="trace-wf-label" x="6" y="${y + ROW_H*0.65}">${escapeHtml(label)}</text>`
-      rows += `<rect class="trace-wf-bar${isRunning?' trace-wf-bar-running':''}${isError?' trace-wf-bar-error':''}"
-        x="${x.toFixed(1)}" y="${(y+4).toFixed(1)}" width="${w.toFixed(1)}" height="${ROW_H-8}"
-        rx="3" fill="${isError ? 'var(--danger)' : color}" opacity="${isError?0.7:0.85}"/>`
-      if (isBottleneck) {
-        rows += `<line class="trace-bottleneck" x1="${(x+w).toFixed(1)}" y1="${AXIS_H}" x2="${(x+w).toFixed(1)}" y2="${svgH}"/>`
-      }
-      rows += `<text class="trace-wf-axis-label" x="${Math.min(x+w+3,svgW-30).toFixed(1)}" y="${(y+ROW_H*0.65).toFixed(1)}" fill="${color}">${durLabel}</text>`
-    })
-
-    // Axis ticks (4 ticks)
-    let axis = ''
-    for (let i = 0; i <= 4; i++) {
-      const xPos = LABEL_W + (i / 4) * barArea
-      const msVal = (i / 4) * totalMs
-      const lbl = msVal >= 1000 ? `${(msVal/1000).toFixed(1)}s` : `${Math.round(msVal)}ms`
-      axis += `<line class="trace-wf-axis-line" x1="${xPos.toFixed(1)}" y1="${AXIS_H}" x2="${xPos.toFixed(1)}" y2="${svgH}"/>`
-      axis += `<text class="trace-wf-axis-label" x="${xPos.toFixed(1)}" y="${AXIS_H-4}" text-anchor="middle">${lbl}</text>`
-    }
-
-    body.innerHTML = `<svg class="trace-wf-svg" viewBox="0 0 ${svgW} ${svgH}" style="height:${svgH}px">${axis}${rows}</svg>`
-  } catch {
-    body.innerHTML = `<div class="trace-waterfall-empty">${t('trace.load_error')}</div>`
   }
 }
 
@@ -11821,7 +11744,7 @@ async function renderDiagnoseOffer() {
   const box = document.getElementById('updatesDiagnose')
   if (!box) return
   let data
-  try { data = await (await fetch('/api/updates/status')).json() } catch { box.hidden = true; return }
+  try { data = await (await fetch('api/updates/status')).json() } catch { box.hidden = true; return }
   if (data.needsHuman) {
     box.hidden = false
     box.className = 'updates-diagnose needs-human'
@@ -11842,7 +11765,7 @@ async function runDiagnose() {
   const btn = document.getElementById('updatesDiagnoseBtn')
   if (btn) btn.disabled = true
   try {
-    const res = await fetch('/api/updates/diagnose', { method: 'POST' })
+    const res = await fetch('api/updates/diagnose', { method: 'POST' })
     const data = await res.json().catch(() => ({}))
     if (!res.ok) {
       if (btn) btn.disabled = false
@@ -11918,7 +11841,7 @@ async function pollUpdateOutcome(resetBtn) {
     await new Promise((r) => setTimeout(r, 3000))
     let data
     try {
-      const res = await fetch('/api/updates/status')
+      const res = await fetch('api/updates/status')
       data = await res.json()
     } catch {
       // Dashboard is mid-restart (expected): keep polling.
@@ -11965,7 +11888,7 @@ setInterval(pollUpdatesBadge, 5 * 60_000)
 // still needs setup (pre-install-now / configure-later flow). Steps 2-3 reuse
 // the existing channel-setup + pairing backend endpoints.
 async function fetchOnboardingStatus() {
-  try { return await (await fetch('/api/onboarding/status')).json() } catch { return null }
+  try { return await (await fetch('api/onboarding/status')).json() } catch { return null }
 }
 function onboardingCurrentStep(s) {
   if (!s.identityConfirmed) return 1
@@ -12011,11 +11934,16 @@ function renderOnboarding(s) {
     el.classList.toggle('active', n === step)
     el.classList.toggle('done', n < step)
   })
+  // The steps build on each other and the system only comes alive at the end
+  // of step 4 -- say so, or a fresh installer reads step 2's "saved" as "done"
+  // and every later "bot token not found" as a failure (BK bootcamp, 07-28).
+  const flowNote = document.getElementById('onbFlowNote')
+  if (flowNote) flowNote.textContent = step === 4 ? t('onboarding.flow_note_last') : t('onboarding.flow_note')
   const body = document.getElementById('onboardingBody')
   if (step === 1) body.innerHTML = onbIdentityHtml(s)
   else if (step === 2) body.innerHTML = onbStep1Html(s)
   else if (step === 3) body.innerHTML = onbStep2Html()
-  else body.innerHTML = onbStep3Html()
+  else body.innerHTML = onbStep3Html(s)
   wireOnboarding(step)
 }
 function onbMsg(text, isErr) {
@@ -12053,8 +11981,15 @@ function onbStep2Html() {
     + `<button class="btn-primary btn-compact" id="onbBotBtn">${escapeHtml(t('onboarding.step2.save_btn'))}</button>`
     + `<div id="onbMsg" class="onb-msg"></div>`
 }
-function onbStep3Html() {
+function onbStep3Html(s) {
+  // Pairing needs the channels session up (the wizard restarted it after the
+  // bot-token save) -- show its state so a not-yet-up service reads as
+  // "starting", not as the user's failure.
+  const svcLine = s && s.agentsRunning
+    ? `<p class="onb-ok-line">${escapeHtml(t('onboarding.step3.svc_up'))}</p>`
+    : `<p class="onb-hint">${escapeHtml(t('onboarding.step3.svc_starting'))}</p>`
   return `<p>${escapeHtml(t('onboarding.step3.desc'))}</p>`
+    + svcLine
     + `<ol class="onb-list"><li>${escapeHtml(t('onboarding.step3.li1'))}</li><li>${escapeHtml(t('onboarding.step3.li2'))}</li></ol>`
     + `<div id="onbPending" class="onb-pending"></div>`
     + `<button class="btn-secondary btn-compact" id="onbRefreshBtn">${escapeHtml(t('onboarding.step3.refresh_btn'))}</button>`
@@ -12069,9 +12004,17 @@ function wireOnboarding(step) {
       if (!agentName || !ownerName) { onbMsg(t('onboarding.identity.empty'), true); return }
       idBtn.disabled = true; onbMsg(t('onboarding.saving'))
       try {
-        const res = await fetch('/api/onboarding/identity', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ agentName, ownerName }) })
+        const res = await fetch('api/onboarding/identity', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ agentName, ownerName }) })
         const d = await res.json().catch(() => ({}))
         if (!res.ok) { idBtn.disabled = false; onbMsg(d.error || t('onboarding.error'), true); return }
+        // The name is live in the .env now -- repaint the chrome from
+        // /api/marveen so the sidebar/title reflect it immediately, and
+        // surface the automatic channels restart (same pattern as the
+        // claude-auth step) instead of silently advancing.
+        if (typeof initSidebarBrand === 'function') initSidebarBrand()
+        if (d.restartError) { idBtn.disabled = false; onbMsg(t('onboarding.identity.saved_restart_failed'), true); setTimeout(refreshOnboarding, 6000); return }
+        if (d.restarted) { onbMsg(t('onboarding.identity.saved_restarted')); setTimeout(refreshOnboarding, 2500); return }
+        if (d.restartNeeded) { onbMsg(t('onboarding.identity.saved_restart_needed')); await refreshOnboarding(); return }
         onbMsg(t('onboarding.identity.saved'))
         await refreshOnboarding()
       } catch (e) { idBtn.disabled = false; onbMsg((e && e.message) || t('onboarding.error'), true) }
@@ -12085,9 +12028,15 @@ function wireOnboarding(step) {
       if (!token) { onbMsg(t('onboarding.step1.token_empty'), true); return }
       authBtn.disabled = true; onbMsg(t('onboarding.saving'))
       try {
-        const res = await fetch('/api/onboarding/claude-auth', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }) })
+        const res = await fetch('api/onboarding/claude-auth', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }) })
         const d = await res.json().catch(() => ({}))
         if (!res.ok) { authBtn.disabled = false; onbMsg(d.error || t('onboarding.error'), true); return }
+        // Fresh-install path: the server restarts the (previously
+        // unauthenticated) channels session right after the first auth save --
+        // surface that, and on failure show the manual restart step instead of
+        // silently advancing.
+        if (d.restartError) { authBtn.disabled = false; onbMsg(t('onboarding.step1.saved_restart_failed'), true); setTimeout(refreshOnboarding, 6000); return }
+        if (d.restarted) { onbMsg(t('onboarding.step1.saved_restarted')); setTimeout(refreshOnboarding, 2500); return }
         onbMsg(d.verified ? t('onboarding.step1.saved_verified') : t('onboarding.step1.saved_unverified'))
         await refreshOnboarding()
       } catch (e) { authBtn.disabled = false; onbMsg((e && e.message) || t('onboarding.error'), true) }
@@ -12096,11 +12045,27 @@ function wireOnboarding(step) {
     if (launchBtn) launchBtn.addEventListener('click', async () => {
       launchBtn.disabled = true; onbMsg(t('onboarding.step1.launching'))
       try {
-        const res = await fetch('/api/onboarding/launch', { method: 'POST' })
+        const res = await fetch('api/onboarding/launch', { method: 'POST' })
         const d = await res.json().catch(() => ({}))
         if (!res.ok) { launchBtn.disabled = false; onbMsg(d.error || t('onboarding.error'), true); return }
         onbMsg(t('onboarding.step1.launched'))
-        setTimeout(refreshOnboarding, 2500)
+        // On a fresh install the session is CREATED here (ONBTMUX1) and takes a
+        // ~minute cold start via channels.sh. Poll until it is up so the wizard
+        // advances on its own instead of stranding the user on step 2 after a
+        // single 2.5s re-check. Bounded so a genuinely failed start still hands
+        // control back rather than spinning forever.
+        let up = false
+        for (let i = 0; i < 40 && !up; i++) {  // ~40 x 3s = 2 min
+          await new Promise((r) => setTimeout(r, 3000))
+          const st = await fetchOnboardingStatus()
+          if (st && st.agentsRunning) { up = true; break }
+        }
+        if (up) { await refreshOnboarding() }
+        // Timeout is NOT success: on a slow machine the cold start can outlast
+        // the 2-min bound while still being healthy, so the message must say
+        // "still starting, check back / refresh" -- repeating the launched
+        // message here would also mask a genuinely dead start (PR #779 review).
+        else { launchBtn.disabled = false; onbMsg(t('onboarding.step1.launch_slow'), true) }
       } catch (e) { launchBtn.disabled = false; onbMsg((e && e.message) || t('onboarding.error'), true) }
     })
   } else if (step === 3) {
@@ -12110,18 +12075,51 @@ function wireOnboarding(step) {
       if (!botToken) { onbMsg(t('onboarding.step2.token_empty'), true); return }
       botBtn.disabled = true; onbMsg(t('onboarding.saving'))
       try {
-        const res = await fetch(`/api/agents/${encodeURIComponent(mainAgentId())}/channels/telegram`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ botToken }) })
+        const res = await fetch(`api/agents/${encodeURIComponent(mainAgentId())}/channels/telegram`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ botToken }) })
         const d = await res.json().catch(() => ({}))
         if (!res.ok) { botBtn.disabled = false; onbMsg(d.error || t('onboarding.error'), true); return }
-        onbMsg(t('onboarding.step2.saved'))
-        setTimeout(refreshOnboarding, 2000)
+        // The server restarts the channels session so the new bot token goes
+        // live -- say so, and give the respawn a beat before advancing so the
+        // pairing step starts against the restarted service.
+        onbMsg(d.restarted ? t('onboarding.step2.saved_restarted') : t('onboarding.step2.saved'))
+        setTimeout(refreshOnboarding, d.restarted ? 4000 : 2000)
       } catch (e) { botBtn.disabled = false; onbMsg((e && e.message) || t('onboarding.error'), true) }
     })
   } else if (step === 4) {
     const refreshBtn = document.getElementById('onbRefreshBtn')
+    // One sink for both failure paths. The box alone was not enough: it renders
+    // in the same muted onb-hint slot as "no pending", so the very distinction
+    // this fix is about -- "nobody is waiting" vs "I could not ask" -- stayed
+    // invisible. onbMsg is the error channel this function already uses for the
+    // approve step a few lines below.
+    const showPendingError = (msg) => {
+      const box = document.getElementById('onbPending')
+      if (box) box.innerHTML = `<span class="onb-hint">${escapeHtml(msg)}</span>`
+      onbMsg(msg, true)
+    }
     const loadPending = async () => {
       try {
-        const p = await (await fetch(`/api/agents/${encodeURIComponent(mainAgentId())}/channels/telegram/pending`)).json()
+        // Same boot race the Messages page already guards against (see
+        // ensureMarveenLoaded): until /api/marveen resolves window._marveen,
+        // mainAgentId() returns the literal 'marveen' fallback. On a renamed
+        // install that is not the main agent, so the backend takes the
+        // sub-agent branch, finds no such agent dir and answers 404 -- and the
+        // wizard rendered that as "no pending pairing" while the Channel view,
+        // which uses the selected agent, listed the very same request.
+        await ensureMarveenLoaded()
+        const res = await fetch(`api/agents/${encodeURIComponent(mainAgentId())}/channels/telegram/pending`)
+        // Surface the failure instead of rendering it as an empty list. This is
+        // a separate defect from the id race: without it a 404 or an auth error
+        // reads as "nobody is waiting for approval", which is the one answer the
+        // user cannot act on. A NETWORK failure does not land here at all -- the
+        // fetch rejects -- so the outer catch carries the same message; see the
+        // end of this function. The two together are what make the comment true.
+        if (!res.ok) {
+          const d = await res.json().catch(() => ({}))
+          showPendingError(d.error || t('onboarding.error'))
+          return
+        }
+        const p = await res.json()
         // Backend contract: [{code, senderId, chatId, createdAt, expiresAt}].
         // `code` is the approve key (the same code the bot sent the user) --
         // POSTing anything else gets a 400 and the pairing never completes.
@@ -12138,14 +12136,19 @@ function wireOnboarding(step) {
         box.querySelectorAll('.onb-approve').forEach((b) => b.addEventListener('click', async () => {
           b.disabled = true
           try {
-            const res = await fetch(`/api/agents/${encodeURIComponent(mainAgentId())}/channels/telegram/approve`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: b.dataset.code }) })
+            const res = await fetch(`api/agents/${encodeURIComponent(mainAgentId())}/channels/telegram/approve`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: b.dataset.code }) })
             const d = await res.json().catch(() => ({}))
             if (!res.ok) { b.disabled = false; onbMsg(d.error || t('onboarding.error'), true); return }
             onbMsg(t('onboarding.step3.approved'))
             setTimeout(refreshOnboarding, 1500)
           } catch (e) { b.disabled = false; onbMsg((e && e.message) || t('onboarding.error'), true) }
         }))
-      } catch { /* ignore */ }
+      } catch (e) {
+        // Network-level failure: the fetch rejected, so the !res.ok branch never
+        // ran. Without this the box stays empty and the user reads it as "nobody
+        // is waiting" -- the exact defect this change is about.
+        showPendingError((e && e.message) || t('onboarding.error'))
+      }
     }
     if (refreshBtn) refreshBtn.addEventListener('click', () => { refreshOnboarding() })
     loadPending()
@@ -12738,7 +12741,7 @@ async function loadApprovalsPage() {
   if (_approvalsCountdownInterval) { clearInterval(_approvalsCountdownInterval); _approvalsCountdownInterval = null }
 
   try {
-    const res = await fetch('/api/approvals?limit=500')
+    const res = await fetch('api/approvals?limit=500')
     if (!res.ok) throw new Error('HTTP ' + res.status)
     _approvalsAll = await res.json()
     _renderApprovalsStats()
@@ -12892,7 +12895,7 @@ function _renderApprovalsPagination(total) {
 
 async function _resolveApproval(id, decision) {
   try {
-    const res = await fetch(`/api/approvals/${id}`, {
+    const res = await fetch(`api/approvals/${id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ status: decision, resolved_by: 'dashboard' }),
@@ -12968,7 +12971,7 @@ const SETTINGS_ACTIVE_TAB_KEY = 'settings-active-tab'
 
 async function fetchAuthStatus() {
   try {
-    const r = await fetch('/api/auth/status')
+    const r = await fetch('api/auth/status')
     return r.ok ? await r.json() : null
   } catch {
     return null
@@ -13006,6 +13009,7 @@ function renderBridgeEnrollSection(body) {
     `<div class="auth-form">` +
       `<input id="authBridgeKeyLine" type="text" autocapitalize="off" spellcheck="false" placeholder="${t('auth.bridge.key_placeholder')}">` +
       `<input id="authBridgeName" type="text" autocapitalize="off" spellcheck="false" maxlength="64" placeholder="${t('auth.bridge.name_placeholder')}">` +
+      `<input id="authBridgeHost" type="text" autocapitalize="off" spellcheck="false" maxlength="253" placeholder="${t('auth.bridge.host_placeholder')}">` +
       `<button class="btn-secondary" id="authBridgeEnrollBtn">${t('auth.bridge.enroll')}</button>` +
       `<div class="auth-form-msg" id="authBridgeMsg"></div>` +
       `<div id="authBridgeBundle" hidden></div>` +
@@ -13019,6 +13023,7 @@ async function bridgeEnrollFromUi() {
   const out = document.getElementById('authBridgeBundle')
   const keyLine = (document.getElementById('authBridgeKeyLine').value || '').trim()
   const name = (document.getElementById('authBridgeName').value || '').trim()
+  const hostOverride = (document.getElementById('authBridgeHost').value || '').trim()
   msg.className = 'auth-form-msg'
   msg.textContent = ''
   out.hidden = true
@@ -13027,9 +13032,9 @@ async function bridgeEnrollFromUi() {
   if (!confirm(t('auth.bridge.confirm', { name }))) return
   msg.textContent = t('auth.bridge.working')
   try {
-    const r = await fetch('/api/security/bridge-enroll', {
+    const r = await fetch('api/security/bridge-enroll', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ key_line: keyLine, name }),
+      body: JSON.stringify(hostOverride ? { key_line: keyLine, name, host: hostOverride } : { key_line: keyLine, name }),
     })
     const data = await r.json().catch(() => ({}))
     if (!r.ok) { msg.classList.add('err'); msg.textContent = data.error || t('auth.card.err_generic'); return }
@@ -13038,6 +13043,7 @@ async function bridgeEnrollFromUi() {
       (data.warnings && data.warnings.length ? ` (${data.warnings.join('; ')})` : '')
     document.getElementById('authBridgeKeyLine').value = ''
     document.getElementById('authBridgeName').value = ''
+    document.getElementById('authBridgeHost').value = ''
     out.hidden = false
     out.innerHTML =
       `<p class="auth-muted">${t('auth.bridge.bundle_hint', { host: escapeHtml(data.host || '') })}</p>` +
@@ -13084,7 +13090,7 @@ async function refreshDeviceKeyList() {
   const el = document.getElementById('authDeviceKeyList')
   if (!el) return
   try {
-    const r = await fetch('/api/auth/device-keys')
+    const r = await fetch('api/auth/device-keys')
     if (!r.ok) { el.innerHTML = ''; return }
     const { keys } = await r.json()
     if (!keys || !keys.length) { el.innerHTML = `<p class="auth-muted">${t('auth.devices.empty')}</p>`; return }
@@ -13110,7 +13116,7 @@ async function refreshDeviceKeyList() {
         if (warnBefore) warnBefore.hidden = true
         let sshWarn = false
         try {
-          const r = await fetch(`/api/auth/device-keys/${btn.dataset.keyId}`, { method: 'DELETE' })
+          const r = await fetch(`api/auth/device-keys/${btn.dataset.keyId}`, { method: 'DELETE' })
           const data = await r.json().catch(() => ({}))
           if (r.ok && data.ssh_removed === false) sshWarn = true
         } catch { /* ignore -- the list refresh below shows the real state */ }
@@ -13136,7 +13142,7 @@ async function mintDeviceKey() {
   const payload = { name }
   if (expiryRaw) payload.expires_in_days = Number(expiryRaw)
   try {
-    const r = await fetch('/api/auth/device-keys', {
+    const r = await fetch('api/auth/device-keys', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     })
@@ -13180,7 +13186,7 @@ function renderCreateLoginForm(body) {
     if (!username || !p1) { msg.classList.add('err'); msg.textContent = t('auth.login.err_empty'); return }
     if (p1 !== p2) { msg.classList.add('err'); msg.textContent = t('auth.card.err_mismatch'); return }
     try {
-      const r = await fetch('/api/auth/users', {
+      const r = await fetch('api/auth/users', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username, password: p1 }),
       })
@@ -13214,7 +13220,7 @@ function renderSessionPanel(body, status) {
     msg.className = 'auth-form-msg'
     if (p1 !== p2) { msg.classList.add('err'); msg.textContent = t('auth.card.err_mismatch'); return }
     try {
-      const r = await fetch('/api/auth/password', {
+      const r = await fetch('api/auth/password', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ current_password: cur, new_password: p1 }),
       })
@@ -13224,11 +13230,11 @@ function renderSessionPanel(body, status) {
     } catch { msg.classList.add('err'); msg.textContent = t('auth.login.err_network') }
   })
   document.getElementById('authLogoutBtn').addEventListener('click', async () => {
-    try { await fetch('/api/auth/logout', { method: 'POST' }) } catch { /* ignore */ }
+    try { await fetch('api/auth/logout', { method: 'POST' }) } catch { /* ignore */ }
     window.location.reload()
   })
   document.getElementById('authLogoutAllBtn').addEventListener('click', async () => {
-    try { await fetch('/api/auth/logout-all', { method: 'POST' }) } catch { /* ignore */ }
+    try { await fetch('api/auth/logout-all', { method: 'POST' }) } catch { /* ignore */ }
     window.location.reload()
   })
   renderAuthSessions()
@@ -13238,7 +13244,7 @@ async function renderAuthSessions() {
   const el = document.getElementById('authSessions')
   if (!el) return
   try {
-    const r = await fetch('/api/auth/sessions')
+    const r = await fetch('api/auth/sessions')
     if (!r.ok) { el.innerHTML = ''; return }
     const { sessions } = await r.json()
     if (!sessions || !sessions.length) { el.innerHTML = ''; return }
@@ -13739,21 +13745,48 @@ let tuChartState = null
 
 // Model pricing in USD per million tokens (input / output / cache-write / cache-read).
 // Fallback row is used when model is unknown or not yet captured.
+// cache-write is 1.25x input, cache-read is 0.1x input -- keep the derived
+// columns consistent with `in` when editing a row.
+// Sonnet 5 launched on introductory pricing (2 / 10) that ends 2026-08-31;
+// the standard rate (3 / 15) applies from 2026-09-01. Resolved by date at load
+// time instead of pinned to one of the two, so the table neither understates
+// spend today nor silently overstates it the morning the intro rate expires.
+const TU_SONNET5_INTRO_END = Date.parse('2026-09-01T00:00:00Z')
+const TU_SONNET5_PRICE = Date.now() < TU_SONNET5_INTRO_END
+  ? { in: 2.0, out: 10.0, cw: 2.50, cr: 0.20 }
+  : { in: 3.0, out: 15.0, cw: 3.75, cr: 0.30 }
+
 const TU_MODEL_PRICING = {
+  // INFERRED, not from the published catalogue: Opus 5 is not listed in the
+  // model reference this table was checked against. The value follows the rest
+  // of the current Opus tier (4.6/4.7/4.8 at 5 / 25); treat it as an estimate
+  // until a published rate confirms it.
+  'claude-opus-5':       { in: 5.0,   out: 25.0,  cw: 6.25,  cr: 0.50 },
+  'claude-opus-4-8':     { in: 5.0,   out: 25.0,  cw: 6.25,  cr: 0.50 },
+  'claude-opus-4-7':     { in: 5.0,   out: 25.0,  cw: 6.25,  cr: 0.50 },
+  'claude-opus-4-6':     { in: 5.0,   out: 25.0,  cw: 6.25,  cr: 0.50 },
+  // Opus 4.0 / 4.1 -- the last generation still on the old Opus pricing.
+  'claude-opus-4':       { in: 15.0,  out: 75.0,  cw: 18.75, cr: 1.50 },
+  'claude-sonnet-5':     TU_SONNET5_PRICE,
   'claude-sonnet-4-6':   { in: 3.0,   out: 15.0,  cw: 3.75,  cr: 0.30 },
   'claude-sonnet-4-5':   { in: 3.0,   out: 15.0,  cw: 3.75,  cr: 0.30 },
-  'claude-sonnet-5':     { in: 3.0,   out: 15.0,  cw: 3.75,  cr: 0.30 },
-  'claude-opus-4':       { in: 15.0,  out: 75.0,  cw: 18.75, cr: 1.50 },
-  'claude-opus-4-8':     { in: 15.0,  out: 75.0,  cw: 18.75, cr: 1.50 },
-  'claude-haiku-4-5':    { in: 0.80,  out: 4.0,   cw: 1.00,  cr: 0.08 },
-  'claude-fable-5':      { in: 3.0,   out: 15.0,  cw: 3.75,  cr: 0.30 },
+  'claude-fable-5':      { in: 10.0,  out: 50.0,  cw: 12.50, cr: 1.00 },
+  'claude-mythos-5':     { in: 10.0,  out: 50.0,  cw: 12.50, cr: 1.00 },
+  'claude-haiku-4-5':    { in: 1.0,   out: 5.0,   cw: 1.25,  cr: 0.10 },
   default:               { in: 3.0,   out: 15.0,  cw: 3.75,  cr: 0.30 },
 }
 
+// Longest-prefix wins. A plain first-match loop is order-dependent and silently
+// wrong here: 'claude-opus-4-8' also startsWith 'claude-opus-4', so whichever
+// key the object happens to list first decides the price -- that is how Opus 4.8
+// was billed at the Opus 4.1 rate even once it had its own row.
 function tuPriceForModel(model) {
   if (!model) return TU_MODEL_PRICING.default
-  for (const key of Object.keys(TU_MODEL_PRICING)) {
-    if (key !== 'default' && model.startsWith(key)) return TU_MODEL_PRICING[key]
+  const keys = Object.keys(TU_MODEL_PRICING)
+    .filter((k) => k !== 'default')
+    .sort((a, b) => b.length - a.length)
+  for (const key of keys) {
+    if (model.startsWith(key)) return TU_MODEL_PRICING[key]
   }
   return TU_MODEL_PRICING.default
 }
@@ -13863,8 +13896,8 @@ async function loadTokenUsage() {
   const baseQuery = params.toString()
 
   const [modelDistRes, toolStatsRes] = await Promise.all([
-    fetch('/api/token-usage/model-dist?' + baseQuery + agentParam),
-    fetch('/api/token-usage/tool-stats?' + baseQuery + agentParam),
+    fetch('api/token-usage/model-dist?' + baseQuery + agentParam),
+    fetch('api/token-usage/tool-stats?' + baseQuery + agentParam),
   ])
   if (modelDistRes.ok) renderTuModelDist(await modelDistRes.json())
   if (toolStatsRes.ok) renderTuToolStats(await toolStatsRes.json())
@@ -15326,8 +15359,8 @@ async function loadFederationPage() {
   peersEl.innerHTML = `<p style="color:var(--text-muted);font-size:13px">${t('common.loading')}</p>`
   try {
     const [peersRes, statusRes] = await Promise.all([
-      fetch('/api/federation/peers'),
-      fetch('/api/federation/status').then((r) => (r.ok ? r.json() : null)).catch(() => null),
+      fetch('api/federation/peers'),
+      fetch('api/federation/status').then((r) => (r.ok ? r.json() : null)).catch(() => null),
     ])
     if (!peersRes.ok) throw new Error('HTTP ' + peersRes.status)
     fedPeersViewCache = await peersRes.json()
@@ -15388,7 +15421,7 @@ function renderFederationPage() {
     const enabled = e.target.checked
     if (!enabled && !confirm(t('federation.confirm.disable'))) { e.target.checked = true; return }
     try {
-      const res = await fetch('/api/federation/enabled', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) })
+      const res = await fetch('api/federation/enabled', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); e.target.checked = !enabled; return }
       showToast(enabled ? t('federation.toast.enabled') : t('federation.toast.disabled'))
@@ -15399,7 +15432,7 @@ function renderFederationPage() {
     radio.addEventListener('change', async (e) => {
       const mode = e.target.value
       try {
-        const res = await fetch('/api/federation/routing-mode', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode }) })
+        const res = await fetch('api/federation/routing-mode', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode }) })
         const data = await res.json().catch(() => ({}))
         if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
         showToast(t('federation.routing.toast_set', { mode: t('federation.routing.mode.' + mode + '.label') }))
@@ -15455,7 +15488,7 @@ async function fedRevealToken(peerId, card) {
   const box = card.querySelector('.fed-token-reveal')
   if (!box.hidden) { box.hidden = true; box.textContent = ''; return }
   try {
-    const res = await fetch(`/api/federation/peers/${encodeURIComponent(peerId)}/inbound-token`)
+    const res = await fetch(`api/federation/peers/${encodeURIComponent(peerId)}/inbound-token`)
     const data = await res.json().catch(() => ({}))
     if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
     box.textContent = data.inboundToken
@@ -15470,7 +15503,7 @@ async function fedRevealToken(peerId, card) {
 async function fedRotateToken(peerId) {
   if (!confirm(t('federation.confirm.rotate', { peer: peerId }))) return
   try {
-    const res = await fetch(`/api/federation/peers/${encodeURIComponent(peerId)}/rotate-inbound-token`, { method: 'POST' })
+    const res = await fetch(`api/federation/peers/${encodeURIComponent(peerId)}/rotate-inbound-token`, { method: 'POST' })
     const data = await res.json().catch(() => ({}))
     if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
     showToast(t('federation.toast.rotated'))
@@ -15480,7 +15513,7 @@ async function fedRotateToken(peerId) {
 
 async function fedToggleShareCap(peerId, share) {
   try {
-    const res = await fetch(`/api/federation/peers/${encodeURIComponent(peerId)}`, {
+    const res = await fetch(`api/federation/peers/${encodeURIComponent(peerId)}`, {
       method: 'PATCH', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ shareCapabilitySummaries: share }),
     })
@@ -15493,7 +15526,7 @@ async function fedToggleShareCap(peerId, share) {
 async function fedDeletePeer(peerId) {
   if (!confirm(t('federation.confirm.delete_peer', { peer: peerId }))) return
   try {
-    const res = await fetch(`/api/federation/peers/${encodeURIComponent(peerId)}`, { method: 'DELETE' })
+    const res = await fetch(`api/federation/peers/${encodeURIComponent(peerId)}`, { method: 'DELETE' })
     const data = await res.json().catch(() => ({}))
     if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
     // Sweep browser leftovers scoped to the removed peer.
@@ -15518,7 +15551,7 @@ async function fedApplyToMainAgent() {
     // so the client does not depend on window._marveen being loaded (the
     // Federation page does not populate it -> the old /api/agents/:name path
     // 404'd when it fell back to the 'marveen' default).
-    const res = await fetch('/api/federation/apply', {
+    const res = await fetch('api/federation/apply', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
     })
     const data = await res.json().catch(() => ({}))
@@ -15531,7 +15564,7 @@ async function fedApplyToMainAgent() {
 // (enable, peer add/edit) so the status shows fresh -- there is no separate
 // manual "refresh" button anymore (the apply action owns the top-right slot).
 async function fedRefreshAndReload() {
-  try { await fetch('/api/federation/refresh', { method: 'POST' }) } catch { /* best effort */ }
+  try { await fetch('api/federation/refresh', { method: 'POST' }) } catch { /* best effort */ }
   loadFederationPage()
 }
 
@@ -15564,14 +15597,14 @@ async function fedSavePeerModal() {
       if (outbound) body.outboundToken = outbound
       if (abandonRaw) body.abandonWindowMinutes = parseInt(abandonRaw, 10)
       else body.abandonWindowMinutes = null
-      res = await fetch(`/api/federation/peers/${encodeURIComponent(fedPeerModalEditId)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      res = await fetch(`api/federation/peers/${encodeURIComponent(fedPeerModalEditId)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
       data = await res.json().catch(() => ({}))
       if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
       showToast(t('federation.toast.peer_saved'))
     } else {
       const body = { id, baseUrl }
       if (outbound) body.outboundToken = outbound
-      res = await fetch('/api/federation/peers', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      res = await fetch('api/federation/peers', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
       data = await res.json().catch(() => ({}))
       if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
       // The minted inbound token is shown ONCE right away: the owner hands it
@@ -15587,7 +15620,7 @@ async function fedSavePeerModal() {
 async function fedRemoveAll() {
   if (!confirm(t('federation.confirm.remove'))) return
   try {
-    const res = await fetch('/api/federation/remove', { method: 'POST' })
+    const res = await fetch('api/federation/remove', { method: 'POST' })
     const data = await res.json().catch(() => ({}))
     if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
     federatedPeerStatus = []
@@ -15801,7 +15834,7 @@ async function loadResearch() {
   listEl.innerHTML = '<p class="muted">' + t('research.loading') + '</p>'
   let groups = []
   try {
-    const res = await fetch('/api/research')
+    const res = await fetch('api/research')
     groups = await res.json()
     if (!Array.isArray(groups)) groups = []
   } catch (e) {
@@ -15839,7 +15872,7 @@ async function openResearchDoc(agent, name) {
   if (!contentEl) return
   contentEl.innerHTML = '<p class="muted">' + t('research.loading') + '</p>'
   try {
-    const res = await fetch('/api/research/' + encodeURIComponent(agent) + '/' + encodeURIComponent(name))
+    const res = await fetch('api/research/' + encodeURIComponent(agent) + '/' + encodeURIComponent(name))
     if (!res.ok) throw new Error('HTTP ' + res.status)
     const doc = await res.json()
     const content = doc.content || ''
