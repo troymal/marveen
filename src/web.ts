@@ -3,7 +3,7 @@ import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { execSync, execFileSync } from 'node:child_process'
-import { PROJECT_ROOT, WEB_HOST, DASHBOARD_PUBLIC_URL, DASHBOARD_ALLOWED_ORIGINS, MAIN_AGENT_ID } from './config.js'
+import { PROJECT_ROOT, WEB_HOST, DASHBOARD_PUBLIC_URL, DASHBOARD_ALLOWED_ORIGINS, DASHBOARD_PREFIX, MAIN_AGENT_ID } from './config.js'
 import { loadOrCreateDashboardToken } from './web/dashboard-auth.js'
 import { resolveAuth, requiresAuth, isFederationWireEndpoint, type AuthResult } from './web/auth-gate.js'
 import { sweepExpiredSessions } from './web/auth-sessions.js'
@@ -102,7 +102,15 @@ export function startWebServer(port = 3420): http.Server {
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || '/', `http://localhost:${port}`)
-    const path = url.pathname
+    // Strip the reverse-proxy path prefix (DASHBOARD_PREFIX) so that route
+    // matching works whether the dashboard is served from the root or from a
+    // subpath like "/dashboard/".  The stripped path is used for all route
+    // matching; the original url object is preserved unchanged in routeCtx.
+    const rawPath = url.pathname
+    const path = DASHBOARD_PREFIX && rawPath.startsWith(DASHBOARD_PREFIX + '/')
+      ? rawPath.slice(DASHBOARD_PREFIX.length)
+      : rawPath === DASHBOARD_PREFIX ? '/'
+      : rawPath
     const method = req.method || 'GET'
 
     const origin = req.headers.origin

@@ -1,7 +1,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { PROJECT_ROOT, MAIN_AGENT_ID, currentBotName } from '../../config.js'
+import { PROJECT_ROOT, MAIN_AGENT_ID, BOT_NAME } from '../../config.js'
 import { getDb, countTaskRunsBetween } from '../../db.js'
 import {
   agentDir, listAgentNames, readAgentDisplayName,
@@ -126,11 +126,11 @@ export async function tryHandleOverview(ctx: RouteContext): Promise<boolean> {
     ].some(existsSync)
     agentsForTeam.push({
       id: MAIN_AGENT_ID,
-      label: currentBotName(),
+      label: BOT_NAME,
       role: 'main',
       running: true,
       hasAvatar: mainHasAvatar,
-      avatarUrl: `/api/marveen/avatar`,
+      avatarUrl: `api/marveen/avatar`,
     })
     for (const a of subAgents) {
       const team = readAgentTeam(a)
@@ -140,7 +140,7 @@ export async function tryHandleOverview(ctx: RouteContext): Promise<boolean> {
         role: team.role,
         running: isAgentRunning(a),
         hasAvatar: existsSync(join(agentDir(a), 'avatar.png')),
-        avatarUrl: `/api/agents/${encodeURIComponent(a)}/avatar`,
+        avatarUrl: `api/agents/${encodeURIComponent(a)}/avatar`,
       })
     }
     jsonMaybeGzip(req, res, {
