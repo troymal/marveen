@@ -2,6 +2,7 @@ import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { PROJECT_ROOT, MAIN_AGENT_ID, DEFAULT_AGENT_MODEL } from '../config.js'
+import { readEnvFile, updateEnvFile } from '../env.js'
 import { atomicWriteFileSync } from './atomic-write.js'
 import { safeJoin } from './sanitize.js'
 import {
@@ -66,6 +67,31 @@ export function findAvatarForAgent(name: string): string | null {
 
 export function resolveModelId(raw: string): string {
   return MODEL_ALIASES[raw] || raw
+}
+
+// ---- main-agent model override (.env MAIN_AGENT_MODEL) ----------------------
+//
+// The main agent's model is pinned in .env, NOT in .claude/settings.json: that
+// file is TRACKED, so an install that writes its model choice there carries a
+// permanent local diff which blocks the update preflight's clean-tree check and
+// gets reverted by the next update. scripts/channels.sh already resolves it
+// this way (resolve_main_model); these helpers give the DASHBOARD the same
+// precedence, so a dashboard-driven respawn cannot silently drop main back onto
+// the repository's tracked value -- which is what made an operator's .env edit
+// look like it "did not take effect".
+//
+// Read fresh from disk on every call: the operator edits .env and restarts the
+// main session, not the dashboard, so a boot-time snapshot would go stale.
+export function readMainModelOverride(): string {
+  return (readEnvFile(['MAIN_AGENT_MODEL'])['MAIN_AGENT_MODEL'] ?? '').trim()
+}
+
+// Persist a new model for the main agent into .env. Only call this when an
+// override is actually in play -- with no MAIN_AGENT_MODEL line the tracked
+// settings.json is still the source of truth, and writing .env here would
+// silently take that decision over from it.
+export function writeMainModelOverride(model: string): void {
+  updateEnvFile({ MAIN_AGENT_MODEL: model })
 }
 
 // ---- model-profile map (deployment-local, card c755f4b2 Block B) -------------

@@ -9,6 +9,8 @@ import {
   readAgentRemoteHost,
   readAgentModel,
   writeAgentModel,
+  readMainModelOverride,
+  writeMainModelOverride,
   resolveModelId,
   DEFAULT_MODEL,
 } from './agent-config.js'
@@ -44,7 +46,13 @@ const downgradedAt = new Map<string, number>()
 
 const MAIN_SETTINGS_PATH = join(PROJECT_ROOT, '.claude', 'settings.json')
 
+// Same precedence as the launch path (scripts/channels.sh resolve_main_model)
+// and as channel-monitor's respawn: .env MAIN_AGENT_MODEL over the tracked
+// .claude/settings.json. Reading settings.json alone made this runner compare
+// against a model main was not actually on.
 function readMainModel(): string {
+  const override = readMainModelOverride()
+  if (override) return resolveModelId(override)
   try {
     const cfg = JSON.parse(readFileSync(MAIN_SETTINGS_PATH, 'utf-8'))
     return resolveModelId((cfg && typeof cfg.model === 'string' && cfg.model) || DEFAULT_MODEL)
@@ -54,6 +62,15 @@ function readMainModel(): string {
 }
 
 function writeMainModel(model: string): void {
+  // Write back to whichever layer is actually in effect. Writing settings.json
+  // while .env pins MAIN_AGENT_MODEL is a no-op for the relaunch (the .env value
+  // still wins), so the downgrade would never take -- and the runner would see
+  // the same limit + the same model on the next sweep and restart main again,
+  // every 60s, forever.
+  if (readMainModelOverride()) {
+    writeMainModelOverride(model)
+    return
+  }
   let cfg: Record<string, unknown> = {}
   try { cfg = JSON.parse(readFileSync(MAIN_SETTINGS_PATH, 'utf-8')) } catch {}
   cfg.model = model
@@ -75,9 +92,10 @@ function sessionFor(name: string): string {
 
 function restartFor(name: string): void {
   if (name === MAIN_AGENT_ID) {
-    // A fresh main relaunch re-reads .claude/settings.json (and thus the new
-    // model). channels.sh always starts fresh for main, so a conversation is
-    // not preserved here -- the model swap is what matters.
+    // A fresh main relaunch re-resolves the model (.env MAIN_AGENT_MODEL, else
+    // .claude/settings.json) and thus picks up the new one. channels.sh always
+    // starts fresh for main, so a conversation is not preserved here -- the
+    // model swap is what matters.
     //
     // Was a hardcoded `/bin/launchctl kickstart` (macOS-only), so on Linux the
     // usage-limit fallback could never actually swap main's model: it threw

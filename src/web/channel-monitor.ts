@@ -6,7 +6,7 @@ import { resolveFromPath } from '../platform.js'
 import { WEB_PORT } from '../config.js'
 import { logger } from '../logger.js'
 import { MAIN_AGENT_ID, SERVICE_ID, BOT_NAME, CHANNEL_PROVIDER, PROJECT_ROOT, RESPAWN_ENABLED } from '../config.js'
-import { agentDir, listAgentNames, readAgentChannelProvider } from './agent-config.js'
+import { agentDir, listAgentNames, readAgentChannelProvider, readMainModelOverride } from './agent-config.js'
 import {
   agentHasChannel,
   agentSessionName,
@@ -502,11 +502,20 @@ async function triggerMarveenMemorySave(): Promise<void> {
   }
 }
 
-// Read the main agent's configured model from .claude/settings.json so a
-// soft resume passes --model explicitly, mirroring scripts/channels.sh. Without
-// it the respawned session falls back to claude-code's built-in default and
-// silently drifts off the model the user picked. Returns '' when unset.
+// Read the main agent's configured model so a soft resume passes --model
+// explicitly, mirroring scripts/channels.sh. Without it the respawned session
+// falls back to claude-code's built-in default and silently drifts off the
+// model the user picked. Returns '' when unset.
+//
+// Precedence mirrors resolve_main_model() in scripts/channels.sh: .env
+// MAIN_AGENT_MODEL (per-install, gitignored) wins over .claude/settings.json
+// (tracked, shipped with the repo). Reading settings.json alone meant every
+// dashboard-driven respawn -- nightly restart, stage-3 resume, hard restart,
+// model fallback -- relaunched main on the REPOSITORY's model and silently
+// undid the operator's .env choice on the next restart.
 function readConfiguredMainModel(): string {
+  const override = readMainModelOverride()
+  if (override) return override
   try {
     const settingsPath = join(PROJECT_ROOT, '.claude', 'settings.json')
     if (!existsSync(settingsPath)) return ''
