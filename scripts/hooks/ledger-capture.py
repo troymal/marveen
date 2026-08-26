@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""UserPromptSubmit hook: capture inbound Telegram messages into the rolling
+"""UserPromptSubmit hook: capture inbound channel messages into the rolling
 transcript (direction='in') BEFORE the agent processes the prompt. Deterministic
 and agent-independent. agent_id is derived from the session's cwd so the hook is
 generic across all three channel agents and never cross-contaminates. Never
 blocks the prompt (always exit 0).
+
+PROVIDER-AGNOSTIC: every channel plugin emits the same <channel source="..">
+envelope, so the capture matches any `plugin:<provider>:<name>` source rather
+than one hardcoded provider. Hardcoding a single provider silently drops the
+whole conversation on every other channel -- and the failure is invisible,
+because the replay still produces a non-empty block from the one provider that
+IS captured.
 """
 import sys
 import os
@@ -16,8 +23,11 @@ import ledger_lib  # noqa: E402
 # <channel source="plugin:telegram:telegram" chat_id="X" message_id="Y" ... ts="Z">
 #   TEXT
 # </channel>
+# The source is `plugin:<provider>:<server>` for every channel plugin
+# (telegram, discord, slack, ...). Matching the shape instead of one literal
+# keeps a new provider working without a code change.
 CHANNEL_RX = re.compile(
-    r'<channel\s+source="plugin:telegram:telegram"([^>]*)>(.*?)</channel>',
+    r'<channel\s+source="plugin:[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+"([^>]*)>(.*?)</channel>',
     re.DOTALL,
 )
 
@@ -39,9 +49,18 @@ def main():
         chat_id = _attr(attrs, "chat_id")
         message_id = _attr(attrs, "message_id")
         ts = _attr(attrs, "ts")
+        # Voice / video_note that arrived WITHOUT a transcript keeps its
+        # attachment identity in the ledger, so a respawned session can still
+        # download + transcribe it (the STT-success path strips these attrs and
+        # carries the transcript in the body instead, so nothing is stored then).
+        att_kind = _attr(attrs, "attachment_kind")
+        att_file_id = _attr(attrs, "attachment_file_id")
         if chat_id and message_id:
             try:
-                ledger_lib.log_inbound(agent_id, chat_id, message_id, text.strip(), ts)
+                ledger_lib.log_inbound(
+                    agent_id, chat_id, message_id, text.strip(), ts,
+                    attachment_kind=att_kind, attachment_file_id=att_file_id,
+                )
             except Exception:
                 pass  # never block the prompt on a ledger error
     sys.exit(0)

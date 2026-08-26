@@ -2,7 +2,8 @@ import http from 'node:http'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { execSync, execFileSync } from 'node:child_process'
+import { execFileSync } from 'node:child_process'
+import { runLsof } from './lsof.js'
 import { PROJECT_ROOT, WEB_HOST, DASHBOARD_PUBLIC_URL, DASHBOARD_ALLOWED_ORIGINS, DASHBOARD_PREFIX, MAIN_AGENT_ID } from './config.js'
 import { loadOrCreateDashboardToken } from './web/dashboard-auth.js'
 import { resolveAuth, requiresAuth, isFederationWireEndpoint, type AuthResult } from './web/auth-gate.js'
@@ -11,8 +12,8 @@ import { sweepExpiredDeviceKeys } from './web/auth-device-keys.js'
 import { isBlockedCrossOriginWrite, originMatchesServedHost } from './web/csrf-origin.js'
 import { json } from './web/http-helpers.js'
 import { detectLanIp } from './web/network-info.js'
-import { AGENTS_BASE_DIR, listAgentNames } from './web/agent-config.js'
-import { ensureAgentHooks, ensureAgentStalenessHook, ensureEgressGate, ensureQuarantineReader, ensureDefaultScheduledTasks, agentSettingsPath, ensureAutonomySection } from './web/agent-scaffold.js'
+import { AGENTS_BASE_DIR, listAgentNames, listAllAgentNames } from './web/agent-config.js'
+import { ensureAgentHooks, ensureAgentStalenessHook, ensureEgressGate, ensureGovernanceGateCommands, ensureQuarantineReader, watchEgressAllowlistForReaderRender, ensureDefaultScheduledTasks, agentSettingsPath, ensureAutonomySection, ensureSkillsPathTrapSection } from './web/agent-scaffold.js'
 import { shouldRegisterHooks, pruneStaleHooksFromSettingsFile } from './web/hook-registration-guard.js'
 import { refreshMarveenBotUsername } from './web/telegram.js'
 import { startMessageRouter } from './web/message-router.js'
@@ -28,10 +29,12 @@ import { startReauthHealer } from './web/reauth-healer.js'
 import { startAutoRestartRunner } from './web/auto-restart-runner.js'
 import { startModelFallbackRunner } from './web/model-fallback-runner.js'
 import { startContextGuardRunner } from './web/context-guard-runner.js'
+import { startContextRestartGateRunner } from './web/context-restart-gate-runner.js'
 import { collectTokenUsage } from './web/token-usage.js'
 import { logger } from './logger.js'
 import { tryHandleAuth } from './web/routes/auth.js'
 import { tryHandleSecurity } from './web/routes/security.js'
+import { tryHandleBridgeServicePorts } from './web/routes/bridge-service-ports.js'
 import { tryHandleProfiles } from './web/routes/profiles.js'
 import { tryHandleMessages } from './web/routes/messages.js'
 import { tryHandleFederation } from './web/routes/federation.js'
@@ -161,7 +164,7 @@ export function startWebServer(port = 3420): http.Server {
     const fedPeerForCtx: string | null = auth.kind === 'federation' ? auth.peer : null
     const ctxAuth =
       auth.kind === 'token' ? { kind: 'token' as const }
-      : auth.kind === 'device' ? { kind: 'device' as const, device: auth.device }
+      : auth.kind === 'device' ? { kind: 'device' as const, device: auth.device, deviceId: auth.deviceId }
       : auth.kind === 'session' ? { kind: 'session' as const, user: auth.user }
       : auth.kind === 'federation' ? { kind: 'federation' as const, peer: auth.peer }
       : undefined
@@ -180,6 +183,7 @@ export function startWebServer(port = 3420): http.Server {
 
       if (await tryHandleAuth(routeCtx)) return
       if (await tryHandleSecurity(routeCtx)) return
+      if (await tryHandleBridgeServicePorts(routeCtx)) return
       if (await tryHandleProfiles(routeCtx)) return
       if (await tryHandleMessages(routeCtx)) return
       if (await tryHandleFederation(routeCtx)) return
@@ -238,7 +242,7 @@ export function startWebServer(port = 3420): http.Server {
       // and under launchd it also race-kills the not-yet-dead predecessor.
       logger.warn({ port }, 'Web port foglalt, probalok felszabaditani...')
       try {
-        const pidsRaw = execSync(`lsof -ti :${port} 2>/dev/null || true`, { timeout: 3000, encoding: 'utf-8' }).trim()
+        const pidsRaw = (runLsof(['-ti', `:${port}`], 3000) ?? '').trim()
         const pids = pidsRaw.split('\n').map(s => s.trim()).filter(Boolean).map(Number).filter(n => Number.isFinite(n) && n > 0)
         const uid = typeof process.getuid === 'function' ? process.getuid() : null
         const victims: number[] = []
@@ -415,6 +419,11 @@ export function startWebServer(port = 3420): http.Server {
   const contextGuardInterval = webOnly ? undefined : startContextGuardRunner()
   if (!webOnly) logger.info('Context-guard runner started (5min poll, 4.5min initial delay)')
 
+  if (!webOnly) {
+    startContextRestartGateRunner()
+    logger.info('Context-restart gate runner started (per-agent poll, 3min initial delay)')
+  }
+
   const updateCheckerInterval = webOnly ? undefined : startUpdateChecker()
   if (!webOnly) logger.info('Update checker started (15min poll)')
 
@@ -480,6 +489,7 @@ export function startWebServer(port = 3420): http.Server {
   if (!webOnly) {
     ensureFederationClaudeMdSection()
     ensureAutonomySection(MAIN_AGENT_ID)
+    ensureSkillsPathTrapSection(MAIN_AGENT_ID)
   }
 
   // Backfill the PreCompact hook into existing agents' settings.json so the
@@ -499,10 +509,18 @@ export function startWebServer(port = 3420): http.Server {
       const patched: string[] = []
       const stalePatched: string[] = []
       const egressPatched: string[] = []
+      const govPatched: string[] = []
       const pruned: string[] = []
       // Include the main agent (MAIN_AGENT_ID) so the voice hook is also seeded
       // into ~/.claude/settings.json alongside existing hooks (e.g. telegram_progress.py).
-      for (const agentName of [MAIN_AGENT_ID, ...listAgentNames()]) {
+      // listALLAgentNames, not listAgentNames (HBGATEWIRE826): the
+      // .hidden-from-dashboard sentinel is a UI concern, but this loop used it
+      // to skip hook-seeding too -- the heartbeat agent therefore ran with
+      // ZERO dashboard-side hooks (its kanban-write-gate and
+      // digest-provenance-gate included), and heartbeat-worker froze at the
+      // partial set from its last pre-hiding seed. Hidden technical workers
+      // need the guard hooks MORE than visible agents, not less.
+      for (const agentName of [MAIN_AGENT_ID, ...listAllAgentNames()]) {
         // Self-heal FIRST: drop entries this app previously wrote whose script
         // file no longer exists (e.g. a deleted worktree instance's paths), so
         // the re-registration below lands on a clean, unblocked settings file.
@@ -510,12 +528,23 @@ export function startWebServer(port = 3420): http.Server {
         if (ensureAgentHooks(agentName)) patched.push(agentName)
         if (ensureAgentStalenessHook(agentName)) stalePatched.push(agentName)
         if (ensureEgressGate(agentName)) egressPatched.push(agentName)
+        if (ensureGovernanceGateCommands(agentName)) govPatched.push(agentName)
         ensureQuarantineReader(agentName)
       }
+      // EGRESSRENDER824: a grant added to store/egress-allowlist.json must
+      // reach the reader PROMPT copies without waiting for the next boot --
+      // the egress-gate hook reads the JSON live, the prompt copies do not.
+      // DELIBERATELY inside the hookDecision.register branch: a worktree /
+      // sandbox instance must not start re-rendering the shared agent
+      // definitions any more than it may register hooks -- the same isolation
+      // rule that guards the settings writes above guards this watcher.
+      watchEgressAllowlistForReaderRender(listAgentNames, (agents) =>
+        logger.info({ agents }, 'quarantine-reader definitions re-rendered after egress-allowlist.json change'))
       if (pruned.length) logger.info({ pruned }, 'Stale hook entries pruned from agent settings.json')
       if (patched.length) logger.info({ patched }, 'PreCompact hook backfilled into agent settings.json')
       if (stalePatched.length) logger.info({ patched: stalePatched }, 'staleness-guard UserPromptSubmit hook backfilled into agent settings.json')
       if (egressPatched.length) logger.info({ patched: egressPatched }, 'egress-gate WebFetch hook backfilled into agent settings.json')
+      if (govPatched.length) logger.info({ patched: govPatched }, 'governance gate hook commands upgraded to absolute node path in agent settings.json')
     } catch (err) {
       logger.warn({ err }, 'Agent hook backfill skipped')
     }

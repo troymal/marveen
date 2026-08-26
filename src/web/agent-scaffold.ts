@@ -1,10 +1,12 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, readdirSync, statSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, readdirSync, statSync, rmSync, watchFile, unwatchFile } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { PROJECT_ROOT, OWNER_NAME, MAIN_AGENT_ID, BOT_NAME, CHANNEL_PROVIDER, WEB_PORT, OWNER_DRIVE_FOLDER, APP_TZ, DASHBOARD_PUBLIC_URL, STORE_DIR } from '../config.js'
+import { PROJECT_ROOT, OWNER_NAME, MAIN_AGENT_ID, HEARTBEAT_AGENT_ID, BOT_NAME, CHANNEL_PROVIDER, WEB_PORT, OWNER_DRIVE_FOLDER, APP_TZ, DASHBOARD_PUBLIC_URL, STORE_DIR } from '../config.js'
 import { channelStateDir } from '../channel-provider.js'
 import { runAgent } from '../agent.js'
 import { atomicWriteFileSync } from './atomic-write.js'
+import { findDuplicateJsonKeys } from './json-dup-keys.js'
+import { logger } from '../logger.js'
 import { agentDir, agentConfigRoot, listAgentNames, readAgentCapabilities } from './agent-config.js'
 import { resolveProfilePlaceholders, type ProfileTemplate } from './profiles.js'
 import { sanitizeCapabilityTag, CAPABILITY_TAG_MAX_PER_AGENT } from '../prompt-safety.js'
@@ -26,6 +28,54 @@ const dashboardOrigin = resolveDashboardOrigin(DASHBOARD_PUBLIC_URL, WEB_PORT)
 // and every call 401s silently. Measured 2026-07-25: relative 401, absolute
 // 200; this had been silently killing sub-agent memory saves and searches.
 const tokenPath = join(PROJECT_ROOT, 'store', '.dashboard-token')
+
+// Hook commands run under `/bin/sh -c` with a NON-interactive PATH. On nvm
+// installs a bare `node` is not on that PATH, so the hook exits 127 -- which
+// Claude Code treats as a NON-blocking error and lets the tool call through:
+// the gate silently never enforces (atlas incident, 2026-07-30). process.execPath
+// is the absolute binary of the node running this server, which by definition
+// exists on the host that spawns the agents. Exported for unit tests.
+export const HOOK_NODE_BIN = process.execPath
+
+// The ONE way a gate hook command is assembled. Both halves are quoted:
+// process.execPath with a space in it (native Windows `C:\Program Files`, a
+// home directory with a space) would otherwise be split by `sh -c` at the
+// space -- exit 127, silently non-enforcing, the exact failure this file
+// exists to close. A single builder also keeps the injectors and every
+// wired-already comparison byte-identical, so they cannot drift.
+export function hookCommand(scriptPath: string): string {
+  // The interpreter is checked before it is used, and a missing one BLOCKS.
+  //
+  // HOOK_NODE_BIN is process.execPath, which on a brew install is the
+  // version-pinned real path (/opt/homebrew/Cellar/node@22/<version>/bin/node),
+  // not the stable /opt/homebrew/bin/node symlink the launchd plist starts.
+  // A `brew upgrade node@22` moves that directory, the burnt-in path goes
+  // dangling, the hook exits 127 -- and 127 is exactly the non-blocking status
+  // this whole file exists to stop, so the gate would go quiet again on a
+  // different route (measured: the pinned path fails with 127 after a version
+  // bump, the stable symlink survives).
+  //
+  // Burning the symlink instead is NOT the fix: nvm installs have no such
+  // stable path outside the launchd PATH, which is the original defect. Making
+  // the failure loud is install-manager agnostic and covers any future move.
+  //
+  // The message says the three things an operator needs: WHAT is missing, that
+  // this is why the call is blocked (so a wall of blocked tools is not read as
+  // some other breakage), and the way out -- restarting the dashboard reruns
+  // the ensure* migrations, which rewrite the path. A blocking gate with no
+  // stated way out is worse than a loud error.
+  const miss = `governance-kapu: a hook interpretere nem talalhato (${HOOK_NODE_BIN}). A kapu ezert BLOKKOL. Javitas: inditsd ujra a dashboardot, az ujrairja a hook-utakat.`
+  return `test -x "${HOOK_NODE_BIN}" || { echo "${miss}" >&2; exit 2; }; "${HOOK_NODE_BIN}" "${scriptPath}"`
+}
+
+// Wired-already predicate for the ensure* migrations: is `command` present in
+// the serialized PreToolUse array? The command must be JSON-escaped before the
+// includes() -- comparing the RAW string disagrees with the serialized form on
+// any backslash path (Windows), where the check then never settles and every
+// boot rewrites settings.json. Exported for unit tests.
+export function hookCommandWired(ptuJson: string, command: string): boolean {
+  return ptuJson.includes(JSON.stringify(command).slice(1, -1))
+}
 
 // Identity values the template substitution injects. Pulled out so the
 // substitution is a pure, parameterizable function (the runtime binds these to
@@ -168,7 +218,21 @@ export function ensureAgentHooks(name: string): boolean {
   if (!tpl.hooks) return false
   let existing: Record<string, unknown> = {}
   if (existsSync(settingsPath)) {
-    try { existing = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { /* overwrite */ }
+    try {
+      const rawExisting = readFileSync(settingsPath, 'utf-8')
+      // JSON.parse keeps only the LAST occurrence of a duplicated key, so a
+      // settings file with two "PreToolUse" (or any hook-event) keys silently
+      // drops every hook in the earlier block -- guards die with no error and
+      // no symptom until the action they gated goes through unchecked. The
+      // evidence only exists in the raw text, so check it BEFORE parsing and
+      // say which paths are affected.
+      const dupKeys = findDuplicateJsonKeys(rawExisting)
+      if (dupKeys.length > 0) {
+        logger.warn({ agent: name, settingsPath, dupKeys },
+          'ensureAgentHooks: duplicate JSON keys in settings -- JSON.parse keeps only the last occurrence, hooks in the earlier block are silently dead')
+      }
+      existing = JSON.parse(rawExisting)
+    } catch { /* overwrite */ }
   }
   const tplHooks = tpl.hooks as Record<string, unknown>
   if (existing.hooks) {
@@ -316,6 +380,10 @@ export function writeAgentSettingsFromProfile(name: string, profile: ProfileTemp
   // covered by the self-pace block + the #0 CLAUDE.md doctrine.
   if (agentGetsEmailGate(name)) injectEmailSendGate(existing)
   if (agentGetsGovernanceGates(name)) injectSelfPaceGate(existing)
+  if (agentGetsKanbanWriteGate(name)) {
+    injectKanbanWriteGate(existing)
+    injectDigestProvenanceGate(existing)
+  }
   injectEgressGate(existing)
   atomicWriteFileSync(settingsPath, JSON.stringify(existing, null, 2))
 }
@@ -329,6 +397,28 @@ export function agentGetsEmailGate(name: string): boolean {
   return name !== MAIN_AGENT_ID
 }
 
+// The matcher is a FULL-match regex against the tool name, and an MCP tool's
+// name is the qualified `mcp__<server>__<tool>` -- so a bare `send_email`
+// alternative never fires for an MCP server (verified live 2026-08-10: a
+// manage_email send went through while the gate script itself denied the same
+// payload, because the hook never ran). The `.*` wrappers are what make the gate
+// reach MCP tools at all. Exported so the startup migration can recognize a
+// stale matcher on an already-scaffolded agent.
+export const EMAIL_GATE_MATCHER = 'Bash|.*send_email.*|.*manage_email.*'
+
+// Does an existing PreToolUse array carry an email-gate entry whose matcher is
+// NOT the current one? Pure + exported: this is the predicate that lets
+// ensureGovernanceGateCommands repair installs scaffolded before the matcher
+// fix, where the hook COMMAND is correctly wired (so the wiring check passes)
+// but the matcher never matches the qualified MCP tool name.
+export function emailGateMatcherStale(preToolUse: unknown): boolean {
+  if (!Array.isArray(preToolUse)) return false
+  return preToolUse.some((e) => {
+    if (!JSON.stringify(e).includes('email-send-gate.mjs')) return false
+    return (e as { matcher?: unknown })?.matcher !== EMAIL_GATE_MATCHER
+  })
+}
+
 // Idempotently wire the email-send-gate PreToolUse hook into a settings.json
 // object. A deny-list rule alone would NOT enforce this: permissive profiles
 // launch with --dangerously-skip-permissions, which bypasses allow/deny --
@@ -338,11 +428,11 @@ export function injectEmailSendGate(existing: Record<string, unknown>): void {
   const hooks = (existing.hooks && typeof existing.hooks === 'object'
     ? existing.hooks
     : (existing.hooks = {})) as Record<string, unknown>
-  const command = `node ${join(PROJECT_ROOT, 'scripts', 'email-send-gate.mjs')}`
+  const command = hookCommand(join(PROJECT_ROOT, 'scripts', 'email-send-gate.mjs'))
   // Registration guard: a /tmp or missing path must never enter shared settings.
   if (isUnsafeHookCommand(command)) return
   const entry = {
-    matcher: 'Bash|send_email',
+    matcher: EMAIL_GATE_MATCHER,
     hooks: [{ type: 'command', command, timeout: 10 }],
   }
   const prev = Array.isArray(hooks.PreToolUse) ? (hooks.PreToolUse as unknown[]) : []
@@ -373,7 +463,7 @@ export function injectSelfPaceGate(existing: Record<string, unknown>): void {
   const hooks = (existing.hooks && typeof existing.hooks === 'object'
     ? existing.hooks
     : (existing.hooks = {})) as Record<string, unknown>
-  const command = `node ${join(PROJECT_ROOT, 'scripts', 'self-pace-gate.mjs')}`
+  const command = hookCommand(join(PROJECT_ROOT, 'scripts', 'self-pace-gate.mjs'))
   // Registration guard: a /tmp or missing path must never enter shared settings.
   if (isUnsafeHookCommand(command)) return
   const entry = {
@@ -390,6 +480,63 @@ export function injectSelfPaceGate(existing: Record<string, unknown>): void {
   ]
 }
 
+// Which agents are subject to the kanban-write gate: ONLY the hidden heartbeat
+// worker (HBFUTTATOIR824). Its skill has forbidden board writes in prompt text
+// since 2026-08-22 ("A FUTTATO A TABLARA NEM IR. SEMMIT.") with zero
+// enforcement -- three violating writes on 2026-08-24 alone, one auto-closing
+// a card whose PR was unreviewed. Every OTHER agent's kanban-first workflow
+// REQUIRES board writes, so this must never widen to the general sub-agent
+// population. Pure + exported so both directions are unit-testable.
+export function agentGetsKanbanWriteGate(name: string): boolean {
+  return name === HEARTBEAT_AGENT_ID
+}
+
+// Idempotently wire the kanban-write-gate PreToolUse hook (blocks SQL and
+// dashboard-API writes to the kanban tables; reads pass). Same shape + dedupe
+// discipline as injectEmailSendGate. Bash-only matcher: the write routes are
+// sqlite3 / python / curl invocations, all of which arrive as Bash commands.
+export function injectKanbanWriteGate(existing: Record<string, unknown>): void {
+  const hooks = (existing.hooks && typeof existing.hooks === 'object'
+    ? existing.hooks
+    : (existing.hooks = {})) as Record<string, unknown>
+  const command = hookCommand(join(PROJECT_ROOT, 'scripts', 'kanban-write-gate.mjs'))
+  // Registration guard: a /tmp or missing path must never enter shared settings.
+  if (isUnsafeHookCommand(command)) return
+  const entry = {
+    matcher: 'Bash',
+    hooks: [{ type: 'command', command, timeout: 10 }],
+  }
+  const prev = Array.isArray(hooks.PreToolUse) ? (hooks.PreToolUse as unknown[]) : []
+  hooks.PreToolUse = [
+    ...prev.filter((e) => !JSON.stringify(e).includes('kanban-write-gate.mjs')),
+    entry,
+  ]
+}
+
+// Idempotently wire the digest-provenance-gate PreToolUse hook (validates the
+// heartbeat worker's /api/messages POSTs: closed cards / merged PRs in action
+// rows and unverifiable msg-id citations are denied -- DIGESTSTALE825). Scoped
+// by the SAME predicate as the kanban-write gate: heartbeat worker only. The
+// prompt-layer version of this rule was proven insufficient live (the first
+// run after the SKILL.md gate still shipped 0/4 accuracy + a fabricated owner
+// decision), so the rule lives here, in code.
+export function injectDigestProvenanceGate(existing: Record<string, unknown>): void {
+  const hooks = (existing.hooks && typeof existing.hooks === 'object'
+    ? existing.hooks
+    : (existing.hooks = {})) as Record<string, unknown>
+  const command = hookCommand(join(PROJECT_ROOT, 'scripts', 'digest-provenance-gate.mjs'))
+  if (isUnsafeHookCommand(command)) return
+  const entry = {
+    matcher: 'Bash',
+    hooks: [{ type: 'command', command, timeout: 10 }],
+  }
+  const prev = Array.isArray(hooks.PreToolUse) ? (hooks.PreToolUse as unknown[]) : []
+  hooks.PreToolUse = [
+    ...prev.filter((e) => !JSON.stringify(e).includes('digest-provenance-gate.mjs')),
+    entry,
+  ]
+}
+
 // Idempotently wire the egress-gate PreToolUse hook (hard-blocks WebFetch to
 // any URL not on the known API allowlist, logs blocked calls). Applied to ALL
 // agents including MAIN_AGENT_ID -- the hook defends against prompt-injection
@@ -399,7 +546,7 @@ export function injectEgressGate(existing: Record<string, unknown>): void {
   const hooks = (existing.hooks && typeof existing.hooks === 'object'
     ? existing.hooks
     : (existing.hooks = {})) as Record<string, unknown>
-  const command = `node ${join(PROJECT_ROOT, 'scripts', 'hooks', 'egress-gate.mjs')}`
+  const command = hookCommand(join(PROJECT_ROOT, 'scripts', 'hooks', 'egress-gate.mjs'))
   // Registration guard: a /tmp or missing path must never enter shared settings.
   if (isUnsafeHookCommand(command)) return
   const entry = {
@@ -423,13 +570,17 @@ export function ensureEgressGate(name: string): boolean {
   if (existsSync(settingsPath)) {
     try { settings = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { return false }
   }
-  const command = `node ${join(PROJECT_ROOT, 'scripts', 'hooks', 'egress-gate.mjs')}`
+  const command = hookCommand(join(PROJECT_ROOT, 'scripts', 'hooks', 'egress-gate.mjs'))
   const hooks = (settings.hooks && typeof settings.hooks === 'object')
     ? settings.hooks as Record<string, unknown>
     : {}
   const ptu = Array.isArray(hooks.PreToolUse) ? hooks.PreToolUse as unknown[] : []
-  // Idempotency: already wired if any entry references the egress-gate script.
-  if (JSON.stringify(ptu).includes('egress-gate.mjs')) return false
+  // Idempotency: already wired only if an entry references the egress-gate
+  // script AND already uses the absolute node binary. A legacy bare-`node`
+  // entry (dead on nvm PATHs, exit 127 = silently non-enforcing) must NOT
+  // count as wired -- fall through so injectEgressGate replaces it in place.
+  const ptuJson = JSON.stringify(ptu)
+  if (ptuJson.includes('egress-gate.mjs') && hookCommandWired(ptuJson, command)) return false
   if (isUnsafeHookCommand(command)) return false
   injectEgressGate(settings)
   if (name !== MAIN_AGENT_ID) mkdirSync(join(agentDir(name), '.claude'), { recursive: true })
@@ -468,9 +619,47 @@ export function isPublicFetchHost(value: string): boolean {
   const labels = host.split('.')
   if (labels.length < 2) return false                 // single label: localhost and friends
   if (labels.some((l) => !l || l.length > 63 || l.startsWith('-') || l.endsWith('-'))) return false
-  const INTERNAL_SUFFIX = ['local', 'internal', 'localdomain', 'lan', 'intranet', 'home', 'arpa', 'test', 'invalid', 'localhost']
+  const INTERNAL_SUFFIX = ['local', 'internal', 'localdomain', 'lan', 'intranet', 'home', 'arpa', 'test', 'invalid', 'localhost', 'svc', 'cluster']
   if (INTERNAL_SUFFIX.includes(labels[labels.length - 1])) return false
+  // A public NAME can still resolve inward. Wildcard-DNS services (nip.io,
+  // sslip.io and friends) encode the address in the name itself, so
+  // 127.0.0.1.nip.io and 192-168-1-50.sslip.io pass every check above and then
+  // resolve to loopback/RFC1918. Reaching them needs an allowlist entry, so
+  // this is defence-in-depth rather than an open door -- but it is the same
+  // class of bypass the literal check already rejects, and it costs one pass.
+  if (labels.some((l) => isInwardDashQuad(l))) return false
+  for (let i = 0; i + 3 < labels.length; i++) {
+    if (isInwardQuad(labels[i], labels[i + 1], labels[i + 2], labels[i + 3])) return false
+  }
   return true
+}
+
+// True for an IPv4 that points back at us or into a private network. Kept
+// narrow on purpose: a PUBLIC address embedded in a name is not a bypass of
+// the loopback/RFC1918 guard, and rejecting every numeric label would break
+// legitimate hosts.
+function isInwardIPv4(o: number[]): boolean {
+  if (o.length !== 4 || o.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return false
+  const [a, b] = o
+  if (a === 0 || a === 127) return true                      // this-host, loopback
+  if (a === 10) return true                                  // RFC1918
+  if (a === 172 && b >= 16 && b <= 31) return true           // RFC1918
+  if (a === 192 && b === 168) return true                    // RFC1918
+  if (a === 169 && b === 254) return true                    // link-local, cloud metadata
+  if (a === 100 && b >= 64 && b <= 127) return true          // CGNAT
+  return false
+}
+
+function isInwardQuad(a: string, b: string, c: string, d: string): boolean {
+  const parts = [a, b, c, d]
+  if (!parts.every((p) => /^\d{1,3}$/.test(p))) return false
+  return isInwardIPv4(parts.map((p) => parseInt(p, 10)))
+}
+
+function isInwardDashQuad(label: string): boolean {
+  const m = label.match(/^(\d{1,3})-(\d{1,3})-(\d{1,3})-(\d{1,3})$/)
+  if (!m) return false
+  return isInwardIPv4(m.slice(1).map((p) => parseInt(p, 10)))
 }
 
 export function ownerAllowedDomains(storeDir = STORE_DIR): string[] {
@@ -482,6 +671,32 @@ export function ownerAllowedDomains(storeDir = STORE_DIR): string[] {
       .filter((d: string) => isPublicFetchHost(d))
   } catch {
     return []   // no file, unreadable, or malformed: ship the template as-is
+  }
+}
+
+// The reader's effective allowlist, matching the egress-gate hook's semantics:
+// `domains` opens a host for every agent type (the hook's step 3), while
+// `quarantine_domains` opens it for the quarantine-reader only (step 4). The
+// rendered definition must carry the union, or a host granted at the
+// quarantine_domains level is honored by the hook but the reader's own prompt
+// still refuses it before a fetch is ever attempted -- which is exactly what
+// stranded a research task on 2026-08-16 (EGRESSKEY816).
+export function quarantineReaderDomains(storeDir = STORE_DIR): string[] {
+  const base = ownerAllowedDomains(storeDir)
+  try {
+    const raw = JSON.parse(readFileSync(join(storeDir, 'egress-allowlist.json'), 'utf-8'))
+    const list = Array.isArray(raw?.quarantine_domains) ? raw.quarantine_domains : []
+    const seen = new Set(base.map((d) => d.toLowerCase()))
+    for (const d of list) {
+      if (typeof d !== 'string') continue
+      const host = d.trim()
+      if (!isPublicFetchHost(host) || seen.has(host.toLowerCase())) continue
+      seen.add(host.toLowerCase())
+      base.push(host)
+    }
+    return base
+  } catch {
+    return base
   }
 }
 
@@ -530,6 +745,48 @@ export function renderQuarantineReader(template: string, domains: string[]): str
   return `${stripped.slice(0, at)}\n${block}${stripped.slice(at)}`
 }
 
+// Idempotent migration: ensure a sub-agent's email-send + self-pace gate hook
+// commands use the absolute node binary (HOOK_NODE_BIN). Legacy entries wrote a
+// bare `node`, which is missing from the non-interactive hook PATH on nvm
+// installs -- exit 127 counts as a non-blocking hook error, so those gates were
+// silently non-enforcing. Called at server startup (alongside ensureEgressGate).
+// Also repairs a stale email-gate MATCHER (pre-2026-08-10 installs wrote a bare
+// `send_email|manage_email`, which never matches a qualified MCP tool name), so
+// an agent scaffolded before the fix is not left with a gate that looks wired
+// and enforces nothing.
+// NOTE: a running session does NOT re-read settings.json -- the rewritten
+// command takes effect at that agent's next (re)spawn; this call only makes
+// the migration zero-touch, not instantaneous.
+// Returns true if the file was updated, false if already correct.
+export function ensureGovernanceGateCommands(name: string): boolean {
+  if (name === MAIN_AGENT_ID) return false
+  const settingsPath = agentSettingsPath(name)
+  if (!existsSync(settingsPath)) return false
+  let settings: Record<string, unknown> = {}
+  try { settings = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { return false }
+  const emailCmd = hookCommand(join(PROJECT_ROOT, 'scripts', 'email-send-gate.mjs'))
+  const paceCmd = hookCommand(join(PROJECT_ROOT, 'scripts', 'self-pace-gate.mjs'))
+  const hooks = (settings.hooks && typeof settings.hooks === 'object')
+    ? settings.hooks as Record<string, unknown>
+    : {}
+  const ptu = Array.isArray(hooks.PreToolUse) ? hooks.PreToolUse : []
+  const ptuJson = JSON.stringify(ptu)
+  // Two separate failure modes, both silently non-enforcing: the command is not
+  // wired at all, or it IS wired but under a pre-2026-08-10 matcher that cannot
+  // match a qualified MCP tool name. The second one is why the wiring check
+  // alone is not enough -- it would report the gate healthy forever.
+  const needEmail = agentGetsEmailGate(name)
+    && (!hookCommandWired(ptuJson, emailCmd) || emailGateMatcherStale(ptu))
+  const needPace = agentGetsGovernanceGates(name) && !hookCommandWired(ptuJson, paceCmd)
+  if (!needEmail && !needPace) return false
+  // The injectors dedupe by script basename, so a stale bare-`node` entry is
+  // replaced in place rather than accumulated.
+  if (needEmail) injectEmailSendGate(settings)
+  if (needPace) injectSelfPaceGate(settings)
+  atomicWriteFileSync(settingsPath, JSON.stringify(settings, null, 2))
+  return true
+}
+
 // Deploy the quarantine-reader sub-agent definition to an agent's
 // .claude/agents/ directory. The template lives in templates/sub-agents/
 // (tracked in git); the deployed copies are per-install runtime state.
@@ -541,30 +798,91 @@ export function renderQuarantineReader(template: string, domains: string[]): str
 // disappeared on 2026-07-30. Now the owner's domains are an INPUT to the
 // render, so a re-render preserves the decision instead of erasing it.
 // Returns true if the file was written, false if already up-to-date.
-export function ensureQuarantineReader(name: string): boolean {
-  const tplPath = join(PROJECT_ROOT, 'templates', 'sub-agents', 'quarantine-reader.md')
+// Where an agent's deployed quarantine-reader definition lives. PROJECT scope
+// for EVERY agent, the main agent included -- and that word is load-bearing
+// (EGRESSRENDER824, measured 2026-08-24 with positive AND negative controls):
+// the Claude Code runtime reads a PROJECT-scoped agent definition from disk at
+// each sub-agent SPAWN, but caches a USER-scoped (~/.claude/agents) one at
+// session start. The main agent's copy used to go to the user scope, so an
+// operator-approved domain only reached its reader after a full session
+// restart -- and the denial came from the stale prompt copy, without any
+// network call, so nothing ever landed in store/egress-blocked.log. Writing
+// the main agent's copy into PROJECT_ROOT/.claude/agents makes a grant
+// effective at the NEXT reader spawn, no restart. Pure + exported so the
+// target-path guarantee is unit-testable.
+export function quarantineReaderDestDir(name: string): string {
+  if (name === MAIN_AGENT_ID) return join(PROJECT_ROOT, '.claude', 'agents')
+  return join(agentDir(name), '.claude', 'agents')
+}
+
+// The optional `paths` override exists for tests only: it lets the whole
+// render-write-cleanup sequence run inside a tmp directory, so the legacy
+// removal ORDER is assertable without touching the real homedir.
+export function ensureQuarantineReader(
+  name: string,
+  paths?: { tplPath?: string; destDir?: string; legacyPath?: string; storeDir?: string },
+): boolean {
+  const tplPath = paths?.tplPath ?? join(PROJECT_ROOT, 'templates', 'sub-agents', 'quarantine-reader.md')
   if (!existsSync(tplPath)) return false
-  let destDir: string
-  if (name === MAIN_AGENT_ID) {
-    destDir = join(homedir(), '.claude', 'agents')
-  } else {
-    destDir = join(agentDir(name), '.claude', 'agents')
-  }
+  const destDir = paths?.destDir ?? quarantineReaderDestDir(name)
   mkdirSync(destDir, { recursive: true })
   const destPath = join(destDir, 'quarantine-reader.md')
   let rendered: string
   try {
-    rendered = renderQuarantineReader(readFileSync(tplPath, 'utf-8'), ownerAllowedDomains())
+    rendered = renderQuarantineReader(readFileSync(tplPath, 'utf-8'), quarantineReaderDomains(paths?.storeDir))
   } catch {
     return false
   }
+  let upToDate = false
   if (existsSync(destPath)) {
     try {
-      if (readFileSync(destPath, 'utf-8') === rendered) return false
-    } catch { /* fall through to re-write */ }
+      upToDate = readFileSync(destPath, 'utf-8') === rendered
+    } catch { /* unreadable -> treat as stale, re-write below */ }
   }
-  writeFileSync(destPath, rendered)
-  return true
+  if (!upToDate) writeFileSync(destPath, rendered)
+  // Legacy cleanup, deliberately AFTER the project-scoped copy is guaranteed
+  // on disk (either it was already current, or the line above just wrote it):
+  // there must be no window in which NEITHER copy exists. The user-scope copy
+  // is the pre-EGRESSRENDER824 location, cached at session start and therefore
+  // permanently stale -- a leftover would shadow nothing (project scope wins)
+  // but would mislead the next person debugging the gate.
+  if (name === MAIN_AGENT_ID) {
+    const legacyPath = paths?.legacyPath ?? join(homedir(), '.claude', 'agents', 'quarantine-reader.md')
+    try { rmSync(legacyPath, { force: true }) } catch { /* best effort */ }
+  }
+  return !upToDate
+}
+
+// EGRESSRENDER824 (b): a grant typed into store/egress-allowlist.json used to
+// reach the reader PROMPT copies only at the next scaffold (boot/spawn of the
+// dashboard) -- the egress-gate HOOK reads the JSON live, but the reader's
+// prompt-level list is baked at render time, so the two silently disagreed
+// and the prompt denial produced no egress-blocked.log line. This watcher
+// closes the gap: any change to the JSON re-renders every deployed reader
+// copy. fs.watchFile (mtime polling) rather than fs.watch: it survives the
+// file being replaced (editors/atomic writes) and needs no debounce.
+// `opts` exists for tests: a tmp storeDir + a short poll interval + an
+// injected ensure() make the re-render decision assertable in milliseconds
+// without touching real agent directories. Production callers pass none of it.
+// Returns a stop function (unwatchFile) so a test can end the poll.
+export function watchEgressAllowlistForReaderRender(
+  listAgents: () => string[],
+  onRendered?: (agents: string[]) => void,
+  opts?: { storeDir?: string; intervalMs?: number; ensure?: (name: string) => boolean },
+): () => void {
+  const allowlistPath = join(opts?.storeDir ?? STORE_DIR, 'egress-allowlist.json')
+  const ensure = opts?.ensure ?? ((name: string) => ensureQuarantineReader(name))
+  const listener = () => {
+    const rendered: string[] = []
+    for (const name of [MAIN_AGENT_ID, ...listAgents()]) {
+      try {
+        if (ensure(name)) rendered.push(name)
+      } catch { /* per-agent best effort: one bad dir must not stop the rest */ }
+    }
+    if (rendered.length) onRendered?.(rendered)
+  }
+  watchFile(allowlistPath, { interval: opts?.intervalMs ?? 5000 }, listener)
+  return () => unwatchFile(allowlistPath, listener)
 }
 
 // Copy the repo's `scheduled-tasks/<task>/task-config.json` to the
@@ -860,6 +1178,62 @@ export function ensureFleetRosterSection(name: string): void {
   atomicWriteFileSync(claudeMdPath, updated)
 }
 
+// SKILLUTCSAPDA822: the near-identical `.claude-config/skills` path IS the
+// shared global directory (a symlink to ~/.claude/skills, single-copy
+// distribution -- deliberate, see skills-symlink-single-copy), and the
+// skill-run base directory even DISPLAYS that path. An agent writing "its
+// own" skill there writes to the whole fleet, and nothing says so. Measured
+// 2026-08-22: five third-party marketing skills landed in the shared dir and
+// only luck caught them. The symlink stays; the fix is naming the trap in
+// every agent's CLAUDE.md, idempotently, on every respawn.
+const SKILLS_TRAP_BEGIN = '<!-- BEGIN GENERATED: skills-path-trap (auto-generated, do not edit by hand) -->'
+const SKILLS_TRAP_END = '<!-- END GENERATED: skills-path-trap -->'
+const SKILLS_TRAP_BLOCK_RE = new RegExp(
+  `${SKILLS_TRAP_BEGIN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\s\\S]*?${SKILLS_TRAP_END.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`,
+)
+
+function buildSkillsPathTrapBody(): string {
+  return [
+    '## Skill-útvonal csapda (KÖTELEZŐ elolvasni skill-írás előtt)',
+    '',
+    'A `.claude-config/skills` NEM a saját mappád: symlink a globális',
+    '`~/.claude/skills`-re, tehát ami oda kerül, az a TELJES flottánál megjelenik',
+    '-- akkor is, ha a skill-futtatás base directory-ja ezt az utat mutatja.',
+    'A saját, csak neked szóló vagy kipróbálatlan külső skill a munkakönyvtárad',
+    '`.claude/skills/` mappájába megy. A globálisba írás tudatos, flotta-szintű',
+    'döntés legyen, ne alapértelmezés.',
+  ].join('\n')
+}
+
+// Same five-rule idempotency contract as ensureFleetRosterSection /
+// ensureAutonomySection; called on every startAgentProcess() so existing
+// agents receive the warning automatically on respawn.
+export function ensureSkillsPathTrapSection(name: string): void {
+  const claudeMdPath = name === MAIN_AGENT_ID
+    ? join(PROJECT_ROOT, 'CLAUDE.md')
+    : join(agentDir(name), 'CLAUDE.md')
+  if (!existsSync(claudeMdPath)) return
+
+  const block = `${SKILLS_TRAP_BEGIN}\n${buildSkillsPathTrapBody()}\n${SKILLS_TRAP_END}`
+
+  let existing: string
+  try {
+    existing = readFileSync(claudeMdPath, 'utf-8')
+  } catch {
+    return
+  }
+
+  let updated: string
+  if (SKILLS_TRAP_BLOCK_RE.test(existing)) {
+    updated = existing.replace(SKILLS_TRAP_BLOCK_RE, block)
+  } else {
+    updated = existing.trimEnd() + '\n\n' + block + '\n'
+  }
+
+  if (updated === existing) return
+  atomicWriteFileSync(claudeMdPath, updated)
+}
+
 export async function generateClaudeMd(name: string, description: string, model: string): Promise<string> {
   // Distribution-safe default-drive line: only emit a concrete folder when this
   // install has one configured (OWNER_DRIVE_FOLDER). A fresh install with no
@@ -932,6 +1306,7 @@ Te egy önfejlesztő ágens vagy. A munkád során tanulsz, és újrafelhasznál
 ### Skill-ek helye
 - Globális: ~/.claude/skills/ (minden ágens számára elérhető)
 - Egyéni: a te munkakönyvtárad .claude/skills/ mappája
+- CSAPDA: a .claude-config/skills NEM a tiéd -- az a globális mappa symlinken át; saját skill a .claude/skills alá menjen
 
 ### Automatikus skill generálás
 Komplex feladatok után (5+ tool hívás, hiba utáni recovery, user korrekció, többlépéses workflow) automatikusan hozz létre SKILL.md fájlt:
@@ -968,6 +1343,20 @@ MINDIG az install időzónáját használd: **${APP_TZ}** (a teljes telepítés 
 - **Cron expressions** (scheduled-tasks + fleet-timer): a scheduler ${APP_TZ} időben értelmezi (SCHEDULER_TZ); a fleet-timer \`once --at\` = ${APP_TZ} fali óra
 
 Heartbeat-eknél és minden időpontot kezelő feladatnál kötelező: \`date\` Bash parancs az elemzés ELŐTT.
+
+## MCP-toolok deferred betöltése (FLEETDEFER809)
+
+Az MCP-toolok érkezhetnek DEFERRED módon: a nevük megjelenik egy
+system-reminder listában, de a séma nincs betöltve, és a közvetlen hívás
+úgy bukik, mintha a tool nem létezne. Ez a bukás NEM hiány. Mielőtt azt
+mondanád egy toolra, hogy "nem elérhető":
+
+1. \`ToolSearch\` a pontos névvel: \`select:<tool_nev>\`. Utána a tool normálisan hívható.
+2. Ha a select nem hoz találatot, keress KULCSSZÓVAL (pl. \`calendar\`, \`gmail\`), mert a szerver-név telepítésenként eltérhet.
+3. Csak akkor mondd ki a hiányt, ha a kulcsszavas keresés sem hozza fel. Az már valódi tény, nem betöltési állapot.
+
+(Mért eset: HBCALMCP808. A heartbeat egy napig üres naptár-szekciót adott,
+miközben mind a 13 calendar-tool ott ült a saját deferred listájában.)
 
 ## Új ismeretlen sender első üzenete (ARANYSZABÁLY)
 
