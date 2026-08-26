@@ -33,8 +33,8 @@ describe('approvals UI wiring', () => {
   })
 
   it('frontend consumes the correct API endpoints', () => {
-    expect(APP).toContain('/api/approvals?limit=')
-    expect(APP).toContain('/api/approvals/')
+    expect(APP).toContain('api/approvals?limit=')
+    expect(APP).toContain('api/approvals/')
     expect(APP).toContain("method: 'PATCH'")
   })
 

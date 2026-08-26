@@ -36,8 +36,8 @@ describe('local agent skills on global Skills page', () => {
   })
 
   it('loadGlobalSkills fetches both /api/skills and /api/skills/local', () => {
-    expect(APP).toContain("fetch('/api/skills')")
-    expect(APP).toContain("fetch('/api/skills/local')")
+    expect(APP).toContain("fetch('api/skills')")
+    expect(APP).toContain("fetch('api/skills/local')")
     expect(APP).toContain('Promise.all([')
     expect(APP).toContain('localAgentSkills')
   })

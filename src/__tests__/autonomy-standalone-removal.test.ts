@@ -38,7 +38,7 @@ describe('standalone autonomy page removal', () => {
 
   it('renderAutonomyContent function is preserved in app.js', () => {
     expect(APP).toMatch(/async function renderAutonomyContent\(/)
-    expect(APP).toContain('/api/autonomy')
+    expect(APP).toContain('api/autonomy')
   })
 
   it('settings tab autonomy panel has settingsAutonomyGrid and settingsAutonomyUpdatedAt', () => {

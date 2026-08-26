@@ -43,17 +43,17 @@ describe('federation UI wiring', () => {
   })
 
   it('frontend consumes the round-2 endpoints', () => {
-    expect(APP).toContain('/api/federation/status')
-    expect(APP).toContain('/api/federation/peers')
-    expect(APP).toContain('/api/federation/refresh')
-    expect(APP).toContain('/api/federation/enabled')
-    expect(APP).toContain('/api/federation/remove')
+    expect(APP).toContain('api/federation/status')
+    expect(APP).toContain('api/federation/peers')
+    expect(APP).toContain('api/federation/refresh')
+    expect(APP).toContain('api/federation/enabled')
+    expect(APP).toContain('api/federation/remove')
     expect(APP).toContain('/inbound-token')
     expect(APP).toContain('/rotate-inbound-token')
   })
 
   it('the federation status fetches are failure-proof (must never blank Agents/Messages)', () => {
-    const guarded = APP.match(/fetch\('\/api\/federation\/status'\)\.then\(\(r\) => \(r\.ok \? r\.json\(\) : null\)\)\.catch\(\(\) => null\)/g) || []
+    const guarded = APP.match(/fetch\('api\/federation\/status'\)\.then\(\(r\) => \(r\.ok \? r\.json\(\) : null\)\)\.catch\(\(\) => null\)/g) || []
     expect(guarded.length).toBeGreaterThanOrEqual(2) // loadAgents + loadChatAgentList
   })
 
@@ -89,7 +89,7 @@ describe('federation UI wiring', () => {
     expect(fn).toContain("confirm(t('federation.confirm.apply'))")
     // Server-side apply endpoint -- NOT the client-agent-id-dependent restart
     // (which 404'd when window._marveen was not loaded on the federation page).
-    expect(fn).toMatch(/fetch\('\/api\/federation\/apply'/)
+    expect(fn).toMatch(/fetch\('api\/federation\/apply'/)
     expect(fn).not.toMatch(/fetch\(`\/api\/agents\//)
     // Status auto-refreshes after config mutations (enable, peer add) instead
     // of a manual refresh button.
@@ -118,7 +118,7 @@ describe('federation UI wiring', () => {
 
   it('the routing-mode selector is wired to /api/federation/routing-mode for all three modes', () => {
     expect(APP).toContain('name="fedRoutingMode"')
-    expect(APP).toContain('/api/federation/routing-mode')
+    expect(APP).toContain('api/federation/routing-mode')
     expect(APP).toContain("['strong', 'catalog-first', 'advisory']")
     // reads the current mode from the peers view and renders label + hint per mode
     expect(APP).toContain('view.routingMode')
