@@ -46,7 +46,7 @@ describe('buildRemoteLaunchCommand', () => {
     expect(cmd).toContain("cd '/home/user/p'")
     expect(cmd).toContain('--continue')
     expect(cmd).toContain("--model 'claude-opus-4-8[1m]'")
-    expect(cmd).toContain('--dangerously-skip-permissions')
+    expect(cmd).toContain('--permission-mode auto')
   })
 
   it('exports a PATH covering both macOS and Linux binary locations', () => {

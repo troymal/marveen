@@ -25,7 +25,7 @@ describe('buildMainSessionRespawnCmd', () => {
   it('includes the channels plugin and skip-permissions flag', () => {
     const cmd = buildMainSessionRespawnCmd({ ...base, continueSession: false })
     expect(cmd).toContain('--channels plugin:telegram@claude-plugins-official')
-    expect(cmd).toContain('--dangerously-skip-permissions')
+    expect(cmd).toContain('--permission-mode auto')
   })
 
   it('single-quotes the model id (so [1m] is not glob-expanded)', () => {

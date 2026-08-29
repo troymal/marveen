@@ -706,6 +706,7 @@ export function buildMainSessionRespawnCmd(opts: {
         : []),
     '&&', opts.claudePath,
     ...(opts.continueSession ? ['--continue'] : []),
+<<<<<<< Updated upstream
     '--dangerously-skip-permissions',
     // Escape the model id so a value like `claude-opus-4-8[1m]` is not
     // glob-expanded -- and so a hostile value cannot break out of the quote and
@@ -714,6 +715,12 @@ export function buildMainSessionRespawnCmd(opts: {
     // allowlist is the belt, this is the braces). shSingleQuote makes the value
     // one inert shell word. See model-id-injection.test.ts.
     ...(opts.model ? ['--model', shSingleQuote(opts.model)] : []),
+=======
+    '--permission-mode', 'auto',
+    // Single-quote the model id so a value like `claude-opus-4-8[1m]` is not
+    // glob-expanded by the shell that tmux respawn-pane spawns the command in.
+    ...(opts.model ? ['--model', `'${opts.model}'`] : []),
+>>>>>>> Stashed changes
     [`--channels plugin:${opts.pluginId}`, ...(opts.extraPluginIds ?? []).map((p) => `plugin:${p}`)].join(' '),
   ].join(' ')
 }

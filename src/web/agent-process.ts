@@ -1208,7 +1208,16 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
         logger.warn({ err, name }, 'Could not scope channel plugins for sub-agent')
       }
     }
-    const skipFlag = profile.permissionMode === 'strict' ? '' : '--dangerously-skip-permissions '
+    // A strict profile must not bypass permissions, but emitting no flag at all
+    // left the agent in manual mode, where every Bash call opens a prompt and an
+    // unattended agent stalls silently (2026-08-08: six agents blocked this way,
+    // two delegations lost). Auto mode is the correct middle: the classifier
+    // adjudicates instead of prompting, and the profile's deny list still applies
+    // -- deny is evaluated before any bypass or auto decision (see agent-scaffold).
+    // 2026-08-13 (Zoltán döntése): a permissive profil sem kap bypasst. Auto módban a
+    // classifier dönt prompt helyett, a profil deny-listája pedig továbbra is elsőbbséget
+    // élvez -- a felügyelet nélküli ágens így nem áll meg, de nem is kerüli meg a szabályokat.
+    const skipFlag = '--permission-mode auto '
     // Optional per-agent CLAUDE_CONFIG_DIR (alternate Claude Code config dir,
     // e.g. for routing this agent to a separate Anthropic login). When the
     // agent-config field is missing or blank, claudeConfigDir is null and we

@@ -29,6 +29,13 @@ export interface ScheduledTask {
   // skipIfBusy false (default) so the queue + alert path catches a
   // long-running busy state and nothing business-critical is lost.
   skipIfBusy?: boolean
+  // Explicit Telegram chat id for this task's result, overriding the agent-level
+  // binding (which resolves to access.json allowFrom[0]). That default is right
+  // for a sub-agent with a single owner, but arbitrary for an agent whose
+  // allowlist holds several people -- the main agent's learning tasks belong to
+  // one person while the operator happens to be first in the list. Omit to keep
+  // the previous behaviour.
+  chat_id?: string
   // When true, skip the busy-state check entirely and inject the prompt
   // via tmux send-keys regardless. The Claude session will process it at
   // the next idle slot. Useful for critical tasks that must never be
@@ -104,7 +111,7 @@ export function readScheduledTask(taskName: string): ScheduledTask | null {
   const skillContent = hasSkill ? readFileOr(skillPath, '') : ''
   const { name, description, body } = parseSkillMdFrontmatter(skillContent)
 
-  let config: { schedule?: string; agent?: string; enabled?: boolean; createdAt?: number; type?: string; skipIfBusy?: boolean; forceSend?: boolean; targetSession?: string; description?: string; command?: string; timeoutMs?: number; failThreshold?: number; preCheck?: string; catchUpMaxAgeMinutes?: unknown; stuckAfterMinutes?: unknown; requires?: { mcp_servers?: unknown } } = {}
+  let config: { schedule?: string; agent?: string; enabled?: boolean; createdAt?: number; type?: string; skipIfBusy?: boolean; forceSend?: boolean; targetSession?: string; description?: string; command?: string; timeoutMs?: number; failThreshold?: number; preCheck?: string; chat_id?: string; catchUpMaxAgeMinutes?: unknown; stuckAfterMinutes?: unknown; requires?: { mcp_servers?: unknown } } = {}
   try {
     config = JSON.parse(readFileOr(configPath, '{}'))
   } catch { /* use defaults */ }
@@ -125,6 +132,12 @@ export function readScheduledTask(taskName: string): ScheduledTask | null {
     timeoutMs: config.timeoutMs,
     failThreshold: config.failThreshold,
     preCheck: config.preCheck,
+    // Without this line the field is silently dropped: the loader builds the
+    // task object key by key, so declaring chat_id on the interface alone left
+    // schedule-runner reading undefined and falling back to allowFrom[0]
+    // (2026-08-10 -- the typecheck stayed quiet because the type was correct;
+    // only the live 20:00 run showed it).
+    chat_id: typeof config.chat_id === 'string' && config.chat_id.trim() ? config.chat_id.trim() : undefined,
     catchUpMaxAgeMinutes: parseCatchUpMaxAge(config.catchUpMaxAgeMinutes),
     stuckAfterMinutes: parseFiniteMinutes(config.stuckAfterMinutes),
     requires: parseRequires(config.requires),
