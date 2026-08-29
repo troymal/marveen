@@ -33,6 +33,7 @@ import { withSessionSendLock } from './session-send-lock.js'
 import { reapChannelOrphans, reapDetachedChannelClaudes, collectPollerEvidence } from './channel-poller-reap.js'
 import { probeTelegramConflict } from './channel-conflict-probe.js'
 import { schedulePluginUnlockAfterRespawn, wasPluginConfirmedAbsent, clearPluginAbsent } from './channel-plugin-unlock.js'
+import { getInjectedPrompt, matchesInjectedPrompt } from './injected-prompt-registry.js'
 import {
   detectPaneState, decidePaneErrorAlert, detectsBlockingMenu, detectsFirstRunGate, detectsModelConsentDialog, type PaneErrorAlertState, type PaneState,
   stuckInputSignature, decideStuckInputRecovery, parkedChannelInput,
@@ -328,6 +329,11 @@ export async function recoverStuckInputForSession(
     // and corrupts the message) and prefers a chat_id-safe re-inject; the
     // truncation-guard (no verbatim re-inject of an incomplete <channel> block)
     // is preserved via blockTruncated.
+    // STUCKINPUT827: what the sender actually typed into THIS pane, if it is
+    // still on record. A match turns the lossy scrape into a known message and
+    // opens the 'reinject-recorded' path (see decideStuckInputAction).
+    const recorded = getInjectedPrompt(session)
+    const recordedMatch = matchesInjectedPrompt(parkedInputText(pane), recorded)
     const facts: StuckInputActionFacts = {
       escalate: attempt > MAIN_STUCK_ENTER_ATTEMPTS,
       rowCount: parkedInputRowCount(pane),
@@ -338,9 +344,10 @@ export async function recoverStuckInputForSession(
       hasPlainText: allowPlainReinject && parkedInputText(pane) != null,
       scheduledTaskBlock: parkedScheduledTaskInput(pane),
       machineOrigin: parkedMachineOriginInput(pane),
+      recordedMatch,
     }
     const action = decideStuckInputAction(facts)
-    await performStuckInputAction(session, action, pane, block, sig, attempt)
+    await performStuckInputAction(session, action, pane, block, sig, attempt, recorded?.text ?? null)
   }
   return decision.next
 }
@@ -358,6 +365,7 @@ async function performStuckInputAction(
   block: ReturnType<typeof parkedChannelInput>,
   prevSig: string | null,
   attempt: number,
+  recordedText: string | null,
 ): Promise<void> {
   let submitted = false
   try {
@@ -405,6 +413,27 @@ async function performStuckInputAction(
           // harmless.
           await dismissModelConsentDialogIfPresent(session)
           execFileSync(tmuxBin(), ['send-keys', '-t', session, 'Enter'], { timeout: 5000 })
+        }
+        submitted = true
+        break
+      }
+      case 'reinject-recorded': {
+        // The registry proved this parked text is the message WE typed, so the
+        // clear destroys no human draft and the re-inject replays the original
+        // rather than a head-lost scrape. Same recover-mode critical section as
+        // reinject-block: never race a live delivery into this pane.
+        if (recordedText == null || recordedText.length === 0) {
+          logger.warn({ session, attempt }, 'Stuck input -- reinject-recorded chosen without a recorded text; holding')
+          break
+        }
+        logger.warn({ session, attempt }, 'Stuck input -- clear + re-inject the recorded prompt (registry-proven)')
+        const res = await withSessionSendLock(session, null, 'recover', async () => {
+          await clearInputBuffer(session)
+          await sendPromptToSession(session, recordedText, null, { lockMode: 'held' })
+        })
+        if (!res.ran) {
+          logger.info({ session, attempt }, 'Stuck-input recovery (reinject-recorded) skipped: a delivery is in flight into this pane (fail-closed)')
+          break
         }
         submitted = true
         break
@@ -1231,6 +1260,18 @@ function maybeRestartWedgedMainChannel(state: StuckInputState): void {
 const KEEPALIVE_FILE = join(PROJECT_ROOT, 'store', '.channel-keepalive')
 const KEEPALIVE_STALE_MS = 18 * 60 * 1000 // ~3 missed 6-min cycles
 const KEEPALIVE_RESPAWN_GRACE_MS = 15 * 60 * 1000 // let a respawned session re-establish the file
+// DEAFNESS-MASK FIX: the liveness shortcut below skips the respawn whenever the
+// bun poller process is alive, treating process-liveness as proof of health.
+// But a live poller only proves the process runs -- NOT that the MCP stdio pipe
+// still DELIVERS. A poller can keep pulling updates while the pipe to the
+// session is deaf, so nothing is delivered for days and no watchdog acts. We
+// still trust a live poller for a BOUNDED window (so a normal quiet idle gap is
+// not respawned), but once the keepalive has been stale past this ceiling a
+// live-but-non-delivering poller reads as deafness and we fall through to the
+// staleness path (still busy-guarded). The ceiling is >2x KEEPALIVE_STALE_MS so
+// it never re-introduces idle false-positives, while bounding a silent deafness
+// to under an hour instead of days.
+const KEEPALIVE_LIVENESS_TRUST_CEILING_MS = 45 * 60 * 1000
 let marveenLastKeepaliveRespawn = 0
 
 /**
@@ -1262,6 +1303,24 @@ export function shouldRespawnForStaleKeepalive(opts: {
   if (opts.keepaliveAgeMs == null) return false
   if (opts.msSinceLastRespawn != null && opts.msSinceLastRespawn < opts.respawnGraceMs) return false
   return opts.keepaliveAgeMs > opts.stalenessThresholdMs
+}
+
+// Pure decision (DEAFNESS-MASK FIX): when the keepalive is stale AND the bun
+// poller is alive, should we TRUST process-liveness and skip the respawn? Only
+// for a bounded window. A live poller proves the process runs, NOT that the MCP
+// pipe still DELIVERS -- a deafness has a live poller and a dead pipe. So we
+// trust liveness while the file is only freshly stale (a normal quiet idle gap),
+// but once staleness crosses the ceiling the poller has delivered nothing for
+// far longer than any idle gap, which reads as deafness -- stop trusting it and
+// let the staleness path decide (its busy-guard still spares a working pane).
+// keepaliveAgeMs == null means no keepalive baseline yet (fresh boot): trust
+// liveness so we never respawn before the first keepalive is written.
+export function shouldTrustLivePollerOverStaleness(opts: {
+  keepaliveAgeMs: number | null
+  trustCeilingMs: number
+}): boolean {
+  if (opts.keepaliveAgeMs == null) return true
+  return opts.keepaliveAgeMs < opts.trustCeilingMs
 }
 
 // SOURCE FIX (2026-06-01): the staleness watchdog's only health signal was the
@@ -1328,8 +1387,17 @@ function checkMainKeepaliveStaleness(): void {
     if (claudePid != null) {
       const provider = getProvider(getMainAgentProvider())
       if (hasChannelPluginAlive(claudePid, provider.type)) {
-        logger.debug({ claudePid, provider: provider.type }, 'Keepalive stale but channel plugin is alive -- skipping respawn')
-        return
+        // A live poller is trusted only while the keepalive is freshly stale.
+        // Past KEEPALIVE_LIVENESS_TRUST_CEILING_MS a live-but-non-delivering
+        // poller reads as deafness, so we do NOT skip -- we fall through to the
+        // staleness path (busy-guarded) instead of staying silent for days.
+        let livenessAgeMs: number | null = null
+        try { livenessAgeMs = Date.now() - statSync(KEEPALIVE_FILE).mtimeMs } catch { livenessAgeMs = null }
+        if (shouldTrustLivePollerOverStaleness({ keepaliveAgeMs: livenessAgeMs, trustCeilingMs: KEEPALIVE_LIVENESS_TRUST_CEILING_MS })) {
+          logger.debug({ claudePid, provider: provider.type, livenessAgeMs }, 'Keepalive stale but channel plugin is alive and within trust ceiling -- skipping respawn')
+          return
+        }
+        logger.warn({ claudePid, provider: provider.type, livenessAgeMs }, 'Keepalive stale beyond liveness-trust ceiling despite a live poller -- treating as possible deafness, not skipping')
       }
     }
   } catch (err) {
