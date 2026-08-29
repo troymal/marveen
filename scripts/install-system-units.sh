@@ -41,7 +41,6 @@ set -uo pipefail
 
 INSTALL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SYSTEMD_DIR="/etc/systemd/system"
-USERD_DIR="${HOME:-/root}/.config/systemd/user"
 
 BOLD='\033[1m'; DIM='\033[2m'; GREEN='\033[0;32m'; ORANGE='\033[0;33m'; RED='\033[0;31m'; NC='\033[0m'
 ok()   { echo -e "  ${GREEN}✓${NC} $*"; }
@@ -56,6 +55,11 @@ RUN_GROUP="${MARVEEN_RUN_GROUP:-$(id -gn "$RUN_USER" 2>/dev/null || echo "$RUN_U
 RUN_HOME="${MARVEEN_RUN_HOME:-$(getent passwd "$RUN_USER" 2>/dev/null | cut -d: -f6)}"
 [ -n "$RUN_HOME" ] || RUN_HOME="$HOME"
 [ -n "$RUN_HOME" ] || RUN_HOME="/opt/$RUN_USER"
+# The user-scope units live under the RUN account's HOME, not the invoking
+# user's. Under sudo, $HOME resolves to /root, so deriving this from $HOME would
+# look in the wrong place and mirror nothing (the enable --now then fails because
+# dashboard/channels were never generated).
+USERD_DIR="${RUN_HOME}/.config/systemd/user"
 
 # --- read .env values (grep, never `source`, so secrets stay out of the env) --
 _get_env() { grep -E "^${1}=" "$INSTALL_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2-; }
