@@ -121,11 +121,40 @@ if (os === 'darwin') {
     warn('Hatterszolgaltatas (launchd)', 'nem talalhato')
   }
 } else if (os === 'linux') {
-  try {
-    execSync(systemdStatusUnits(SERVICE_ID).map((u) => `systemctl --user is-active ${u} 2>/dev/null`).join(' || '), { encoding: 'utf-8' })
-    ok('Hatterszolgaltatas (systemd)', 'aktiv')
-  } catch {
-    warn('Hatterszolgaltatas (systemd)', 'nem aktiv')
+  // Scope-aware, mirroring doctor.sh: the stack runs as SYSTEM units
+  // (root-style install / service account converted via install-system-units.sh),
+  // USER units (default install-linux.sh), or a direct nohup launch (no systemd
+  // at all) tracked by store/*.pid. Only probing `systemctl --user` reported a
+  // live service as down on every non-user-manager shape.
+  const units = systemdStatusUnits(SERVICE_ID)
+  const isActive = (cmd: string) => {
+    try {
+      execSync(cmd, { encoding: 'utf-8' })
+      return true
+    } catch {
+      return false
+    }
+  }
+  const systemScope = units.map((u) => `systemctl is-active ${u} 2>/dev/null`).join(' || ')
+  const userScope = units.map((u) => `systemctl --user is-active ${u} 2>/dev/null`).join(' || ')
+  const pidAlive = (file: string) => {
+    const p = join(PROJECT_ROOT, 'store', file)
+    if (!existsSync(p)) return false
+    try {
+      process.kill(parseInt(readFileSync(p, 'utf-8').trim(), 10), 0)
+      return true
+    } catch {
+      return false
+    }
+  }
+  if (isActive(systemScope)) {
+    ok('Hatterszolgaltatas (systemd)', 'aktiv (system unit)')
+  } else if (isActive(userScope)) {
+    ok('Hatterszolgaltatas (systemd)', 'aktiv (user unit)')
+  } else if (pidAlive('dashboard.pid') || pidAlive('channels.pid')) {
+    ok('Hatterszolgaltatas (nohup)', 'aktiv')
+  } else {
+    warn('Hatterszolgaltatas', 'nem aktiv')
   }
 }
 

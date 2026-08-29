@@ -40,8 +40,25 @@ for component in channels dashboard; do
     fi
   else
     svc="${MAIN_AGENT_ID}-${component}"
-    if systemctl --user is-active "$svc.service" &>/dev/null; then
-      ok "$svc: running"
+    # Scope-aware check, in the order the stack actually launches under. The
+    # installer writes USER-scope units, but a root-style install (or a service
+    # account converted via install-system-units.sh) runs SYSTEM-scope units, and
+    # a WSL/container with no systemd at all falls back to a direct nohup launch
+    # (start.sh) tracked by store/*.pid. Checking only `systemctl --user` reported
+    # a perfectly running dashboard/channels as "NOT running" on all three of the
+    # non-user-manager shapes -- the false negative that masked this outage.
+    if systemctl is-active "$svc.service" &>/dev/null; then
+      ok "$svc: running (systemd system unit)"
+    elif systemctl --user is-active "$svc.service" &>/dev/null; then
+      ok "$svc: running (systemd user unit)"
+    elif [ -f "store/${component}.pid" ]; then
+      _pid="$(cat "store/${component}.pid" 2>/dev/null | tr -d '[:space:]')"
+      if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
+        ok "$svc: running (nohup pid $_pid)"
+      else
+        fail "$svc: NOT running (stale pidfile)"
+      fi
+      unset _pid
     else
       fail "$svc: NOT running"
     fi

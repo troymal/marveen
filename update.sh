@@ -384,6 +384,18 @@ BUILT_COMMIT_FILE="$INSTALL_DIR/dist/.built-commit"
 # 07:27 elapse) start the briefing service immediately -- restart churn then
 # multiplies the morning briefing (customer report 2026-07-26: 5 deliveries in
 # one day). Idempotent: strips the line wherever it is still present.
+# Reload the manager that owns a units dir: the system manager for
+# /etc/systemd/system, the user manager for ~/.config/systemd/user. The install
+# can now run in EITHER scope (see scripts/install-system-units.sh), and a
+# `systemctl --user daemon-reload` against a system-scope unit is a silent no-op
+# that leaves the fix un-applied.
+reload_for_scope() {
+  case "$1" in
+    /etc/systemd/*) systemctl daemon-reload 2>/dev/null || true ;;
+    *)              systemctl --user daemon-reload 2>/dev/null || true ;;
+  esac
+}
+
 repair_morning_timer() {
   units_dir="${1:-$HOME/.config/systemd/user}"
   [ -d "$units_dir" ] || return 0
@@ -391,7 +403,7 @@ repair_morning_timer() {
     [ -f "$morn_timer" ] || continue
     if grep -q '^Requires=.*-morning\.service' "$morn_timer"; then
       sed -i.marveen-bak '/^Requires=.*-morning\.service/d' "$morn_timer" && rm -f "${morn_timer}.marveen-bak"
-      systemctl --user daemon-reload 2>/dev/null || true
+      reload_for_scope "$units_dir"
       echo -e "  Reggeli-napindito timer javitva (Requires= a [Unit]-bol eltavolitva): $(basename "$morn_timer")"
     fi
   done
@@ -422,7 +434,7 @@ migrate_channels_restart() {
     fi
   done
   if [ "$_patched" = "1" ]; then
-    systemctl --user daemon-reload 2>/dev/null || true
+    reload_for_scope "$units_dir"
   fi
   return 0
 }
