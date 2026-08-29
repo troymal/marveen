@@ -763,7 +763,6 @@ async function attemptFireTask(
       // ALLOWED_CHAT_ID. The latter is the main/admin chat; injecting it here
       // pointed every sub-agent's task result at the boss's chat instead of its
       // own owner (e.g. attilamarveenja -> Papp Attila). The old "chat_id: 0"
-<<<<<<< Updated upstream
       // sentinel encoded the same intent, but the official Telegram plugin rejects it
       // (assertAllowedChat: "0" is never allowlisted), so the binding is
       // resolved to a CONCRETE id here at prompt-build time.
@@ -773,30 +772,19 @@ async function attemptFireTask(
       // to deliver to the wrong chat, and the warn below makes the config gap
       // visible. The system-level pending-retry alert further down uses the
       // owner chat by design.
-      const bound = resolveBoundChannel(agentName)
-      if (bound.chatId) {
-        prefix = `[Utemezett feladat: ${task.name}] Az eredmenyt kuldd el ${channelDeliveryName(bound.provider)} (chat_id: ${bound.chatId}, reply tool). `
-=======
-      // sentinel encoded the same intent, but the official Telegram plugin
-      // rejects it (assertAllowedChat: "0" is never allowlisted), so the
-      // binding is resolved to a CONCRETE id here at prompt-build time. No
-      // binding -> no Telegram instruction at all: better to skip delivery
-      // than to deliver to the wrong chat, and the warn below makes the
-      // config gap visible. The system-level pending-retry alert further
-      // down still uses ALLOWED_CHAT_ID by design.
-      // A PER-TASK chat_id wins over the agent-level binding. resolveBoundChatId
+      // A PER-TASK chat_id wins over the agent-level binding. resolveBoundChannel
       // picks allowFrom[0], which is right for a sub-agent with one owner but
       // arbitrary for the main agent, whose allowlist holds several people: on
       // 2026-08-10 Angelika's evening-study and morning-BIM tasks both addressed
       // the operator instead of her, purely because he is first in the list.
       // Task-configs that carry no chat_id keep the previous behaviour exactly.
+      const bound = resolveBoundChannel(agentName)
       const taskChatId = typeof task.chat_id === 'string' && task.chat_id.trim()
         ? task.chat_id.trim()
         : null
-      const boundChatId = taskChatId ?? resolveBoundChatId(agentName)
+      const boundChatId = taskChatId ?? bound.chatId
       if (boundChatId) {
-        prefix = `[Utemezett feladat: ${task.name}] Az eredmenyt kuldd el Telegramon (chat_id: ${boundChatId}, reply tool). `
->>>>>>> Stashed changes
+        prefix = `[Utemezett feladat: ${task.name}] Az eredmenyt kuldd el ${channelDeliveryName(bound.provider)} (chat_id: ${boundChatId}, reply tool). `
       } else {
         logger.warn({ task: task.name, agent: agentName, provider: bound.provider }, 'scheduled task: agent has no bound channel (access.json missing/empty) -- prompt omits the delivery instruction')
         prefix = `[Utemezett feladat: ${task.name}] `
