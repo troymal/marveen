@@ -30,6 +30,25 @@ function assetVersion(webDir: string, fileName: string): string {
   }
 }
 
+// Inject the ?v= cache-bust token into the app.js/style.css references. The
+// regexes accept BOTH the relative (`src="app.js"`, subpath-friendly) and the
+// absolute (`src="/app.js"`) forms and always rewrite to the relative form, so
+// the cache-buster keeps working whether index.html ships relative or absolute
+// asset paths. Exported so the subpath contract is locked by a test.
+export function injectCacheBust(html: string, appVersion: string, styleVersion: string): string {
+  return html
+    .replace(
+      /(<script\s+src=")\/?app\.js(")/,
+      `$1app.js?v=${appVersion}$2`,
+    )
+    // style.css gets the same ?v= cache-busting as app.js so both can be
+    // served with a long max-age (see tryHandleStatic below).
+    .replace(
+      /(<link\s+rel="stylesheet"\s+href=")\/?style\.css(")/,
+      `$1style.css?v=${styleVersion}$2`,
+    )
+}
+
 function serveIndexHtml(ctx: RouteContext, webDir: string): void {
   const { req, res } = ctx
   try {
@@ -44,17 +63,7 @@ function serveIndexHtml(ctx: RouteContext, webDir: string): void {
       res.end()
       return
     }
-    const html = readFileSync(filePath, 'utf-8')
-      .replace(
-        /(<script\s+src=")\/app\.js(")/,
-        `$1/app.js?v=${assetVersion(webDir, 'app.js')}$2`,
-      )
-      // style.css gets the same ?v= cache-busting as app.js so both can be
-      // served with a long max-age (see tryHandleStatic below).
-      .replace(
-        /(<link\s+rel="stylesheet"\s+href=")\/style\.css(")/,
-        `$1/style.css?v=${assetVersion(webDir, 'style.css')}$2`,
-      )
+    const html = injectCacheBust(readFileSync(filePath, 'utf-8'), assetVersion(webDir, 'app.js'), assetVersion(webDir, 'style.css'))
       // Bake the iOS home-screen label into apple-mobile-web-app-title so an
       // installed PWA shows the configured main-agent name (BRAND_NAME), not the
       // bundled "Marveen" default. Done server-side (not JS) so it is reliable
