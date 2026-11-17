@@ -1,20 +1,62 @@
-import { statSync, readdirSync, existsSync } from 'node:fs'
+import { statSync, readdirSync, existsSync, realpathSync } from 'node:fs'
+import { encodeClaudeProjectDir } from '../claude-project-dir.js'
 import { join, basename } from 'node:path'
 import { homedir } from 'node:os'
 import { createReadStream } from 'node:fs'
 import { createInterface } from 'node:readline'
 import { getDb } from '../db.js'
 import { logger } from '../logger.js'
-import { MAIN_AGENT_ID, PROJECT_ROOT } from '../config.js'
+import { BOT_NAME, MAIN_AGENT_ID, PROJECT_ROOT } from '../config.js'
+import { listAgentNames } from './agent-config.js'
+import { resolveAgentConfigDirForRead } from './claude-plans.js'
+import { mainConfigRoots } from './inbound-probe.js'
+import { toolInputPreview } from './tool-input-preview.js'
+import { resolveMainAgentRotatedConfigDir } from './agent-process.js'
 
 const PROJECTS_DIR = join(homedir(), '.claude', 'projects')
 
-// Claude Code encodes a project's absolute path into a directory name by
-// replacing every non-alphanumeric/non-dash character with `-`. The main
-// agent's transcripts live under that exact directory, regardless of what
-// the agent calls itself.
-function encodeProjectPath(p: string): string {
-  return p.replace(/[^a-zA-Z0-9-]/g, '-')
+function realOrSelf(p: string): string {
+  try { return realpathSync(p) } catch { return p }
+}
+
+// Every config root the main agent may have written a transcript under: the
+// probe's candidate list (shared ~/.claude, .channels-config, an operator-set
+// MAIN_AGENT_CONFIG_DIR) plus the one launcher resolution that list does not
+// carry -- a rotated plan dir. scripts/main-agent-isolated-config.mjs launches
+// the main agent there (explicit > rotated > isolated), and from that moment
+// its transcripts land in <plan.configDir>/projects, which no candidate above
+// names. The launcher's own resolver is called rather than re-reading the plan
+// files here: it carries the gates (isolation on, 2+ plans, an active entry)
+// that decide whether the launcher uses the dir at all.
+// A union, not a precedence pick: the roots the agent has LEFT still hold real
+// history, and the candidates that are not in use simply have no directory.
+//
+// `pooled` marks the rotated plan dir. A plan comes from a pool that sub-agents
+// can be assigned too (activePlanByAgent), so its projects/ is NOT the main
+// agent's alone: it is name-attributed, like the shared root, never booked whole.
+function mainAgentTranscriptRoots(): Array<{ root: string; pooled: boolean }> {
+  const roots = mainConfigRoots().map((root) => ({ root, pooled: false }))
+  let rotated: string | null = null
+  try { rotated = resolveMainAgentRotatedConfigDir() } catch { rotated = null }
+  if (rotated && !roots.some((r) => r.root === rotated)) roots.push({ root: rotated, pooled: true })
+  return roots
+}
+
+// The main agent's transcripts live under the directory Claude Code derives
+// from PROJECT_ROOT, regardless of what the agent calls itself. The encoder is
+// the tree-wide one (src/claude-project-dir.ts); the local copy that used to
+// live here was the only correct rule in the tree, and it is now the shared one.
+
+// True when `dir` is the shared ~/.claude/projects wearing another name,
+// reached through a symlink. Compared by realpath, so a symlinked parent
+// counts too. A missing path is not the shared root. `sharedRoot` is a
+// parameter only so the test can point both sides at a fixture.
+export function resolvesToSharedProjectsRoot(dir: string, sharedRoot: string = PROJECTS_DIR): boolean {
+  try {
+    return realpathSync(dir) === realpathSync(sharedRoot)
+  } catch {
+    return false
+  }
 }
 
 interface AgentTranscriptSource {
@@ -22,11 +64,20 @@ interface AgentTranscriptSource {
   projectDir: string
 }
 
-function discoverAgentSources(): AgentTranscriptSource[] {
+// `projectRootOverride` exists for the tests, matching the convention
+// resolveAgentConfigDirForRead() already uses: the isolated dir is found by
+// probing the filesystem, so the probe root has to be redirectable to a
+// fixture. Production callers pass nothing.
+export function discoverAgentSources(projectRootOverride?: string): AgentTranscriptSource[] {
   const sources: AgentTranscriptSource[] = []
-  if (!existsSync(PROJECTS_DIR)) return sources
-  const mainDirName = encodeProjectPath(PROJECT_ROOT)
-  for (const entry of readdirSync(PROJECTS_DIR)) {
+  const mainDirName = encodeClaudeProjectDir(PROJECT_ROOT)
+  // A missing shared root skips THIS loop only. It used to return from the
+  // whole function, so an install whose agents all run on isolated config dirs
+  // -- the main agent included, which then never creates ~/.claude/projects --
+  // reported nothing at all, never reaching the isolated loops below.
+  let sharedEntries: string[] = []
+  try { sharedEntries = readdirSync(PROJECTS_DIR) } catch { /* no shared root on this install */ }
+  for (const entry of sharedEntries) {
     const full = join(PROJECTS_DIR, entry)
     let stat
     try { stat = statSync(full) } catch { continue }
@@ -43,6 +94,131 @@ function discoverAgentSources(): AgentTranscriptSource[] {
       sources.push({ agent: MAIN_AGENT_ID, projectDir: full })
     }
   }
+
+  // A sub-agent that runs under its own OS user writes into an ISOLATED config
+  // dir (agents/<name>/.claude-config/projects/...), not into ~/.claude. The
+  // loop above only ever sees the shared root, so from the moment an agent is
+  // migrated its token rows stop -- and they stop SILENTLY, because the old
+  // directory still exists and still parses. It looks like an idle agent.
+  //
+  // MEASURED 2026-08-21 10:15: all four sub-agents' newest transcript under
+  // ~/.claude/projects/-home-...-agents-<name>/ was frozen at 2026-08-18 17:44
+  // (0.15-0.53 MB), while the live files under agents/<name>/.claude-config/
+  // carried timestamps from minutes earlier and 3.9-7.2 MB. Three days of the
+  // fleet's consumption were missing from the monitor that a model-assignment
+  // decision was about to be based on.
+  //
+  // This is the same defect resolveAgentConfigDirForRead() was written for
+  // (the dashboard's context counter, fixed the same morning); reusing it is
+  // deliberate, so the two readers cannot drift apart again.
+  //
+  // Both roots are kept for a migrated agent, not swapped: the pre-migration
+  // history is real and lives only in the shared root. Duplicate rows are
+  // impossible anyway -- the UNIQUE INDEX on (agent, session_id, timestamp,
+  // input, output) plus the ON CONFLICT ... DO UPDATE upsert at the insert site
+  // absorbs any overlap. The upsert is not a plain INSERT OR IGNORE: on a
+  // conflict it keeps the stored row and only backfills `model` where it is NULL
+  // and `thinking_tokens` where it is NULL or zero, so a re-read can complete a
+  // partial row but never rewrite one.
+  for (const name of listAgentNames()) {
+    let configDir: string | null = null
+    try { configDir = resolveAgentConfigDirForRead(name, projectRootOverride) } catch { continue }
+    if (!configDir) continue
+    const isolatedProjects = join(configDir, 'projects')
+    if (!existsSync(isolatedProjects)) continue
+    // ...unless the agent was never actually migrated, in which case
+    // agents/<name>/.claude-config/projects is a SYMLINK back to the shared
+    // ~/.claude/projects. Then the comment below is false: the dir holds
+    // EVERY agent's work, and all of it gets booked under this one name.
+    //
+    // MEASURED 2026-09-04 18:40 on a live install: three sub-agents each
+    // reported the whole fleet's consumption, byte-identical down to the
+    // field (43844 calls, 28.5M output, 8.82G cache-read, 636 sessions),
+    // because all three symlinks resolve to the same root; only the main
+    // agent's row was real. 73% of the table was duplicate.
+    // The cursor table cannot absorb it either, being keyed by file path, and
+    // the same transcript reached the parser under three different paths.
+    //
+    // Skipping it loses nothing: the shared root is walked in the loop above,
+    // where attribution comes from the encoded directory name.
+    if (resolvesToSharedProjectsRoot(isolatedProjects)) continue
+    let entries: string[]
+    try { entries = readdirSync(isolatedProjects) } catch { continue }
+    for (const entry of entries) {
+      const full = join(isolatedProjects, entry)
+      let stat
+      try { stat = statSync(full) } catch { continue }
+      if (!stat.isDirectory()) continue
+      // Attribution comes from WHOSE config dir this is, not from the encoded
+      // project name: an agent's isolated dir holds only that agent's work.
+      if (sources.some((s) => s.agent === name && s.projectDir === full)) continue
+      sources.push({ agent: name, projectDir: full })
+    }
+  }
+
+  // The MAIN agent has the same isolated-config problem the sub-agent loop above
+  // was written for, and it was left out of that fix: the loop over PROJECTS_DIR
+  // only ever finds ~/.claude/projects/<encoded>, while a channels session that
+  // runs with its own CLAUDE_CONFIG_DIR writes into <PROJECT_ROOT>/.channels-config/
+  // projects/<encoded>. From the moment the main session moved there its rows
+  // stop, and they stop SILENTLY -- the old directory still exists and still
+  // parses, so the dashboard keeps showing a number instead of a gap.
+  //
+  // MEASURED 2026-09-15 08:5x on this install: the newest transcript under
+  // ~/.claude/projects/-home-bobeklajos-marveen/ was frozen at 2026-09-13 07:27
+  // (288 KB), while the live file under .channels-config/projects/<same name>
+  // was 5.0 MB and minutes old. token_usage's last row carried exactly that
+  // 07:27 timestamp: 30 hours of the main agent's consumption missing from the
+  // monitor, with no error anywhere.
+  //
+  // mainConfigRoots() is reused deliberately rather than re-deriving the roots:
+  // the scheduler's sawTurn probe (SCHEDLOST914) and the channel watchdogs were
+  // fixed the same way, and a second copy of the root list is exactly how they
+  // drifted apart in the first place.
+  //
+  // Both roots are kept, not swapped -- the pre-migration history is real and
+  // lives only in the shared root. Duplicates cannot arise: dirs are deduped by
+  // realpath here (a .channels-config/projects that is merely a SYMLINK back to
+  // the shared root resolves to the same path and is skipped), and the UNIQUE
+  // INDEX plus the ON CONFLICT ... DO UPDATE upsert at the insert site absorbs
+  // any overlap the cursor table misses (backfill-only, see the note above).
+  //
+  // The list of roots also follows the launcher onto a rotated plan dir
+  // (mainAgentTranscriptRoots), and a root that is the main agent's OWN --
+  // i.e. whose projects/ is not the shared one and not a pooled plan dir -- is
+  // booked to it WHOLE, every project dir in it, by the same owner rule the
+  // sub-agent loop applies (this picks up e.g. .channels-config/projects/-tmp, a
+  // session the main agent ran from /tmp). The shared root and a pooled plan
+  // dir stay name-attributed: there the encoded dir name is the
+  // only thing that says whose work a directory is.
+  //
+  // The realpath set covers EVERY source already booked, to any agent, so a
+  // directory reached through two roots (a symlinked MAIN_AGENT_CONFIG_DIR, a
+  // .channels-config/projects that points back at the shared root) is parsed
+  // once. The upsert would hide a second parse in the row counts -- identical
+  // rows collapse -- but not in the work, and not in the per-file cursors.
+  const claimed = new Set<string>(sources.map((s) => realOrSelf(s.projectDir)))
+  for (const { root, pooled } of mainAgentTranscriptRoots()) {
+    const projects = join(root, 'projects')
+    if (!existsSync(projects)) continue
+    let entries: string[]
+    if (pooled || resolvesToSharedProjectsRoot(projects)) {
+      entries = [mainDirName]
+    } else {
+      try { entries = readdirSync(projects) } catch { continue }
+    }
+    for (const entry of entries) {
+      const candidate = join(projects, entry)
+      let stat
+      try { stat = statSync(candidate) } catch { continue }
+      if (!stat.isDirectory()) continue
+      const real = realOrSelf(candidate)
+      if (claimed.has(real)) continue
+      claimed.add(real)
+      sources.push({ agent: MAIN_AGENT_ID, projectDir: candidate })
+    }
+  }
+
   return sources
 }
 
@@ -174,17 +350,26 @@ async function parseJsonlFile(
     }
 
     let toolName: string | null = null
+    let toolInput: unknown = undefined
     let thinkingTokens = 0
     if (Array.isArray(content)) {
       for (const block of content) {
         if (block.type === 'tool_use' && block.name && !toolName) {
           toolName = block.name
+          toolInput = block.input
         }
         // Estimate thinking tokens from char length (no per-block count in API)
         if (block.type === 'thinking' && typeof block.thinking === 'string') {
           thinkingTokens += Math.ceil(block.thinking.length / 4)
         }
       }
+    }
+
+    // APRO920 (b): a tool-calling turn has no text block, so `preview` above
+    // stays '' -- that's the "Bash" row with no command visible in the token
+    // log. Fill it from the tool's own input (redacted) when there is one.
+    if (!preview && toolName) {
+      preview = toolInputPreview(toolName, toolInput) || ''
     }
 
     calls.push({
@@ -370,6 +555,63 @@ export function getModelDistribution(from?: number, to?: number, agent?: string)
   return db.prepare(sql).all(...params) as ModelDistEntry[]
 }
 
+// APRO920 (c)(1): a Bash row in the token log said only "Bash"; likewise the
+// model distribution said only "claude-sonnet-4-6, 227 rows" with no way to
+// tell WHICH task or agent drove them (D001, ELSOKOR922 Phase 0: all 227 rows
+// were agent='marveen', task_title empty, spread across 21 sessions -- a CLI
+// fallback-model pattern, not one configured source). This breaks a single
+// model's rows down by agent / session_id so that question is answerable from
+// the API, not by hand-editing a SQL query against the DB. Since DBSIZE1111 the
+// cards come from the in_progress windows at read time (`cards`), not from the
+// stored task_title.
+export interface ModelSourceBreakdownEntry {
+  agent: string
+  sessionId: string
+  /** DBSIZE1111: the cards that were in_progress for this agent at some point between firstSeen and lastSeen,
+   *  worked out at read time from kanban_card_events (no stored title). Several when the session spanned them. */
+  cards: CardRef[]
+  count: number
+  totalTokens: number
+  firstSeen: number
+  lastSeen: number
+}
+
+export function getModelSourceBreakdown(
+  model: string,
+  from?: number,
+  to?: number,
+  opts: { botName?: string; mainAgentId?: string; now?: number } = {},
+): ModelSourceBreakdownEntry[] {
+  const db = getDb()
+  const hasModelCol = db.prepare("SELECT COUNT(*) as n FROM pragma_table_info('token_usage') WHERE name='model'").get() as { n: number }
+  if (!hasModelCol.n || !model) return []
+
+  const conditions: string[] = ['model = ?']
+  const params: any[] = [model]
+  if (from) { conditions.push('timestamp >= ?'); params.push(from) }
+  if (to) { conditions.push('timestamp <= ?'); params.push(to) }
+
+  // DBSIZE1111: grouped by agent and session; the stored task_title is not read any more.
+  const sql = `
+    SELECT agent,
+      session_id as sessionId,
+      COUNT(*) as count,
+      SUM(input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens) as totalTokens,
+      MIN(timestamp) as firstSeen,
+      MAX(timestamp) as lastSeen
+    FROM token_usage
+    WHERE ${conditions.join(' AND ')}
+    GROUP BY agent, session_id
+    ORDER BY count DESC
+  `
+  const rows = db.prepare(sql).all(...params) as Omit<ModelSourceBreakdownEntry, 'cards'>[]
+  const windows = agentCardWindows(new Set(rows.map((r) => r.agent)), opts)
+  return rows.map((r) => ({
+    ...r,
+    cards: cardsIn(windows.get(r.agent) ?? [], (w) => w.from <= r.lastSeen && r.firstSeen < w.to),
+  }))
+}
+
 export interface ToolStatEntry {
   tool_name: string
   model: string | null
@@ -445,25 +687,46 @@ export function getTokenTimeline(
 export interface TokenDetail {
   id: number
   agent: string
-  sessionId: string
+  session_id: string
   timestamp: number
-  inputTokens: number
-  outputTokens: number
-  cacheReadTokens: number
-  cacheCreationTokens: number
-  thinkingTokens: number
+  input_tokens: number
+  output_tokens: number
+  cache_read_tokens: number
+  cache_creation_tokens: number
+  thinking_tokens: number | null
   model: string | null
-  contentPreview: string | null
-  toolName: string | null
+  content_preview: string | null
+  tool_name: string | null
+  /** DBSIZE1111: every card that was in_progress for this agent at this row's timestamp (read time, from
+   *  kanban_card_events). Two or more when the agent had overlapping cards: the transcript does not say which
+   *  one a call was for, so none is picked. */
+  taskCards: CardRef[]
+  /** The card when exactly one was in_progress, else null (none, or ambiguous: see taskCards). */
+  taskCardId: string | null
   taskTitle: string | null
-  project: string | null
+}
+
+/** DBSIZE1111: the newest card windows a title search may expand to. A broad term ("a") can match most cards;
+ *  past this many windows the oldest are left out of the card-title part of the search (the other columns are
+ *  still searched). */
+export const TOKEN_DETAILS_Q_MAX_WINDOWS = 200
+
+/** LIKE with a backslash escape: the clause and the pattern for "contains this text literally". */
+const LIKE_ESCAPE = "ESCAPE '\\'"
+export function likeContains(text: string): string {
+  return `%${text.replace(/[\\%_]/g, (c) => `\\${c}`)}%`
 }
 
 export function getTokenDetails(
-  opts: { agent?: string; from?: number; to?: number; limit?: number; offset?: number; minTokens?: number; q?: string },
+  opts: {
+    agent?: string; from?: number; to?: number; limit?: number; offset?: number; minTokens?: number; q?: string
+    botName?: string; mainAgentId?: string; now?: number
+  },
 ): TokenDetail[] {
   const db = getDb()
-  let sql = `SELECT * FROM token_usage`
+  // DBSIZE1111: the stored task_title / project columns are not read; the card comes from the in_progress windows.
+  let sql = `SELECT id, agent, session_id, timestamp, input_tokens, output_tokens, cache_read_tokens,
+    cache_creation_tokens, thinking_tokens, model, content_preview, tool_name FROM token_usage`
   const conditions: string[] = []
   const params: any[] = []
   if (opts.agent) { conditions.push('agent = ?'); params.push(opts.agent) }
@@ -474,45 +737,253 @@ export function getTokenDetails(
     params.push(opts.minTokens)
   }
   if (opts.q) {
-    const like = `%${opts.q}%`
-    conditions.push('(agent LIKE ? OR tool_name LIKE ? OR content_preview LIKE ? OR task_title LIKE ?)')
-    params.push(like, like, like, like)
+    // The search text is taken literally: %, _ and the backslash in it are escaped, not wildcards.
+    const like = likeContains(opts.q)
+    const terms = [`agent LIKE ? ${LIKE_ESCAPE}`, `tool_name LIKE ? ${LIKE_ESCAPE}`, `content_preview LIKE ? ${LIKE_ESCAPE}`]
+    params.push(like, like, like)
+    // The card title: matching cards -> their in_progress windows -> the agent's rows inside them.
+    for (const w of cardTitleWindows(opts.q, opts)) {
+      terms.push('(agent = ? AND timestamp >= ? AND timestamp < ?)')
+      params.push(w.agent, w.from, w.to)
+    }
+    conditions.push(`(${terms.join(' OR ')})`)
   }
   if (conditions.length) sql += ' WHERE ' + conditions.join(' AND ')
   sql += ' ORDER BY timestamp DESC'
   sql += ' LIMIT ? OFFSET ?'
   params.push(opts.limit || 100, opts.offset || 0)
 
-  return db.prepare(sql).all(...params) as TokenDetail[]
+  const rows = db.prepare(sql).all(...params) as Omit<TokenDetail, 'taskCards' | 'taskCardId' | 'taskTitle'>[]
+  const windows = agentCardWindows(new Set(rows.map((r) => r.agent)), opts)
+  return rows.map((r) => {
+    const taskCards = cardsIn(windows.get(r.agent) ?? [], (w) => w.from <= r.timestamp && r.timestamp < w.to)
+    const one = taskCards.length === 1 ? taskCards[0] : null
+    return { ...r, taskCards, taskCardId: one?.id ?? null, taskTitle: one?.title ?? null }
+  })
 }
 
-export function correlateWithKanban(): void {
+// === Card attribution at read time (DBSIZE1111) ===
+//
+// A token row belongs to the cards its agent had in_progress at the row's timestamp: the same windows as the
+// tokens-per-card view below (#568, inProgressWindows / tokenAgentForAssignee), computed when read, never
+// stored. The card's CURRENT assignee decides whose rows a window covers (a reassigned card moves its past
+// windows to the new assignee), the same limit as #568. An archived card still counts: it was worked on.
+
+export interface CardRef { id: string; title: string }
+
+interface AgentCardWindow { cardId: string; title: string; from: number; to: number }
+
+/** Every in_progress window of every card, grouped by the token_usage agent its assignee maps to, limited to
+ *  `agents` (all agents when null). One pass over the cards that ever were in_progress and their events. */
+function agentCardWindows(
+  agents: Set<string> | null,
+  opts: { botName?: string; mainAgentId?: string; now?: number },
+): Map<string, AgentCardWindow[]> {
+  const out = new Map<string, AgentCardWindow[]>()
+  if (agents !== null && agents.size === 0) return out
   const db = getDb()
-  const uncorrelated = db.prepare(`
-    SELECT DISTINCT agent, MIN(timestamp) as minTs, MAX(timestamp) as maxTs
-    FROM token_usage
-    WHERE task_title IS NULL
-    GROUP BY agent
-  `).all() as { agent: string; minTs: number; maxTs: number }[]
+  const map = { botName: opts.botName ?? BOT_NAME, mainAgentId: opts.mainAgentId ?? MAIN_AGENT_ID }
+  const now = opts.now ?? Math.floor(Date.now() / 1000)
+  const cards = db.prepare(`
+    SELECT id, title, assignee FROM kanban_cards
+    WHERE id IN (SELECT DISTINCT card_id FROM kanban_card_events WHERE to_status = 'in_progress')
+  `).all() as { id: string; title: string; assignee: string | null }[]
+  const wanted = new Map<string, { title: string; agent: string }>()
+  for (const c of cards) {
+    const agent = tokenAgentForAssignee(c.assignee, map)
+    if (agent && (agents === null || agents.has(agent))) wanted.set(c.id, { title: c.title, agent })
+  }
+  if (wanted.size === 0) return out
+  const events = db.prepare(`
+    SELECT card_id, from_status, to_status, created_at FROM kanban_card_events
+    WHERE card_id IN (SELECT DISTINCT card_id FROM kanban_card_events WHERE to_status = 'in_progress')
+    ORDER BY card_id, created_at ASC, id ASC
+  `).all() as (CardStatusEvent & { card_id: string })[]
+  const byCard = new Map<string, CardStatusEvent[]>()
+  for (const e of events) {
+    if (!wanted.has(e.card_id)) continue
+    const list = byCard.get(e.card_id)
+    if (list) list.push(e)
+    else byCard.set(e.card_id, [e])
+  }
+  for (const [cardId, evs] of byCard) {
+    const card = wanted.get(cardId)!
+    const list = out.get(card.agent) ?? []
+    for (const w of inProgressWindows(evs, now)) list.push({ cardId, title: card.title, from: w.from, to: w.to })
+    out.set(card.agent, list)
+  }
+  return out
+}
 
-  for (const row of uncorrelated) {
-    const cards = db.prepare(`
-      SELECT id, title, project, assignee, updated_at
-      FROM kanban_cards
-      WHERE (assignee = ? OR assignee LIKE '%' || ? || '%')
-        AND updated_at BETWEEN ? AND ?
-      ORDER BY updated_at ASC
-    `).all(row.agent, row.agent, row.minTs, row.maxTs) as any[]
+/** The distinct cards of the windows that pass `hit`, in first-window order. */
+function cardsIn(windows: AgentCardWindow[], hit: (w: AgentCardWindow) => boolean): CardRef[] {
+  const seen = new Map<string, CardRef>()
+  for (const w of windows) if (hit(w) && !seen.has(w.cardId)) seen.set(w.cardId, { id: w.cardId, title: w.title })
+  return [...seen.values()]
+}
 
-    for (const card of cards) {
-      const nextCard = cards.find((c: any) => c.updated_at > card.updated_at)
-      const endTs = nextCard ? nextCard.updated_at : row.maxTs
+/** The in_progress windows of the cards whose title contains `q` (LIKE, so ASCII case-insensitive), newest first,
+ *  at most TOKEN_DETAILS_Q_MAX_WINDOWS. With opts.agent only that agent's windows. */
+function cardTitleWindows(
+  q: string,
+  opts: { agent?: string; botName?: string; mainAgentId?: string; now?: number },
+): { agent: string; from: number; to: number }[] {
+  const db = getDb()
+  const ids = new Set((db.prepare(`SELECT id FROM kanban_cards WHERE title LIKE ? ${LIKE_ESCAPE}`).all(likeContains(q)) as { id: string }[]).map((r) => r.id))
+  if (ids.size === 0) return []
+  const all: { agent: string; from: number; to: number }[] = []
+  for (const [agent, list] of agentCardWindows(opts.agent ? new Set([opts.agent]) : null, opts)) {
+    for (const w of list) if (ids.has(w.cardId)) all.push({ agent, from: w.from, to: w.to })
+  }
+  all.sort((x, y) => y.to - x.to)
+  return all.slice(0, TOKEN_DETAILS_Q_MAX_WINDOWS)
+}
 
-      db.prepare(`
-        UPDATE token_usage
-        SET task_title = ?, project = ?
-        WHERE agent = ? AND timestamp BETWEEN ? AND ? AND task_title IS NULL
-      `).run(card.title, card.project || null, row.agent, card.updated_at, endTs)
+// === Tokens per card (card 0f21864e, #568) ===
+//
+// What a card cost: the assignee agent's token rows while the card was
+// in_progress. The windows come from kanban_card_events (to_status
+// 'in_progress' opens one, the next move out of it closes it; an open window
+// runs until `now`), not from updated_at, which any comment or subcard write
+// bumps.
+//
+// The honest limit: an agent that has two cards in_progress at once spends ONE
+// stream of tokens, and nothing in the transcript says which card a call was
+// for. The total is therefore an upper bound, and `overlappingCards` says how
+// many other cards of the same agent were in_progress during the windows. No
+// split is invented.
+
+export interface CardWindow { from: number; to: number }
+
+export interface CardStatusEvent { from_status: string | null; to_status: string; created_at: number }
+
+/** in_progress windows from a card's status events (oldest first). Pure. */
+export function inProgressWindows(events: CardStatusEvent[], now: number): CardWindow[] {
+  const windows: CardWindow[] = []
+  let openedAt: number | null = null
+  for (const ev of events) {
+    if (ev.to_status === 'in_progress') {
+      if (openedAt === null) openedAt = ev.created_at
+    } else if (openedAt !== null) {
+      windows.push({ from: openedAt, to: ev.created_at })
+      openedAt = null
     }
+  }
+  if (openedAt !== null) windows.push({ from: openedAt, to: now })
+  return windows
+}
+
+export interface CardTokenModelRow {
+  model: string | null
+  calls: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheCreationTokens: number
+}
+
+export interface CardTokenUsage {
+  /** The token_usage agent the assignee resolved to, or null (human, unassigned). */
+  agent: string | null
+  windows: CardWindow[]
+  totalCalls: number
+  /** input + output + cache read + cache creation. */
+  totalTokens: number
+  outputTokens: number
+  /** input + cache creation: what was newly read in, as opposed to re-read from cache. */
+  freshInputTokens: number
+  cacheReadTokens: number
+  perModel: CardTokenModelRow[]
+  /** Other cards of the same agent that were in_progress at some point of the windows. */
+  overlappingCards: number
+  /** Latest collected token row of this agent: rows after it are not in the sum yet. */
+  dataUntil: number | null
+}
+
+/** Map a card assignee onto the token_usage agent name (lowercase id). */
+export function tokenAgentForAssignee(
+  assignee: string | null | undefined,
+  opts: { botName: string; mainAgentId: string },
+): string | null {
+  const a = (assignee ?? '').trim().toLowerCase()
+  if (!a) return null
+  if (a === opts.botName.toLowerCase()) return opts.mainAgentId.toLowerCase()
+  return a
+}
+
+export function getCardTokenUsage(
+  cardId: string,
+  opts: { botName: string; mainAgentId: string; now?: number },
+): CardTokenUsage | null {
+  const db = getDb()
+  const card = db.prepare('SELECT id, assignee FROM kanban_cards WHERE id = ?').get(cardId) as
+    { id: string; assignee: string | null } | undefined
+  if (!card) return null
+  const now = opts.now ?? Math.floor(Date.now() / 1000)
+  const agent = tokenAgentForAssignee(card.assignee, opts)
+  const eventsStmt = db.prepare(
+    'SELECT from_status, to_status, created_at FROM kanban_card_events WHERE card_id = ? ORDER BY created_at ASC, id ASC',
+  )
+  const windows = inProgressWindows(eventsStmt.all(cardId) as CardStatusEvent[], now)
+  const empty: CardTokenUsage = {
+    agent, windows, totalCalls: 0, totalTokens: 0, outputTokens: 0, freshInputTokens: 0, cacheReadTokens: 0, perModel: [], overlappingCards: 0, dataUntil: null,
+  }
+  if (!agent) return empty
+  const until = db.prepare('SELECT MAX(timestamp) AS ts FROM token_usage WHERE agent = ?').get(agent) as { ts: number | null }
+  empty.dataUntil = until.ts ?? null
+  if (windows.length === 0) return empty
+
+  const byModel = new Map<string, CardTokenModelRow>()
+  const sumStmt = db.prepare(`
+    SELECT model, COUNT(*) AS calls,
+      COALESCE(SUM(input_tokens), 0) AS inputTokens,
+      COALESCE(SUM(output_tokens), 0) AS outputTokens,
+      COALESCE(SUM(cache_read_tokens), 0) AS cacheReadTokens,
+      COALESCE(SUM(cache_creation_tokens), 0) AS cacheCreationTokens
+    FROM token_usage
+    WHERE agent = ? AND timestamp >= ? AND timestamp < ?
+    GROUP BY model
+  `)
+  for (const w of windows) {
+    for (const r of sumStmt.all(agent, w.from, w.to) as CardTokenModelRow[]) {
+      const key = r.model ?? ''
+      const acc = byModel.get(key)
+      if (!acc) { byModel.set(key, { ...r }); continue }
+      acc.calls += r.calls
+      acc.inputTokens += r.inputTokens
+      acc.outputTokens += r.outputTokens
+      acc.cacheReadTokens += r.cacheReadTokens
+      acc.cacheCreationTokens += r.cacheCreationTokens
+    }
+  }
+  // A model row with no tokens at all (the transcript's '<synthetic>' entries) is noise here.
+  const perModel = [...byModel.values()]
+    .filter((r) => r.inputTokens + r.outputTokens + r.cacheReadTokens + r.cacheCreationTokens > 0)
+    .sort((a, b) => b.outputTokens - a.outputTokens)
+  const totalCalls = perModel.reduce((s, r) => s + r.calls, 0)
+  const outputTokens = perModel.reduce((s, r) => s + r.outputTokens, 0)
+  const freshInputTokens = perModel.reduce((s, r) => s + r.inputTokens + r.cacheCreationTokens, 0)
+  const cacheReadTokens = perModel.reduce((s, r) => s + r.cacheReadTokens, 0)
+  const totalTokens = perModel.reduce(
+    (s, r) => s + r.inputTokens + r.outputTokens + r.cacheReadTokens + r.cacheCreationTokens, 0)
+
+  // Overlap: the agent's other cards and their own in_progress windows.
+  const names = [agent]
+  if (agent === opts.mainAgentId.toLowerCase()) names.push(opts.botName.toLowerCase())
+  const others = db.prepare(`
+    SELECT DISTINCT e.card_id AS id FROM kanban_card_events e
+    JOIN kanban_cards c ON c.id = e.card_id
+    WHERE e.card_id <> ? AND lower(c.assignee) IN (${names.map(() => '?').join(',')})
+      AND (e.to_status = 'in_progress' OR e.from_status = 'in_progress')
+  `).all(cardId, ...names) as { id: string }[]
+  let overlappingCards = 0
+  for (const o of others) {
+    const ow = inProgressWindows(eventsStmt.all(o.id) as CardStatusEvent[], now)
+    if (ow.some((x) => windows.some((w) => x.from < w.to && w.from < x.to))) overlappingCards++
+  }
+
+  return {
+    agent, windows, totalCalls, totalTokens, outputTokens, freshInputTokens, cacheReadTokens, perModel,
+    overlappingCards, dataUntil: empty.dataUntil,
   }
 }

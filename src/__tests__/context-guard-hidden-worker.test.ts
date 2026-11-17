@@ -33,6 +33,10 @@ vi.mock('../web/channel-monitor.js', () => ({
 }))
 vi.mock('../web/stuck-tool-call-watcher.js', () => ({ shouldDeferForRecentRespawn: () => false }))
 vi.mock('../web/agent-process.js', () => ({
+  withTmuxBatch: (fn: () => unknown) => fn(),
+  // The not-ready-path modal clear: false = no modal, so every caller keeps
+  // its existing skip/busy behaviour and these fixtures are unaffected.
+  clearFeedbackModalAndRecheck: () => false,
   agentRunState: () => 'stopped',
   agentSessionName: (n: string) => `agent-${n}`,
   restartAgentProcess: vi.fn(),
@@ -126,7 +130,7 @@ describe('hidden technical workers and the saturation net', () => {
       else if (src[i] === '}' && --depth === 0) { end = i; break }
     }
     const body = src.slice(m!.index, end + 1)
-    expect(body).toContain('restartAgentProcess(name, { fresh: true })')
+    expect(body).toContain('restartAgentProcess(name, { fresh: true, ownsResume: true })')
     expect(body).not.toMatch(/restartAgentProcess\(name,\s*\{\s*fresh:\s*false/)
     expect(body).not.toMatch(/restartAgentProcess\(name\)/)
   })

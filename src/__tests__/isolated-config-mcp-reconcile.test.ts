@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, readdirSync, chmodSync, statSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, readdirSync, chmodSync, statSync, readlinkSync, symlinkSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
@@ -14,6 +14,19 @@ vi.mock('node:os', async (orig) => {
 vi.mock('../web/agent-config.js', async (orig) => {
   const actual = await orig<typeof import('../web/agent-config.js')>()
   return { ...actual, agentDir: (name: string) => join(SANDBOX, 'agents', name) }
+})
+
+// MCPOROKLES923: a sub-agent now inherits only servers on AGENT_INHERITED_MCP_SERVERS.
+// These tests pin the gap-fill and scope-collision behaviour FOR LISTED servers, so
+// every name they use is on the list; what an UNLISTED server gets is pinned in
+// mcp-inheritance.test.ts.
+vi.mock('../settings-store.js', async (orig) => {
+  const actual = await orig<typeof import('../settings-store.js')>()
+  return {
+    ...actual,
+    getEffectiveSettingValue: (key: string) =>
+      key === 'AGENT_INHERITED_MCP_SERVERS' ? 'gmail,google-drive,cortex,extra,third' : actual.getEffectiveSettingValue(key),
+  }
 })
 
 const { ensureIsolatedChannelConfigDir } = await import('../web/agent-process.js')
@@ -85,9 +98,41 @@ describe('isolated config dir: mcpServers reconcile', () => {
     expect(servers()['google-drive']).toEqual({ command: 'npx', args: ['gdrive-mcp'] })
   })
 
-  it('leaves a server removed from the shared config in place (additive only)', () => {
-    ensureIsolatedChannelConfigDir(AGENT, 'telegram')
+  // MCPWRITEGATE1104 D4 (Samu 68033): the one exception to "additive only". A server the seed or the gap-fill
+  // provably copied from the shared config goes once the shared config drops it; the agent's own server never does.
+  it('takes an INHERITED server back out once the shared config drops it (seed and gap-fill alike)', () => {
+    ensureIsolatedChannelConfigDir(AGENT, 'telegram')                       // gmail: seeded, recorded
+    writeShared({ gmail: { command: 'npx', args: ['gmail-mcp'] }, extra: { command: 'x' } })
+    ensureIsolatedChannelConfigDir(AGENT, 'telegram')                       // extra: gap-filled, recorded
+    expect(Object.keys(servers()).sort()).toEqual(['extra', 'gmail'])
     writeShared({})
+    ensureIsolatedChannelConfigDir(AGENT, 'telegram')
+    expect(Object.keys(servers())).toEqual([])
+    expect(JSON.parse(readFileSync(join(SANDBOX, 'agents', AGENT, '.claude-config', '.marveen-mcp-inherited.json'), 'utf-8'))).toEqual({ servers: [] })
+  })
+
+  it('NEVER removes the agent\'s own server (no inherited record), e.g. a voice server it was given by hand', () => {
+    ensureIsolatedChannelConfigDir(AGENT, 'telegram')
+    const cur = readIsolated()
+    writeFileSync(isolatedDotClaude(), JSON.stringify({ ...cur, mcpServers: { ...servers(), wisprflow: { command: 'w' } } }))
+    writeShared({})
+    ensureIsolatedChannelConfigDir(AGENT, 'telegram')
+    expect(Object.keys(servers())).toEqual(['wisprflow'])
+    expect(servers().wisprflow).toEqual({ command: 'w' })
+  })
+
+  it('a pre-provenance config (no record): only the named legacy server Filesystem goes, the rest stays', () => {
+    ensureIsolatedChannelConfigDir(AGENT, 'telegram')
+    rmSync(join(SANDBOX, 'agents', AGENT, '.claude-config', '.marveen-mcp-inherited.json'))
+    const cur = readIsolated()
+    writeFileSync(isolatedDotClaude(), JSON.stringify({ ...cur, mcpServers: { ...servers(), Filesystem: { command: 'npx', args: ['fs', '/'] } } }))
+    writeShared({})
+    ensureIsolatedChannelConfigDir(AGENT, 'telegram')
+    expect(Object.keys(servers())).toEqual(['gmail'])
+  })
+
+  it('keeps an inherited server the shared config still has', () => {
+    ensureIsolatedChannelConfigDir(AGENT, 'telegram')
     ensureIsolatedChannelConfigDir(AGENT, 'telegram')
     expect(Object.keys(servers())).toEqual(['gmail'])
   })
@@ -151,6 +196,67 @@ describe('isolated config dir: mcpServers reconcile', () => {
     expect(statSync(isolatedDotClaude()).mode & 0o777).toBe(0o600)
   })
 
+  it('never shadows a server the agent defines in its own project-scope .mcp.json', () => {
+    // The agent owns `cortex` at project scope, with ITS token.
+    writeFileSync(
+      join(SANDBOX, 'agents', AGENT, '.mcp.json'),
+      JSON.stringify({ mcpServers: { cortex: { url: 'https://cortex.example/mcp', headers: { Authorization: 'Bearer agent-own-token' } } } }),
+    )
+    // The router's shared config carries the SAME name with a DIFFERENT token.
+    writeShared({
+      gmail: { command: 'npx', args: ['gmail-mcp'] },
+      cortex: { url: 'https://cortex.example/mcp', headers: { Authorization: 'Bearer router-token' } },
+    })
+
+    ensureIsolatedChannelConfigDir(AGENT, 'telegram')
+
+    // `cortex` must NOT land in the isolated (local-scope) config: local wins
+    // over project, so copying it would replace the agent's own credential with
+    // the router's and kill the whole server for that agent.
+    expect(servers().cortex).toBeUndefined()
+    // The genuine gap is still filled -- the fix must not disable #834.
+    expect(servers().gmail).toEqual({ command: 'npx', args: ['gmail-mcp'] })
+  })
+
+  it('skips the collision on the RECONCILE path too, not only on first seed', () => {
+    // Provision first WITHOUT any project-scope servers: the dir now exists,
+    // so every later call takes the reconcile (gap-fill) branch -- the exact
+    // branch the measured 12-hour outage came from (startup write-back).
+    ensureIsolatedChannelConfigDir(AGENT, 'telegram')
+    expect(Object.keys(servers())).toEqual(['gmail'])
+
+    // The agent then defines `cortex` at project scope with its own token,
+    // and the router's shared config later grows a same-named entry.
+    writeFileSync(
+      join(SANDBOX, 'agents', AGENT, '.mcp.json'),
+      JSON.stringify({ mcpServers: { cortex: { url: 'https://cortex.example/mcp', headers: { Authorization: 'Bearer agent-own-token' } } } }),
+    )
+    writeShared({
+      gmail: { command: 'npx', args: ['gmail-mcp'] },
+      cortex: { url: 'https://cortex.example/mcp', headers: { Authorization: 'Bearer router-token' } },
+      'google-drive': { command: 'npx', args: ['gdrive-mcp'] },
+    })
+
+    ensureIsolatedChannelConfigDir(AGENT, 'telegram')
+
+    // The genuine gap arrives, the collision does not.
+    expect(servers().cortex).toBeUndefined()
+    expect(Object.keys(servers()).sort()).toEqual(['gmail', 'google-drive'])
+  })
+
+  it('still gap-fills when the agent has no readable .mcp.json', () => {
+    // No .mcp.json at all: nothing can collide, so every shared server is a gap.
+    writeShared({ gmail: { command: 'npx', args: ['gmail-mcp'] }, extra: { command: 'x' } })
+    ensureIsolatedChannelConfigDir(AGENT, 'telegram')
+    expect(Object.keys(servers()).sort()).toEqual(['extra', 'gmail'])
+
+    // An unparseable one must behave the same way, not block the roll-out.
+    writeFileSync(join(SANDBOX, 'agents', AGENT, '.mcp.json'), '{ this is not json')
+    writeShared({ gmail: { command: 'npx', args: ['gmail-mcp'] }, extra: { command: 'x' }, third: { command: 'y' } })
+    ensureIsolatedChannelConfigDir(AGENT, 'telegram')
+    expect(Object.keys(servers()).sort()).toEqual(['extra', 'gmail', 'third'])
+  })
+
   it('leaves no staging file behind (atomic write)', () => {
     ensureIsolatedChannelConfigDir(AGENT, 'telegram')
     writeShared({ gmail: { command: 'npx', args: ['gmail-mcp'] }, extra: { command: 'x' } })
@@ -159,5 +265,26 @@ describe('isolated config dir: mcpServers reconcile', () => {
     const stray = readdirSync(join(SANDBOX, 'agents', AGENT, '.claude-config'))
       .filter((f) => f.includes('.tmp-'))
     expect(stray).toEqual([])
+  })
+
+  // PLUGINCODEWRITE1104 (Samu 68214): a config-dir link redirected elsewhere (by a tool call or a script) is put
+  // back at the next spawn; before, any symlink was accepted as is.
+  it('re-points a redirected plugins/cache and skills link at the next provisioning', () => {
+    const shared = join(SANDBOX, 'home', '.claude')
+    mkdirSync(join(shared, 'plugins', 'cache'), { recursive: true })
+    mkdirSync(join(shared, 'skills'), { recursive: true })
+    ensureIsolatedChannelConfigDir(AGENT, 'telegram')
+    const cfg = join(SANDBOX, 'agents', AGENT, '.claude-config')
+    const cacheLink = join(cfg, 'plugins', 'cache')
+    const skillsLink = join(cfg, 'skills')
+    expect(readlinkSync(cacheLink)).toBe(join(shared, 'plugins', 'cache'))
+    expect(readlinkSync(skillsLink)).toBe(join(shared, 'skills'))
+    const evil = join(SANDBOX, 'evil')
+    mkdirSync(evil, { recursive: true })
+    unlinkSync(cacheLink); symlinkSync(evil, cacheLink)
+    unlinkSync(skillsLink); symlinkSync(evil, skillsLink)
+    ensureIsolatedChannelConfigDir(AGENT, 'telegram')
+    expect(readlinkSync(cacheLink)).toBe(join(shared, 'plugins', 'cache'))
+    expect(readlinkSync(skillsLink)).toBe(join(shared, 'skills'))
   })
 })

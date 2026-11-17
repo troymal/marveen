@@ -16,12 +16,14 @@ import { logger } from '../../logger.js'
 import { logConfigChange } from '../../db.js'
 import { notifySecurityEvent } from '../../notify.js'
 import { bridgeEnroll, sshDirOverride, RemoteEnrollError } from '../bridge-enroll.js'
+import { isSshDirGuardError } from '../../ssh-dir.js'
 import { checkEnrollHost } from '../../remote-enroll-core.js'
+import { DEVICE_NAME_RE } from '../auth-device-keys.js'
 import { isIP } from 'node:net'
+import { bridgeOwner, mayActAsOwnerOrFirstRun, refuseOwner } from './auth.js'
 import type { RouteContext } from './types.js'
 
 const BODY_MAX_BYTES = 8 * 1024
-const NAME_RE = /^[\p{L}\p{N} ._-]{1,64}$/u
 const ENROLL_KINDS = ['token', 'session'] as const
 
 function str(v: unknown): string {
@@ -33,8 +35,15 @@ export async function tryHandleSecurity(ctx: RouteContext): Promise<boolean> {
 
   if (path !== '/api/security/bridge-enroll' || method !== 'POST') return false
 
-  if (auth === undefined || !ENROLL_KINDS.includes(auth.kind as (typeof ENROLL_KINDS)[number])) {
-    json(res, { error: 'Forbidden for this credential type' }, 403)
+  if (auth === undefined || (!ENROLL_KINDS.includes(auth.kind as (typeof ENROLL_KINDS)[number]) && !bridgeOwner(auth, req))) {
+    json(res, { error: 'Forbidden for this credential type', code: 'forbidden_credential' }, 403)
+    return true
+  }
+  // DEVKEYMINT1022: pairing issues a full device key and an SSH line, so after the
+  // first login exists it takes the owner's session (routes/auth.ts). Before it, the shared token pairs only the
+  // FIRST device of the install (OWNERGATE4-1104, FIRST_RUN_PATHS 'first-device').
+  if (!mayActAsOwnerOrFirstRun(auth, req, 'first-device')) {
+    refuseOwner(res, 'Pairing a device needs the dashboard login (an owner session).')
     return true
   }
 
@@ -44,18 +53,24 @@ export async function tryHandleSecurity(ctx: RouteContext): Promise<boolean> {
     const parsed = raw ? JSON.parse(raw) : {}
     body = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {}
   } catch {
-    json(res, { error: 'Invalid JSON' }, 400)
+    json(res, { error: 'Invalid JSON', code: 'invalid_json' }, 400)
     return true
   }
 
   const keyLine = str(body.key_line).trim()
   const name = str(body.name).trim()
   if (!keyLine) {
-    json(res, { error: 'key_line is required (the ssh-ed25519 ... marveen-remote:<uuid> line shown by the Bridge)' }, 400)
+    json(res, {
+      error: 'key_line is required (the ssh-ed25519 ... marveen-remote:<uuid> line shown by the Bridge)',
+      code: 'key_line_required',
+    }, 400)
     return true
   }
-  if (!NAME_RE.test(name)) {
-    json(res, { error: 'Invalid device name (1-64 chars: letters, digits, space, . _ -)' }, 400)
+  if (!DEVICE_NAME_RE.test(name)) {
+    json(res, {
+      error: 'Invalid device name (1-64 chars: letters, digits, space, . _ -)',
+      code: 'invalid_name',
+    }, 400)
     return true
   }
   // Empty stays empty: the field is optional and bridgeEnroll then fills in the
@@ -65,7 +80,11 @@ export async function tryHandleSecurity(ctx: RouteContext): Promise<boolean> {
   if (host !== undefined) {
     const checked = checkEnrollHost(host, isIP)
     if (!checked.ok) {
-      json(res, { error: `Invalid host: ${checked.reason}` }, 400)
+      json(res, {
+        error: `Invalid host: ${checked.reason}`,
+        code: checked.code,
+        params: checked.params,
+      }, 400)
       return true
     }
   }
@@ -73,7 +92,7 @@ export async function tryHandleSecurity(ctx: RouteContext): Promise<boolean> {
   if (body.ssh_port !== undefined && body.ssh_port !== null && body.ssh_port !== '') {
     const n = Number(body.ssh_port)
     if (!Number.isInteger(n) || n < 1 || n > 65535) {
-      json(res, { error: 'Invalid ssh_port (1-65535)' }, 400)
+      json(res, { error: 'Invalid ssh_port (1-65535)', code: 'invalid_ssh_port' }, 400)
       return true
     }
     sshPort = n
@@ -105,11 +124,25 @@ export async function tryHandleSecurity(ctx: RouteContext): Promise<boolean> {
     }, 201)
   } catch (err) {
     if (err instanceof RemoteEnrollError) {
-      json(res, { error: err.message }, 400)
+      json(res, { error: err.message, code: err.code, params: err.params }, 400)
+      return true
+    }
+    if (isSshDirGuardError(err)) {
+      // The only 500 on this route with a specific, actionable cause: a test
+      // signal (VITEST / NODE_ENV=test) reached a LIVE install, so the ENROLL813
+      // guard refused to touch authorized_keys. Its full diagnostic names the
+      // operator's real home directory, so that text stays in the log -- but the
+      // CODE goes on the wire, or the operator sees a bare "Enrollment failed"
+      // with nothing to search for. Own code, hence own translation
+      // (auth.bridge.err.enroll813 in web/lang/{hu,en}.js): this route's codes
+      // carry a coverage contract, checked by bridge-pairing-i18n.test.ts, and a
+      // code without a message is how the pairing UI fell back to English before.
+      logger.error({ err }, 'bridge enroll refused by the ENROLL813 ssh-dir guard')
+      json(res, { error: 'Enrollment failed', code: 'enroll813' }, 500)
       return true
     }
     logger.error({ err }, 'bridge enroll failed')
-    json(res, { error: 'Enrollment failed' }, 500)
+    json(res, { error: 'Enrollment failed', code: 'enroll_failed' }, 500)
   }
   return true
 }

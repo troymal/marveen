@@ -1,16 +1,15 @@
-import { execFile, execFileSync } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { resolveFromPath } from '../../platform.js'
 import { logger } from '../../logger.js'
 import { readBody, json } from '../http-helpers.js'
 import { agentDir } from '../agent-config.js'
-import { agentSessionName, isAgentRunning } from '../agent-process.js'
+import { agentSessionName, isAgentRunning, tmuxInvocationFor } from '../agent-process.js'
 import { isMainChannelsAgent, MAIN_CHANNELS_SESSION } from '../main-agent.js'
 import { literalKeyArgs, specialKeyArgs, loginSequence, type LoginStep } from '../tmux-keys.js'
 import { readTerminalInputEnabled, writeTerminalInputEnabled } from '../terminal-input-store.js'
 import type { RouteContext } from './types.js'
-
-const TMUX = resolveFromPath('tmux')
+import { mayActAsOwner, refuseOwner } from './auth.js'
+import { exactTmuxTarget } from '../../tmux-target.js'
 
 // Per-agent dashboard terminal: live pane stream (SSE), keystroke injection,
 // and the scripted /login flow. All gated by the dashboard token (the SSE
@@ -21,13 +20,20 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-function isTmuxSessionAlive(session: string): boolean {
-  try {
-    execFileSync(TMUX, ['has-session', '-t', session], { timeout: 3000, stdio: 'ignore' })
-    return true
-  } catch {
-    return false
-  }
+// has-session off the event loop, with the child's stdio ignored as the
+// synchronous call had it (no buffering, so no output size can turn a
+// successful exit into "not running"); alive means exit status 0.
+function isTmuxSessionAlive(session: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    try {
+      const inv = tmuxInvocationFor(['has-session', '-t', exactTmuxTarget(session)])
+      const child = spawn(inv.file, inv.args, { stdio: 'ignore', timeout: 3000 })
+      child.on('error', () => resolve(false))
+      child.on('exit', (code) => resolve(code === 0))
+    } catch {
+      resolve(false)
+    }
+  })
 }
 
 // Resolve a terminal target for both sub-agents and the MAIN agent (Marveen).
@@ -35,18 +41,26 @@ function isTmuxSessionAlive(session: string): boolean {
 // `agent-<name>` -- so the sub-agent assumptions (existsSync(agentDir) +
 // agentSessionName) 404 it (Zara hit this, 871005b). Branch on the main agent.
 interface SessionTarget { exists: boolean; running: boolean; session: string }
-function resolveTarget(name: string): SessionTarget {
+async function resolveTarget(name: string): Promise<SessionTarget> {
   if (isMainChannelsAgent(name)) {
-    return { exists: true, running: isTmuxSessionAlive(MAIN_CHANNELS_SESSION), session: MAIN_CHANNELS_SESSION }
+    return { exists: true, running: await isTmuxSessionAlive(MAIN_CHANNELS_SESSION), session: MAIN_CHANNELS_SESSION }
   }
   return { exists: existsSync(agentDir(name)), running: isAgentRunning(name), session: agentSessionName(name) }
 }
 
 // Run a single `tmux <args>` invocation. Rejects on non-zero exit so the
 // caller can surface a 500 rather than silently swallowing a tmux failure.
+//
+// Goes through tmuxInvocationFor (agent-process.ts) rather than the raw binary:
+// an agent that owns its OS user lives on its OWN tmux server, and a cross-user
+// connection is refused even when the socket permissions allow it. Calling the
+// bare binary here made every /keys and /login write answer 500 for exactly the
+// agents most likely to need one -- measured twice on this install, 2026-08-26
+// and 2026-08-27, while the operator was trying to clear a permission prompt.
 function tmux(args: string[]): Promise<void> {
+  const inv = tmuxInvocationFor(args)
   return new Promise((resolve, reject) => {
-    execFile(TMUX, args, { timeout: 5000 }, (err) => {
+    execFile(inv.file, inv.args, { timeout: 5000 }, (err) => {
       if (err) reject(err)
       else resolve()
     })
@@ -71,6 +85,26 @@ export function sanitizeLiteralKeys(keys: string): string {
   return singleLine.replace(/^\s+|\s+$/g, '')
 }
 
+/**
+ * Az audit-naplóba kerülő leírás egy beírt szövegről -- a szöveg TARTALMA NÉLKÜL.
+ *
+ * MIÉRT (kanban dashboard-key-logging, jelezve 2026-08-02, javítva 2026-08-11): ez a sor
+ * korábban a nyers payloadot írta a naplóba (`keys:"..."`), és 806 ilyen sor gyűlt össze a
+ * store/dashboard.log-ban. A súlyt kimértük: a 11 hosszú érték MIND különböző volt, és egyik
+ * SEM a hosszú életű titkaink közül való -- a vault egyszer használatos, 15 percig élő
+ * beviteli-link tokenjeire illettek. Tehát tartós titok nem szivárgott ki, és rotálni sem
+ * kellett. A kockázat viszont ELŐRE mutat: aki valaha egy valódi jelszót másol a
+ * webterminálba, azt eddig szó szerint naplóztuk volna.
+ *
+ * Amit az auditnak tudnia kell, az NEM a tartalom, hanem hogy TÖRTÉNT-E injektálás, mekkora
+ * volt, és -- egy hamisított prompt visszakereséséhez -- hogyan kezdődött. Négy karakter ehhez
+ * elég, és önmagában nem használható titokként.
+ */
+export function maskKeysPreview(keys: string): string {
+  const head = keys.slice(0, 4).replace(/\s/g, ' ')
+  return `keys:len=${keys.length} head=${JSON.stringify(head)}${keys.length > 4 ? '…(maszkolva)' : ''}`
+}
+
 async function runLoginSteps(session: string, steps: LoginStep[]): Promise<void> {
   for (const step of steps) {
     const args = step.kind === 'literal'
@@ -85,9 +119,9 @@ export async function tryHandleAgentTerminal(ctx: RouteContext): Promise<boolean
   const { res, path, method, url } = ctx
 
   // --- terminal-input master toggle (owner-gated opt-in) ---------------
-  // GET returns the current state; POST {enabled:boolean} flips it. Both sit
-  // behind the global dashboard-token gate (web.ts), so only the operator can
-  // read or change it. This is the deliberate first step of the two-step opt-in:
+  // GET returns the current state; POST {enabled:boolean} flips it. GET sits
+  // behind the global dashboard-token gate (web.ts); POST also needs the owner
+  // (OWNERGATE3-1104), since the shared token is readable by every sub-agent. This is the deliberate first step of the two-step opt-in:
   // /keys stays 403 until this is ON. Every flip is audit-logged.
   if (path === '/api/terminal-input') {
     if (method === 'GET') {
@@ -95,6 +129,14 @@ export async function tryHandleAgentTerminal(ctx: RouteContext): Promise<boolean
       return true
     }
     if (method === 'POST') {
+      // OWNERGATE3-1104: flips store/terminal-input.json, the master switch that lets /keys type into ANY agent's
+      // pane; owner-only, before the body is read. Turning it OFF is gated too: no machine caller turns it off
+      // (none in scripts/, src/, the skills or the UI beyond the owner's own toggle), and an open OFF would let the
+      // shared token silently cut the owner's terminal mid-session.
+      if (!mayActAsOwner(ctx.auth, ctx.req)) {
+        refuseOwner(res, 'Turning terminal input on or off needs the dashboard login (an owner session).')
+        return true
+      }
       const body = await readBody(ctx.req)
       let enabled: unknown
       try { enabled = (JSON.parse(body.toString()) as { enabled?: unknown }).enabled } catch { json(res, { error: 'Invalid JSON' }, 400); return true }
@@ -118,7 +160,15 @@ export async function tryHandleAgentTerminal(ctx: RouteContext): Promise<boolean
   const streamMatch = path.match(/^\/api\/agents\/([^/]+)\/pane\/stream$/)
   if (streamMatch && method === 'GET') {
     const name = decodeURIComponent(streamMatch[1])
-    const target = resolveTarget(name)
+    // The client can go away while resolveTarget awaits tmux; listen first, so a
+    // close during that await is not missed (it would leave the ticks running).
+    let closed = false
+    let interval: ReturnType<typeof setInterval> | undefined
+    const stop = (): void => { closed = true; if (interval) clearInterval(interval) }
+    ctx.req.on('close', stop)
+    ctx.req.on('error', stop)
+    const target = await resolveTarget(name)
+    if (closed) return true
     if (!target.exists) { json(res, { error: 'Agent not found' }, 404); return true }
     const session = target.session
 
@@ -129,7 +179,6 @@ export async function tryHandleAgentTerminal(ctx: RouteContext): Promise<boolean
       'X-Accel-Buffering': 'no',
     })
 
-    let closed = false
     let inFlight = false
     const tick = (): void => {
       if (closed || inFlight) return // skip if a slow capture is still running
@@ -142,26 +191,34 @@ export async function tryHandleAgentTerminal(ctx: RouteContext): Promise<boolean
       // the visible pane) so the frontend can offer scroll-back; the frontend
       // repaints the full snapshot (clear-scrollback + clear + home) each changed
       // frame and only when the user is at the bottom, so scrolling up is stable.
-      execFile(TMUX, ['capture-pane', '-t', session, '-S', '-2000', '-e', '-p'], { timeout: 3000, encoding: 'utf-8', maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
-        inFlight = false
-        if (closed) return
+      // Same resolution as the write path: for a per-user agent the pane lives on
+      // that user's tmux server, and a raw binary call returns nothing -- which
+      // the stream renders as a blank terminal rather than an error. That blank
+      // pane is what the operator reported as "nem jelenit meg semmit".
+      const capture = tmuxInvocationFor(['capture-pane', '-t', exactTmuxTarget(session), '-S', '-2000', '-e', '-p'])
+      execFile(capture.file, capture.args, { timeout: 3000, encoding: 'utf-8', maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+        if (closed) { inFlight = false; return }
         const pane = err ? '' : (stdout ?? '')
+        // The tick stays in flight until the probe answers, so a slow probe
+        // never overlaps the next tick.
+        const send = (running: boolean): void => {
+          inFlight = false
+          if (closed) return
+          try {
+            res.write(`data: ${JSON.stringify({ pane, running })}\n\n`)
+          } catch {
+            closed = true
+          }
+        }
         // A successful capture proves the session is alive; only re-probe on
         // capture failure (cheap, and avoids a has-session call every tick).
-        const running = err ? isTmuxSessionAlive(session) : true
-        try {
-          res.write(`data: ${JSON.stringify({ pane, running })}\n\n`)
-        } catch {
-          closed = true
-        }
+        if (err) void isTmuxSessionAlive(session).then(send)
+        else send(true)
       })
     }
 
     tick()
-    const interval = setInterval(tick, 700)
-    const stop = (): void => { closed = true; clearInterval(interval) }
-    ctx.req.on('close', stop)
-    ctx.req.on('error', stop)
+    interval = setInterval(tick, 700)
     return true
   }
 
@@ -187,12 +244,20 @@ export async function tryHandleAgentTerminal(ctx: RouteContext): Promise<boolean
     const remote = ctx.req.socket?.remoteAddress ?? 'unknown'
     const xff = ctx.req.headers['x-forwarded-for'] ?? ''
     const ua = ctx.req.headers['user-agent'] ?? ''
+    // OWNERGATE3-1104: types arbitrary input into an agent's tmux pane, i.e. full control of that agent; the
+    // toggle below is a second switch, not an identity check (while it is ON, the shared token every sub-agent can
+    // read would pass it). Owner-only, before the toggle, the target lookup, the body and any tmux call.
+    if (!mayActAsOwner(ctx.auth, ctx.req)) {
+      logger.warn({ name, remote, xff, ua, auth: ctx.auth?.kind ?? 'none' }, 'agent-terminal: KEYS INJECTION REFUSED (no owner session)')
+      refuseOwner(res, 'Typing into an agent\'s terminal needs the dashboard login (an owner session).')
+      return true
+    }
     if (!readTerminalInputEnabled()) {
       logger.warn({ name, remote, xff, ua }, 'agent-terminal: KEYS INJECTION BLOCKED (toggle OFF)')
       json(res, { error: 'Terminal input is disabled. Enable it in the dashboard first.' }, 403)
       return true
     }
-    const target = resolveTarget(name)
+    const target = await resolveTarget(name)
     if (!target.exists) { json(res, { error: 'Agent not found' }, 404); return true }
     if (!target.running) { json(res, { error: 'Agent is not running' }, 400); return true }
     const session = target.session
@@ -210,13 +275,26 @@ export async function tryHandleAgentTerminal(ctx: RouteContext): Promise<boolean
       json(res, { error: 'Provide {keys:string} or an allow-listed {special}' }, 400)
       return true
     }
-    // AUDIT every accepted injection. Preview reflects the SANITIZED payload
-    // actually sent (truncated so a long paste does not bloat the log, but
-    // present so a forged prompt is traceable).
+    // AUDIT every accepted injection. Preview describes the SANITIZED payload actually sent,
+    // but it MUST NOT contain the payload itself.
+    //
+    // MIÉRT MASZKOLVA (kanban dashboard-key-logging, 2026-08-02 jelzés, 2026-08-11 javítás):
+    // ez a sor korábban a nyers szöveget írta a naplóba (`keys:"..."`), és 806 ilyen sor gyűlt
+    // össze. A súlyt kimértük: a 11 hosszú érték MIND különböző volt, és egyik SEM a hosszú
+    // életű titkaink közül való — a vault egyszer használatos, 15 percig élő beviteli-link
+    // tokenjeire illettek, tehát nem szivárgott ki tartós titok. A kockázat viszont ELŐRE
+    // mutat: aki valaha egy valódi jelszót másol a webterminálba, azt szó szerint naplózzuk.
+    //
+    // Amit a naplónak tudnia kell, az NEM a tartalom, hanem hogy TÖRTÉNT-E injektálás, mikor,
+    // kitől és mekkora. A hossz és az első néhány karakter elég ahhoz, hogy egy hamisított
+    // prompt nyomon követhető legyen; a teljes szöveg csak kárt tud okozni.
     const preview = parsed.special
       ? `special:${parsed.special}`
-      : `keys:${JSON.stringify((literalKeys ?? '').slice(0, 120))}${(literalKeys ?? '').length > 120 ? '…' : ''}`
+      : maskKeysPreview(literalKeys ?? '')
     logger.info({ name, remote, xff, ua, preview }, 'agent-terminal: KEYS INJECTION ACCEPTED')
+    // ENVATLEAK1114: typed AS IS, deliberately WITHOUT the pane mapping (pane-text.ts paneTyped). This is
+    // the owner's own keyboard into the pane: an at-sign file reference typed here is what the owner meant,
+    // and escaping it would change their keystrokes. Every other path that types outside text is mapped.
     try {
       await tmux(args)
       json(res, { ok: true })
@@ -231,7 +309,13 @@ export async function tryHandleAgentTerminal(ctx: RouteContext): Promise<boolean
   const loginMatch = path.match(/^\/api\/agents\/([^/]+)\/login$/)
   if (loginMatch && method === 'POST') {
     const name = decodeURIComponent(loginMatch[1])
-    const target = resolveTarget(name)
+    // OWNERGATE3-1104: types the scripted /login sequence into the agent's pane and confirms it, i.e. starts a new
+    // Claude login for that agent (whose account it then runs on); owner-only, before the target lookup and any tmux.
+    if (!mayActAsOwner(ctx.auth, ctx.req)) {
+      refuseOwner(res, 'Starting an agent\'s Claude login needs the dashboard login (an owner session).')
+      return true
+    }
+    const target = await resolveTarget(name)
     if (!target.exists) { json(res, { error: 'Agent not found' }, 404); return true }
     if (!target.running) { json(res, { error: 'Agent is not running' }, 400); return true }
     const session = target.session

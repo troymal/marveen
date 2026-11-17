@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
-import { writeFileSync, unlinkSync, mkdtempSync, rmSync } from 'node:fs'
+import { writeFileSync, unlinkSync, mkdtempSync, rmSync, chmodSync, statSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
@@ -63,4 +63,57 @@ describe('readEnvFile', () => {
     expect(result['C']).toBe('3')
     expect(result['B']).toBeUndefined()
   })
+})
+
+// ENVPERM925: .env holds the bot token and API keys. updateEnvFile writes a new
+// file and renames it over .env, so the mode has to be carried over on purpose;
+// before this fix a 0600 .env came back 0644 (measured with this function).
+describe('updateEnvFile keeps the .env mode', () => {
+  const modeOf = (p: string) => statSync(p).mode & 0o777
+
+  it('a 0600 .env stays 0600, and the value is written', async () => {
+    writeFileSync(testEnvPath, 'SECRET=abc\nMAIN_AGENT_MODEL=claude-opus-5\n')
+    chmodSync(testEnvPath, 0o600)
+    const { updateEnvFile } = await import('../env.js')
+    updateEnvFile({ MAIN_AGENT_MODEL: 'claude-sonnet-5' })
+    expect(modeOf(testEnvPath)).toBe(0o600)
+    expect(readFileSync(testEnvPath, 'utf-8')).toContain('MAIN_AGENT_MODEL=claude-sonnet-5')
+    expect(readFileSync(testEnvPath, 'utf-8')).toContain('SECRET=abc')
+  })
+
+  it('an operator-chosen mode (0640) is kept, not reset to a default', async () => {
+    writeFileSync(testEnvPath, 'A=1\n')
+    chmodSync(testEnvPath, 0o640)
+    const { updateEnvFile } = await import('../env.js')
+    updateEnvFile({ B: '2' })
+    expect(modeOf(testEnvPath)).toBe(0o640)
+  })
+
+  it('a .env that did not exist is created 0600', async () => {
+    try { unlinkSync(testEnvPath) } catch { /* absent */ }
+    const { updateEnvFile, ENV_FILE_MODE } = await import('../env.js')
+    updateEnvFile({ MAIN_AGENT_ID: 'bot' })
+    expect(ENV_FILE_MODE).toBe(0o600)
+    expect(modeOf(testEnvPath)).toBe(0o600)
+  })
+})
+
+// FLEETIMPORTENVKEY1021: updateEnvFile writes KEY=value unquoted, one per line,
+// so a value with a line break would add a line of its own choosing. The writer
+// refuses it (and a key that is not a plain env name), and leaves the file as it was.
+describe('updateEnvFile refuses what would add a line of its own', () => {
+  for (const [label, updates] of [
+    ['LF in a value', { BOT_NAME: 'Atlas\nSUDO_AGENTS=dani' }],
+    ['CR in a value', { BOT_NAME: 'Atlas\rSUDO_AGENTS=dani' }],
+    ['NUL in a value', { BOT_NAME: 'Atlas\u0000' }],
+    ['a key with a line break', { 'BOT_NAME\nSUDO_AGENTS': 'dani' }],
+    ['a key with =', { 'A=B': 'x' }],
+  ] as const) {
+    it(label, async () => {
+      writeFileSync(testEnvPath, 'SECRET=abc\nBOT_NAME=Old\n')
+      const { updateEnvFile } = await import('../env.js')
+      expect(() => updateEnvFile(updates as Record<string, string>)).toThrow(/\.env/)
+      expect(readFileSync(testEnvPath, 'utf-8')).toBe('SECRET=abc\nBOT_NAME=Old\n')
+    })
+  }
 })

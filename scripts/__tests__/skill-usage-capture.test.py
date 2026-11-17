@@ -155,5 +155,125 @@ class TestAgentIdFromCwd(unittest.TestCase):
         self.assertNotEqual(self._call(cwd), "some-workdir")
 
 
+# 2026-09-14: a SKILL.md-minta kiterjesztese
+# projekt-szintu skillekre. A REGI minta csak a futo felhasznalo HOME-ja ala
+# illeszkedett, ezert a <install>/.claude/skills/<nev>/SKILL.md olvasasa SOHA nem
+# keletkeztetett skill_usage sort. Merve aznap: 71 telepitett skillhez 4 usage-sor,
+# mind `tool_call`, egyetlen `skill_read` sem. Ez a negy eset pinneli az uj hatart.
+class TestProjectScopedSkills(unittest.TestCase):
+    def _classify(self, path):
+        return hook._classify("Read", {"file_path": path})
+
+    def test_project_scoped_skill_md_matches(self):
+        self.assertEqual(
+            self._classify("/srv/marveen/.claude/skills/my-skill/SKILL.md"),
+            ("my-skill", "skill_read"),
+        )
+
+    def test_home_scoped_still_matches(self):
+        home = os.path.expanduser("~")
+        self.assertEqual(
+            self._classify(f"{home}/.claude/skills/fleet-helper/SKILL.md"),
+            ("fleet-helper", "skill_read"),
+        )
+
+    def test_scheduled_task_skill_md_does_not_match(self):
+        # A scheduled-tasks SKILL.md NEM skill, hanem egy utemezett feladat promptja.
+        home = os.path.expanduser("~")
+        self.assertIsNone(self._classify(f"{home}/.claude/scheduled-tasks/foo/SKILL.md"))
+
+    def test_nested_reference_still_does_not_match(self):
+        self.assertIsNone(self._classify("/srv/marveen/.claude/skills/my-skill/references/x.md"))
+
+
+# SKILLBASHREAD1109: 2026-11-09-en merve 11-07 20:21 es 11-09 08:10 kozott nulla
+# skill_usage sor keletkezett, mert minden SKILL.md-t Bash-bol (cat/sed) nyitottunk meg.
+class TestBashSkillRead(unittest.TestCase):
+    def _b(self, cmd):
+        return hook._classify_bash(cmd)
+
+    def test_cat_of_a_project_skill_counts(self):
+        self.assertEqual(self._b("cat /srv/m/.claude/skills/fleet-helper/SKILL.md"), ["fleet-helper"])
+
+    def test_home_and_isolated_roots_count(self):
+        self.assertEqual(self._b("sed -n 1,40p ~/.claude/skills/a/SKILL.md"), ["a"])
+        self.assertEqual(self._b("head -80 /srv/m/.channels-config/skills/b/SKILL.md"), ["b"])
+        self.assertEqual(self._b("cat /srv/m/agents/x/.claude-config/skills/c/SKILL.md | head"), ["c"])
+
+    def test_quoted_path_and_several_skills_are_distinct(self):
+        cmd = 'cat "/s/.claude/skills/a/SKILL.md" && grep x "/s/.claude/skills/b/SKILL.md"; cat /s/.claude/skills/a/SKILL.md'
+        self.assertEqual(self._b(cmd), ["a", "b"])
+
+    def test_cap(self):
+        cmd = " ".join(f"/s/.claude/skills/k{i}/SKILL.md" for i in range(9))
+        self.assertEqual(len(self._b("cat " + cmd)), hook._MAX_BASH_SKILLS)
+
+    def test_glob_or_variable_is_not_a_read_of_one_skill(self):
+        self.assertEqual(self._b("grep -l foo ~/.claude/skills/*/SKILL.md"), [])
+        self.assertEqual(self._b('cat ~/.claude/skills/$NAME/SKILL.md'), [])
+
+    def test_writes_do_not_count(self):
+        for cmd in [
+            "cat > ~/.claude/skills/a/SKILL.md << 'EOF'",
+            "echo x >> /s/.claude/skills/a/SKILL.md",
+            "sed -i 's/a/b/' /s/.claude/skills/a/SKILL.md",
+            "cp /tmp/x /s/.claude/skills/a/SKILL.md",
+            "rm /s/.claude/skills/a/SKILL.md",
+            "git add .claude/skills/a/SKILL.md",
+        ]:
+            self.assertEqual(self._b(cmd), [], cmd)
+
+    def test_scheduled_task_and_references_do_not_count(self):
+        self.assertEqual(self._b("cat ~/.claude/scheduled-tasks/foo/SKILL.md"), [])
+        self.assertEqual(self._b("cat /s/.claude/skills/a/references/SKILL.md.bak"), [])
+
+    def test_unrelated_command(self):
+        self.assertEqual(self._b("echo hi"), [])
+        self.assertEqual(self._b(""), [])
+
+    # SKILLREADERONLY1109: the review of #2644 measured these as counted reads.
+    def test_a_mention_is_not_a_read(self):
+        for cmd in [
+            'echo "see .claude/skills/gamma/SKILL.md for details"',
+            "git diff -- .claude/skills/zeta/SKILL.md",
+            "ls -la .claude/skills/eta/SKILL.md",
+            "printf '%s\\n' /s/.claude/skills/a/SKILL.md",
+            "grep -l foo /s/.claude/skills/a/SKILL.md",
+            "grep -rl foo /s/.claude/skills/a/SKILL.md",
+            "rg --files-with-matches foo /s/.claude/skills/a/SKILL.md",
+            "grep -c foo /s/.claude/skills/a/SKILL.md",
+        ]:
+            self.assertEqual(self._b(cmd), [], cmd)
+
+    def test_heredoc_body_is_not_a_read(self):
+        cmd = "cat > /tmp/notes.md <<'EOF'\nread .claude/skills/delta/SKILL.md first\ncat /s/.claude/skills/omega/SKILL.md\nEOF"
+        self.assertEqual(self._b(cmd), [])
+        # ...but a real read after the heredoc still counts
+        cmd2 = "python3 - <<EOF\nprint('.claude/skills/delta/SKILL.md')\nEOF\ncat /s/.claude/skills/real/SKILL.md"
+        self.assertEqual(self._b(cmd2), ["real"])
+
+    def test_readers_count(self):
+        self.assertEqual(self._b("tail -n 20 /s/.claude/skills/a/SKILL.md"), ["a"])
+        self.assertEqual(self._b("awk 'NR<10' /s/.claude/skills/a/SKILL.md"), ["a"])
+        self.assertEqual(self._b("grep -n Buktato /s/.claude/skills/a/SKILL.md"), ["a"])
+        self.assertEqual(self._b('cat "$HOME/.claude/skills/eps/SKILL.md"'), ["eps"])
+        self.assertEqual(self._b("LC_ALL=C /usr/bin/head -5 /s/.claude/skills/a/SKILL.md"), ["a"])
+        self.assertEqual(self._b("cd /s && cat .claude/skills/a/SKILL.md 2>/dev/null"), ["a"])
+
+    def test_mention_next_to_a_read_counts_only_the_read(self):
+        cmd = "echo /s/.claude/skills/x/SKILL.md; cat /s/.claude/skills/y/SKILL.md"
+        self.assertEqual(self._b(cmd), ["y"])
+
+    def test_unparseable_line_is_skipped_not_raised(self):
+        self.assertEqual(self._b("cat '/s/.claude/skills/a/SKILL.md"), [])
+
+    def test_read_tool_sees_isolated_root(self):
+        self.assertEqual(
+            hook._classify("Read", {"file_path": "/srv/m/.channels-config/skills/b/SKILL.md"}),
+            ("b", "skill_read"),
+        )
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

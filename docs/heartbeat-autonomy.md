@@ -28,7 +28,7 @@ Egy dashboard-felületen, kategóriánként húzod feljebb-lejjebb a szintet —
 
 1. **Ütemezett feladatok (heartbeat-ek):** cron-szerű ütemezésű promptok (pl. memória-mentés, kanban-audit, déli/reggeli összefoglaló). Minden futás egy rövid, fókuszált ellenőrzés.
 2. **Autonómia-config:** egy `store/autonomy-config.json` tárolja kategóriánként a szintet (`level: 1|2|3`), a zárolt (`locked`) flag-et és a `maxLevel`-t.
-3. **Dashboard UI + API:** `GET/POST /api/autonomy` olvassa/írja a configot; a felület kategória-soronként szint-választót ad, a zárolt sorok szürkén, lakattal. A backend server-side tiltja a zárolt kategóriák szint-emelését.
+3. **Dashboard UI + API:** `GET/POST /api/autonomy` olvassa/írja a configot; a felület kategória-soronként szint-választót ad, a zárolt sorok szürkén, lakattal. A backend server-side tiltja a zárolt kategóriák szint-emelését. Szintet EMELNI a dashboard-bejelentkezéssel lehet, amint a gépen van dashboard-felhasználó: a közös tokent minden ügynök ismeri, ezért tokennel az emelés 403-at kap (`owner_session_required`). A csökkentés és ugyanannak a szintnek a beállítása tokennel is megy. Friss telepítésen, amíg nincs felhasználó, a token emelhet (az első beállítás útja).
 4. **Heartbeat-bekötés:** minden ütemezett feladat a futás elején beolvassa a rá vonatkozó kategória szintjét, és aszerint viselkedik.
 
 ### Szint-logika (példa: kanban-audit)
@@ -41,7 +41,9 @@ level 2  → nem cselekszik magától; üzenetben javasolja, és vár a jóváha
 level 1  → csak listázza/jelzi, semmit nem tesz
 ```
 
-Hiányzó config vagy kulcs esetén a default a 3. szint (a korábbi viselkedés).
+Hiányzó, olvashatatlan config vagy hiányzó kulcs esetén a default az 1. szint (csak jelez): ugyanaz, amit a `seed-config` minden kategóriára szállít. Így egy törölt vagy sérült config nem a legmegengedőbb szintre billenti a feladatot. (A levélkapu, `scripts/hooks/email-approval-gate.py`, ugyanerre a 2. szintet adja: ott a kimenő levél jóváhagyással még elmehet.)
+
+A legtöbb szintet az ágens promptja olvassa. Kettőt a szerver vagy egy hook is kikényszerít: az `email_send`-et a levélkapu (`scripts/hooks/email-approval-gate.py`), a `data_delete`-et a memória-törlés végpontja (`DELETE /api/memories/:id`, 3-as szint alatt csak jóváhagyott, egyszer felhasználható azonosítóval; lásd `docs/security-hardening.md`).
 
 ### Config-séma
 
@@ -50,14 +52,14 @@ Hiányzó config vagy kulcs esetén a default a 3. szint (a korábbi viselkedés
   "version": 1,
   "categories": [
     { "key": "kanban_archive_done", "label": "...", "level": 3, "locked": false, "maxLevel": 3 },
-    { "key": "email_send",          "label": "...", "level": 1, "locked": false, "maxLevel": 2 },
+    { "key": "email_send",          "label": "...", "level": 1, "locked": false, "maxLevel": 3 },
     { "key": "payment",             "label": "...", "level": 1, "locked": true,  "maxLevel": 1 }
   ]
 }
 ```
 
 - `locked: true` + `maxLevel: 1` → hard-safety kategória, nem emelhető (publikálás, pénz, törlés, jogosultság, külső üzenet).
-- `email_send` speciális: állítható, de `maxLevel: 2` (vázlat + jóváhagyás, sosem teljesen autonóm küldés).
+- `email_send` speciális: a kiinduló szint 1, a felső határ `maxLevel: 3` (a gazda döntése, 2026-11-15). A 2 vázlat + jóváhagyás; a 3-on a levélkapu jóváhagyás nélkül enged küldeni. A szintet emelni a dashboardon csak a gazda tudja (tulajdonosi bejelentkezés; a közös tokennel 403). A frissítés a meglévő telepítés `maxLevel`-jét csak akkor emeli 2-ről 3-ra, ha még a gyári 2 áll ott; a szinthez nem nyúl.
 
 ### Telepítés / frissítés
 
@@ -65,4 +67,4 @@ A default config a `seed-config/` mappában van; az install kimásolja `store/`-
 
 ### Bővítés
 
-Új autonómia-kategória: vedd fel a `seed-config/autonomy-config.json`-ba (`key`, `label`, `level`, `locked`, `maxLevel`), és a releváns heartbeat-prompt olvassa be a szintet a cselekvés előtt. A hard-safety határt mindig tartsd: kifelé menő / visszafordíthatatlan művelet sosem kap `maxLevel > 1`-et (az email a kivétel, `maxLevel: 2`).
+Új autonómia-kategória: vedd fel a `seed-config/autonomy-config.json`-ba (`key`, `label`, `level`, `locked`, `maxLevel`), és a releváns heartbeat-prompt olvassa be a szintet a cselekvés előtt. A hard-safety határt mindig tartsd: kifelé menő / visszafordíthatatlan művelet sosem kap `maxLevel > 1`-et (az email a kivétel, `maxLevel: 3`, a szint emelése a gazdáé).

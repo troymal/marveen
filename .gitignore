@@ -25,6 +25,8 @@ reports/
 # '*/**/.claude/' keeps nested .claude dirs ignored like before.
 .claude/*
 !.claude/settings.json
+# HOOKDRIFT926: the hook sidecar travels with the settings it describes.
+!.claude/hooks.metadata.json
 */**/.claude/
 .config/
 
@@ -40,6 +42,7 @@ reports/
 # Test artifacts
 test-results/
 .playwright-mcp/
+tmp.*
 
 # macOS
 .DS_Store
@@ -136,3 +139,40 @@ transcripts/
 
 # Task Observer megfigyelesi naplo (helyi, nem verziokezelt)
 skill-observations/
+
+# Upload staging area written into the install directory: per-install state,
+# not source. (The UI language marker .lang this commit also added has since
+# landed on develop; kept there, not duplicated here.)
+.uploads/
+
+# Scratch HOME for test runs. The suite is run as `HOME=<scratch> npx vitest`
+# because #1348 -- before it, the full suite wrote into the owner's real
+# ~/.ssh/authorized_keys. The tool leaves droppings in that HOME (npm's
+# update-notifier stamp, a 648 KB lbdb vector extension), and three PRs in the
+# MEMKERESVAK917 series would have carried the first of them into the repo.
+# No trailing slash on purpose: a trailing slash does not match a symlink, so
+# `.fakehome/` would stop ignoring it the day the scratch HOME is created as one.
+.fakehome
+
+# Supabase CLI scratch state (cli-latest, linked-project.json). Written on every
+# CLI run, never source. Two of these rode into #1324 and would have been the
+# first ones in the repo -- after that they regenerate silently on every run.
+#
+# NO TRAILING SLASH, same rule and same reason as `.fakehome` above, measured
+# again for this path on 2026-09-17 in a throwaway repo, with an empty-.gitignore
+# negative control confirming the file is visible when unignored:
+#   supabase/.temp   -> ignores a real directory AND a symlink
+#   supabase/.temp/  -> ignores a real directory, MISSES the symlink (it shows in
+#                       `git status`, so the next CLI run commits it again)
+supabase/.temp
+
+# Install-local hook scripts named by store/extra-hooks.json (docs/config-reference.md)
+local-hooks/
+
+# VOICETOKENLEAK1101 (Dani 64894): the main agent's kanban recipe payload files (written in the project root)
+/kanban-*-eredmeny.txt
+/kanban-*-bizonyitek.txt
+/kanban-*-kerdes.txt
+
+# VOICETOKENLEAK1101 PR-A1 (Dani 64941/2): the main agent's dashboard-API payload files (written in the project root)
+/api-*.txt

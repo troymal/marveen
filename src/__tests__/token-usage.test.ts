@@ -296,7 +296,7 @@ describe('getTokenDetails', () => {
 
     expect(details.length).toBeGreaterThan(0)
     for (const d of details) {
-      const combined = `${d.agent} ${d.toolName || ''} ${d.contentPreview || ''}`
+      const combined = `${d.agent} ${d.tool_name || ''} ${d.content_preview || ''}`
       expect(combined.toLowerCase()).toContain('samu')
     }
   })
@@ -332,32 +332,6 @@ describe('deduplication', () => {
 
     // Cleanup
     db.prepare("DELETE FROM token_usage WHERE agent = 'test-dedup'").run()
-  })
-})
-
-describe('correlateWithKanban', () => {
-  it('links token_usage rows to kanban cards by agent and time range', async () => {
-    const db = getDb()
-    const baseTs = 1716200000
-
-    // Insert a kanban card (created_at is NOT NULL)
-    db.prepare(`
-      INSERT OR IGNORE INTO kanban_cards (id, title, status, priority, assignee, project, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run('test-kanban-1', 'Test Task', 'in_progress', 'normal', 'test-main', 'test-project', baseTs, baseTs)
-
-    const { correlateWithKanban } = await import('../web/token-usage.js')
-    correlateWithKanban()
-
-    const rows = db.prepare(
-      "SELECT task_title, project FROM token_usage WHERE agent = 'test-main' AND task_title IS NOT NULL",
-    ).all() as { task_title: string; project: string }[]
-
-    expect(rows.length).toBeGreaterThan(0)
-    expect(rows[0].task_title).toBe('Test Task')
-
-    // Cleanup
-    db.prepare("DELETE FROM kanban_cards WHERE id = 'test-kanban-1'").run()
   })
 })
 
@@ -431,5 +405,44 @@ describe('tryHandleTokenUsage route handler', () => {
     const { ctx } = makeCtx('/api/token-usage/collect', 'GET')
     const handled = await tryHandleTokenUsage(ctx)
     expect(handled).toBe(false)
+  })
+})
+
+// An agent that was never migrated to its own OS user still has an
+// agents/<name>/.claude-config/projects entry, but it is a SYMLINK back to
+// the shared ~/.claude/projects. Walking it books the whole fleet's
+// transcripts under that one agent, which is how three sub-agents came to
+// report byte-identical totals on 2026-09-04.
+describe('resolvesToSharedProjectsRoot', () => {
+  const ROOT = join(TEST_DIR, 'shared-root-probe')
+  const shared = join(ROOT, 'shared-projects')
+  const symlinked = join(ROOT, 'agent-projects-symlink')
+  const ownDir = join(ROOT, 'agent-projects-real')
+
+  beforeAll(async () => {
+    const { symlinkSync } = await import('node:fs')
+    rmSync(ROOT, { recursive: true, force: true })
+    mkdirSync(shared, { recursive: true })
+    mkdirSync(ownDir, { recursive: true })
+    symlinkSync(shared, symlinked)
+  })
+
+  afterAll(() => {
+    rmSync(ROOT, { recursive: true, force: true })
+  })
+
+  it('detects a projects dir that is a symlink to the shared root', async () => {
+    const { resolvesToSharedProjectsRoot } = await import('../web/token-usage.js')
+    expect(resolvesToSharedProjectsRoot(symlinked, shared)).toBe(true)
+  })
+
+  it('leaves a genuinely isolated projects dir alone', async () => {
+    const { resolvesToSharedProjectsRoot } = await import('../web/token-usage.js')
+    expect(resolvesToSharedProjectsRoot(ownDir, shared)).toBe(false)
+  })
+
+  it('treats a missing path as not shared', async () => {
+    const { resolvesToSharedProjectsRoot } = await import('../web/token-usage.js')
+    expect(resolvesToSharedProjectsRoot(join(ROOT, 'nope'), shared)).toBe(false)
   })
 })

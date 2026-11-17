@@ -1,0 +1,614 @@
+// Named Claude subscription registry -- dashboard-facing CRUD (PR2b), plus
+// the rotation trigger (PR2c). See
+// docs/superpowers/specs/2026-09-11-claude-key-rotation-design.md sections 6
+// and 7.
+//
+// GET was the whole surface in PR1 (moved here unchanged from agents.ts).
+// PR2b added POST/PUT/DELETE on store/claude-plans.json plus a read-only
+// GET .../state. PR2c adds the write side of the state side-car
+// (POST .../rotate) -- the one code path both the (not-yet-built) manual
+// dashboard button and the automatic heartbeat decision (design 6.3, wired in
+// scripts/claude-plan-rotate-check.ts) call.
+//
+// Every plan write runs the body through validatePlan() -- the exact function
+// resolveClaudePlans() uses to parse the file back -- so nothing invalid can
+// reach disk through this route that the read side would then silently drop.
+import { homedir } from 'node:os'
+import { existsSync } from 'node:fs'
+import { readBody, json } from '../http-helpers.js'
+import { mayActAsOwner, refuseOwner } from './auth.js'
+import { logger } from '../../logger.js'
+import { MAIN_AGENT_ID, PROJECT_ROOT } from '../../config.js'
+import { getEffectiveSettingValue } from '../../settings-store.js'
+import { readClaudePlans, writeClaudePlans, validatePlan, PLAN_ID_ALLOWED, tokenSecretIdFor } from '../claude-plans.js'
+import { breaksLine } from '../../heartbeat-line.js'
+import { setSecret, deleteSecret, getSecret } from '../vault.js'
+import { readClaudePlansState, writeClaudePlansState, applyRotation, recordPlanObservation } from '../claude-plans-state.js'
+import { probePlanUsage, observationFromProbe, usageFromProbe } from '../../claude-plan-usage-probe.js'
+import { agentDir, writeAgentClaudePlan } from '../agent-config.js'
+import {
+  restartAgentProcess, planTokenPreflight, resolveMainAgentConfigDir, resolveMainAgentRotatedConfigDir, resolveMainAgentRotatedTokenSecretId,
+  hasFleetOauthToken, mainAgentSharedConfigDir,
+} from '../agent-process.js'
+import { waitPlanTokenOutcome } from '../plan-token-launch.js'
+import { hardRestartMarveenChannels, restartMainForRotationContinue } from '../channel-monitor.js'
+import { rotationReadiness } from '../claude-rotation-heartbeat.js'
+import { mainRotationContinueVerdict, type ContinueRestartResult } from '../main-rotation-continue.js'
+import type { RouteContext } from './types.js'
+import { withRotationLock } from '../claude-rotation-lock.js'
+
+/** Minimum gap between two manual probes of the same plan (POST .../probe). */
+export const MANUAL_PROBE_MIN_INTERVAL_MS = 60_000
+
+function isRotationEnabled(): boolean {
+  try { return String(getEffectiveSettingValue('CLAUDE_ROTATION_ENABLED')) === '1' } catch { return false }
+}
+
+function isFleetRotationEnabled(): boolean {
+  try { return String(getEffectiveSettingValue('CLAUDE_ROTATION_FLEET')) === '1' } catch { return false }
+}
+
+function isMainAgentIsolated(): boolean {
+  try { return String(getEffectiveSettingValue('MAIN_AGENT_ISOLATED_CONFIG')) === '1' } catch { return false }
+}
+
+// A raw `token` combined with configDir or tokenSecretId is ambiguous -- the
+// caller almost certainly meant only one of them. Rejected explicitly rather
+// than silently dropping `token` (which would otherwise sail through as an
+// unrecognized field while validatePlan happily accepts the configDir/
+// tokenSecretId that WAS present, masking the caller's mistake).
+function hasAmbiguousTokenField(raw: Record<string, unknown>): boolean {
+  return typeof raw.token === 'string' && raw.token.trim().length > 0
+    && (Boolean(raw.configDir) || Boolean(raw.tokenSecretId))
+}
+
+// Token-mode convenience: the caller sends a raw `token` field (the literal
+// `claude setup-token` output) instead of pre-populating the vault and
+// passing tokenSecretId directly -- this is the whole point of token-mode
+// (see ClaudePlan.tokenSecretId): no separate vault-management step, paste
+// the token and go.
+//
+// PURE -- writes NOTHING to the vault. It only builds the candidate object
+// validatePlan() will see (tokenSecretId swapped in, raw `token` stripped so
+// it never reaches store/claude-plans.json or a GET response) plus what
+// WOULD be written if the caller commits it later. The caller must run
+// validatePlan() (and any other rejection check, e.g. a duplicate id) FIRST,
+// and only setSecret() the pendingToken once everything else has already
+// succeeded.
+//
+// PR #1304 review (a): the previous version wrote to the vault right here,
+// before validation. On a PUT that reuses an existing token-mode plan's id,
+// the write landed on that plan's EXISTING vault entry (same derived id) --
+// so an invalid PUT (bad token plus some unrelated bad field) overwrote the
+// live secret, validation then failed, and the failure-path cleanup deleted
+// the same id -- destroying a working credential on a 400 response.
+function prepareTokenCandidate(
+  raw: Record<string, unknown>,
+  planId: string,
+): { candidate: Record<string, unknown>; pendingToken: { secretId: string; label: string; value: string } | null } {
+  if (typeof raw.token !== 'string' || !raw.token.trim()) {
+    return { candidate: raw, pendingToken: null }
+  }
+  if (!planId || !PLAN_ID_ALLOWED.test(planId)) return { candidate: raw, pendingToken: null }
+  const secretId = tokenSecretIdFor(planId)
+  const { token: _discard, ...rest } = raw
+  return {
+    candidate: { ...rest, tokenSecretId: secretId },
+    pendingToken: {
+      secretId,
+      label: `Claude plan token: ${typeof raw.label === 'string' ? raw.label : planId}`,
+      value: raw.token.trim(),
+    },
+  }
+}
+
+// The same setup-token registered under two plan ids makes rotation between
+// them a no-op that still restarts the main agent, and the two plans'
+// "remaining quota" bars are really one subscription counted twice (measured
+// 2026-09-26: two of six plans on a real install carried the identical
+// token, and nothing flagged it). Returns the OTHER plan's id, never the
+// token. A vault read failure for one plan is treated as "no match" for that
+// plan: this is a mistake guard, not an authorization gate, and it must not
+// turn an unreadable neighbour into a failed create.
+export function findPlanWithSameToken(
+  plans: ReadonlyArray<{ id: string; tokenSecretId?: string }>,
+  planId: string,
+  token: string,
+): string | null {
+  for (const p of plans) {
+    if (p.id === planId || !p.tokenSecretId) continue
+    let stored: string | null = null
+    try { stored = getSecret(p.tokenSecretId) } catch { stored = null }
+    if (stored !== null && stored.trim() === token) return p.id
+  }
+  return null
+}
+
+const DUPLICATE_TOKEN_ERROR = (otherId: string) =>
+  `This token is already stored for another plan (${otherId}). Each plan needs its own subscription token.`
+
+// Defense in depth beyond validatePlan's own derived-form check (PR #1304
+// review (b)): deleteSecret must never fire on anything but the plan's OWN
+// tokenSecretId, even if a caller somehow got a different id attached to it
+// (e.g. a hand-edited store/claude-plans.json -- validatePlan on read would
+// normally just drop such an entry, but this keeps the deletion call sites
+// safe independently of that, rather than relying on a single upstream gate
+// for a primitive this destructive).
+// Exported for a direct unit test: with validatePlan now also enforcing the
+// derived-form-only rule, a foreign tokenSecretId can no longer reach disk
+// through this route at all, so the "DELETE never removes a non-prefixed
+// secret" guarantee has no route-level path left to exercise it through --
+// this function IS the guarantee, and is tested directly.
+export function deleteOwnTokenSecret(planId: string, secretId: string | null | undefined): void {
+  if (secretId && secretId === tokenSecretIdFor(planId)) deleteSecret(secretId)
+}
+
+// Create a new plan from a POST body: every rejection check first, the vault
+// write last. The dashboard's "add by logging in" flow (claude-plans-login.ts)
+// calls this too, with the caught token as `token`, so both ways in share one
+// write path.
+export function commitNewPlan(rawBody: Record<string, unknown>): { status: number; payload: unknown } {
+  if (hasAmbiguousTokenField(rawBody)) {
+    return { status: 400, payload: { error: 'Invalid plan: token cannot be combined with configDir or tokenSecretId' } }
+  }
+  // K1 (ROTSLACK1111, Dani 75718): a label goes into the heartbeat's line-by-line output; a line break or a control
+  // character is refused here (the value is never echoed). A label already on disk is not dropped by the reader:
+  // the heartbeat flattens it when it prints (heartbeat-line.ts).
+  if (typeof rawBody.label === 'string' && breaksLine(rawBody.label)) {
+    return { status: 400, payload: { error: 'Invalid plan: the label must be a single line, without control characters' } }
+  }
+  const rawId = typeof rawBody.id === 'string' ? rawBody.id.trim() : ''
+  const { candidate, pendingToken } = prepareTokenCandidate(rawBody, rawId)
+
+  const plan = validatePlan(candidate, homedir())
+  if (!plan) {
+    return {
+      status: 400,
+      payload: {
+        error: 'Invalid plan: id (letters/digits/_.- only), label, exactly one of configDir (safe absolute or ~-prefixed path, no traversal/spaces) or token (raw claude setup-token output), planType (personal|team) and channelsAllowed (boolean) are all required',
+      },
+    }
+  }
+
+  const current = readClaudePlans()
+  if (current.some((p) => p.id === plan.id)) {
+    return { status: 409, payload: { error: `Plan id already exists: ${plan.id}` } }
+  }
+  if (pendingToken) {
+    const otherId = findPlanWithSameToken(current, plan.id, pendingToken.value)
+    if (otherId) return { status: 409, payload: { error: DUPLICATE_TOKEN_ERROR(otherId) } }
+  }
+
+  // Vault write happens only now, after every rejection check has already
+  // passed -- see prepareTokenCandidate's header.
+  if (pendingToken) setSecret(pendingToken.secretId, pendingToken.label, pendingToken.value)
+  writeClaudePlans([...current, plan])
+  logger.info({ id: plan.id, mode: plan.tokenSecretId ? 'token' : 'configDir' }, 'Claude plan created')
+  return { status: 201, payload: plan }
+}
+
+// PLANROTATEDEADLOCK1115 P2: the rotation itself, for both callers: the route below (after its request-shape checks)
+// and, next, the backend timer. Same guardrails and the same restart as the route always had; the answer is the
+// status and body the route sends.
+export async function rotatePlan(input: { agentId: string; targetPlanId: string; continue: boolean }): Promise<{ status: number; payload: Record<string, unknown> }> {
+  const { agentId, targetPlanId } = input
+  const wantContinue = input.continue
+
+  if (!isRotationEnabled()) {
+    return { status: 409, payload: { error: 'Rotation is disabled (CLAUDE_ROTATION_ENABLED=0)' } }
+  }
+
+  const plans = readClaudePlans()
+  const target = plans.find((p) => p.id === targetPlanId)
+  if (!target) {
+    return { status: 400, payload: { error: `Unknown target plan id: ${targetPlanId}` } }
+  }
+  // Guardrail from design decision #5: a plan not marked channelsAllowed is
+  // not a rotation candidate, whatever the caller asks for.
+  if (!target.channelsAllowed) {
+    return { status: 400, payload: { error: `Plan ${targetPlanId} does not allow channels use (channelsAllowed=false)` } }
+  }
+
+  if (agentId === MAIN_AGENT_ID) {
+    // Design 6.2: rotation is only meaningful on the isolated-config path,
+    // and only once 2+ plans exist -- otherwise there is nothing to
+    // resolve a "rotated" configDir against (agent-process.js:
+    // resolveMainAgentRotatedConfigDir has the same gate, so a stale state
+    // entry can never silently take effect if the operator turns isolation
+    // back off or drops to one plan).
+    if (!isMainAgentIsolated() || plans.length < 2) {
+      return { status: 409, payload: {
+        error: 'Rotation not applicable: main agent needs MAIN_AGENT_ISOLATED_CONFIG=1 and at least 2 registered plans',
+      } }
+    }
+
+    // 8c338dc4: decided BEFORE anything is written, so a refused continue leaves the plan and the
+    // session untouched and the caller can still ask for the plain (fresh) rotation.
+    if (wantContinue) {
+      const verdict = mainRotationContinueVerdict({
+        explicitDir: resolveMainAgentConfigDir(),
+        activeRotatedDir: resolveMainAgentRotatedConfigDir(),
+        activeIsTokenPlan: resolveMainAgentRotatedTokenSecretId() !== null,
+        fleetToken: hasFleetOauthToken(),
+        targetConfigDir: target.configDir ?? null,
+        sharedDir: mainAgentSharedConfigDir(),
+        projectRoot: PROJECT_ROOT,
+      })
+      if (!verdict.ok) {
+        return { status: 409, payload: { error: `continue is not possible: ${verdict.reason}` } }
+      }
+    }
+
+    // Record the decision BEFORE restarting: the next launch resolves its
+    // CLAUDE_CONFIG_DIR by reading this file back
+    // (main-agent-isolated-config.mjs -> resolveMainAgentRotatedConfigDir),
+    // so the state has to be on disk before the process that will read it
+    // comes up.
+    writeClaudePlansState(applyRotation(readClaudePlansState(), MAIN_AGENT_ID, targetPlanId))
+
+    // The default stays the fresh restart; only "continue": true takes the --continue path, and only
+    // that path adds "mode" to the response (continue, or fresh-fallback when the resume failed).
+    let mode: ContinueRestartResult['mode'] | null = null
+    if (wantContinue) {
+      const restarted = await restartMainForRotationContinue()
+      if (!restarted.ok) {
+        return { status: 500, payload: { error: restarted.error } }
+      }
+      mode = restarted.mode
+    } else {
+      const result = hardRestartMarveenChannels()
+      if (!result.ok) {
+        return { status: 500, payload: { error: result.error || 'Main agent restart failed' } }
+      }
+    }
+    logger.info({ agentId, targetPlanId, ...(mode ? { mode } : {}) }, 'Claude plan rotation: main agent restarted')
+
+    // Fleet leg (opt-in, CLAUDE_ROTATION_FLEET): the shared fleet token and
+    // the sub-agents on it follow the main agent. Deliberately NOT awaited:
+    // the restarts are sequential with a gap (a minute or more on a big
+    // fleet), and the usual caller -- the main agent's own heartbeat turn --
+    // is being restarted by this very request. runFleetLeg never throws; it
+    // records its outcome in the state side-car (fleet), and the next
+    // heartbeat tick prints that once for the Telegram report.
+    // Imported lazily: the wiring pulls in the agent registry/launcher
+    // helpers, which installs with the opt-in off never need to load here.
+    const fleetOn = isFleetRotationEnabled()
+    if (fleetOn) {
+      void import('../claude-plan-fleet-wiring.js')
+        .then(({ runFleetLeg }) => runFleetLeg(target))
+        .catch((err) => logger.error({ err: err instanceof Error ? err.name : 'error' }, 'Claude plan rotation: fleet leg failed to load'))
+    }
+    return { status: 200, payload: { ok: true, agentId, activePlanId: targetPlanId, fleet: fleetOn ? 'started' : 'off', ...(mode ? { mode } : {}) } }
+  }
+
+  // 8c338dc4: a sub-agent's restart keeps its own --continue rule (restartAgentProcess); a
+  // "continue" asked for here could not be honoured as asked, so it is refused, not ignored.
+  if (wantContinue) {
+    return { status: 400, payload: { error: 'continue applies to the main agent only' } }
+  }
+
+  // Sub-agent path: point its claudePlan field at the target and restart it
+  // through the same primitive the dashboard's own restart button uses --
+  // no separate sub-agent rotation mechanism to keep in sync.
+  if (!existsSync(agentDir(agentId))) {
+    return { status: 404, payload: { error: `Agent not found: ${agentId}` } }
+  }
+  // SUBPLANTOKEN1110: a token plan is checked BEFORE anything is written --
+  // the agent can take a plan token at all, and the secret is in the vault.
+  // A refusal is a 4xx and the agent's claudePlan field stays as it was.
+  if (target.tokenSecretId) {
+    const pre = planTokenPreflight(agentId, target.tokenSecretId)
+    if (pre.kind === 'refuse') {
+      return { status: 409, payload: { error: `Plan ${targetPlanId} cannot be used by ${agentId}: ${pre.reason}` } }
+    }
+  }
+  // Agent config first: if it refuses (corrupt file, JSONCLOBBER926) the
+  // rotation side-car must not already claim the switch happened.
+  writeAgentClaudePlan(agentId, targetPlanId)
+  writeClaudePlansState(applyRotation(readClaudePlansState(), agentId, targetPlanId))
+  // RESTARTWAKE927: the plan switch restarts a pane that may be mid-turn.
+  const restartAt = Date.now()
+  const result = await restartAgentProcess(agentId, { wake: { reason: 'plan-switch' } })
+  if (!result.ok) {
+    return { status: 500, payload: { error: result.error || `Restart failed for agent ${agentId}` } }
+  }
+  logger.info({ agentId, targetPlanId }, 'Claude plan rotation: agent restarted')
+  if (target.tokenSecretId) {
+    // The answer is what the restarted launch actually did, read back from the
+    // helper's status file -- not the field just written. Only 'plan-token'
+    // means the plan's own token reached the launch env.
+    const launch = await waitPlanTokenOutcome(agentId, restartAt)
+    const launchAuth = launch && launch.at >= restartAt ? launch.state : 'unknown'
+    if (launchAuth !== 'plan-token') {
+      logger.error({ agentId, targetPlanId, launchAuth, reason: launch?.reason }, 'Claude plan rotation: the restarted agent is NOT on the plan token')
+      return { status: 502, payload: { error: `Agent ${agentId} restarted, but not on the plan token (${launchAuth})`, agentId, activePlanId: targetPlanId, launchAuth, ...(launch?.reason ? { reason: launch.reason } : {}) } }
+    }
+    return { status: 200, payload: { ok: true, agentId, activePlanId: targetPlanId, launchAuth } }
+  }
+  return { status: 200, payload: { ok: true, agentId, activePlanId: targetPlanId } }
+}
+
+export async function tryHandleClaudePlans(ctx: RouteContext): Promise<boolean> {
+  const { req, res, path, method } = ctx
+
+  // Resolved + validated registry. Feeds the per-agent plan dropdown; empty
+  // array when no registry file exists (opt-in feature).
+  if (path === '/api/claude-plans' && method === 'GET') {
+    json(res, readClaudePlans())
+    return true
+  }
+
+  // Create a new plan.
+  if (path === '/api/claude-plans' && method === 'POST') {
+    // OWNERGATE2-1104: writes a new plan into store/claude-plans.json and its token into the vault, which decides
+    // which Claude subscription agents run on. The gate sits here, not in commitNewPlan (the login flow has its own).
+    if (!mayActAsOwner(ctx.auth, req)) {
+      refuseOwner(res, 'Adding a Claude plan needs the dashboard login (an owner session).')
+      return true
+    }
+    let body: unknown
+    try {
+      body = JSON.parse((await readBody(req)).toString())
+    } catch {
+      json(res, { error: 'Invalid JSON' }, 400)
+      return true
+    }
+
+    const rawBody = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>
+    const out = commitNewPlan(rawBody)
+    json(res, out.payload, out.status)
+    return true
+  }
+
+  // Rotation telemetry side-car (store/claude-plans-state.json). An honest
+  // empty state ({activePlanByAgent:{}, plans:{}}) when nothing has rotated
+  // yet, rather than 404ing, so the dashboard cards can render "no rotation
+  // data yet" instead of treating the endpoint itself as missing. Checked
+  // before the :id matcher below so a plan literally named "state" can never
+  // shadow this route.
+  if (path === '/api/claude-plans/state' && method === 'GET') {
+    json(res, readClaudePlansState())
+    return true
+  }
+
+  // Why rotation would stay inert right now (rotation off, main agent not
+  // isolated, too few channels plans, heartbeat task missing/disabled). Read
+  // by the Settings "Claude plans" warning banner. Before the :id matcher for
+  // the same reason as .../state above.
+  if (path === '/api/claude-plans/readiness' && method === 'GET') {
+    json(res, rotationReadiness())
+    return true
+  }
+
+  // Trigger a rotation for one agent (PR2c, design 6.5/5). Body:
+  // { agentId?: string, targetPlanId: string }. agentId defaults to the main
+  // channels agent -- the only caller today is the heartbeat script, and a
+  // manual dashboard button (not yet built) would default the same way.
+  //
+  // This is ALSO how an agent's very first plan assignment happens: there is
+  // no separate "bootstrap" endpoint. applyRotation() just adds an entry when
+  // none existed (design 6.5/4's open bootstrap question -- resolved this
+  // way because a first assignment and a later rotation are the same
+  // operation: "agentId is now on targetPlanId").
+  if (path === '/api/claude-plans/rotate' && method === 'POST') {
+    let body: unknown
+    try {
+      body = JSON.parse((await readBody(req)).toString())
+    } catch {
+      json(res, { error: 'Invalid JSON' }, 400)
+      return true
+    }
+    const b = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>
+    const agentId = typeof b.agentId === 'string' && b.agentId.trim() ? b.agentId.trim() : MAIN_AGENT_ID
+    const targetPlanId = typeof b.targetPlanId === 'string' ? b.targetPlanId.trim() : ''
+    if (!targetPlanId) {
+      json(res, { error: 'targetPlanId is required' }, 400)
+      return true
+    }
+    // 8c338dc4: "continue": true restarts the main agent with --continue (same conversation, new
+    // plan). Only a real JSON boolean counts: a "true" string would otherwise fall back to the fresh
+    // restart without telling the caller.
+    if (b.continue !== undefined && typeof b.continue !== 'boolean') {
+      json(res, { error: 'continue must be a JSON boolean' }, 400)
+      return true
+    }
+    const wantContinue = b.continue === true
+
+    // PLANROTATEDEADLOCK1115 P3: the same lock as the backend tick, so a manual rotation and a tick never interleave.
+    const r = await withRotationLock(() => rotatePlan({ agentId, targetPlanId, continue: wantContinue }))
+    json(res, r.payload, r.status)
+    return true
+  }
+
+  // Live usage probe for one plan ("Check now" in Settings -> Claude plans).
+  // Reads the plan's own token from the vault, makes one minimal Messages API
+  // call with it (src/claude-plan-usage-probe.ts), records the unified
+  // rate-limit headers into the state side-car as that plan's observation,
+  // and returns the parsed usage. The token itself never leaves this handler:
+  // not in the response, not in a log line, not in an error.
+  //
+  // Token-mode plans only. A configDir-mode plan's credential lives in that
+  // dir's .credentials.json (Linux) or the host Keychain (macOS, keyed per
+  // host login, not per dir) -- the codebase deliberately never reads the
+  // former (claude-credentials-guard.ts only ever renames it out of the way),
+  // and the latter would report the HOST login's usage, not this plan's. So
+  // there is no honest way to probe one: 422 rather than a wrong answer.
+  const probeMatch = path.match(/^\/api\/claude-plans\/([^/]+)\/probe$/)
+  if (probeMatch && method === 'POST') {
+    const planId = decodeURIComponent(probeMatch[1])
+    const target = readClaudePlans().find((p) => p.id === planId)
+    if (!target) {
+      json(res, { error: 'Not found' }, 404)
+      return true
+    }
+    if (!target.tokenSecretId) {
+      json(res, { error: 'probe needs a token-mode plan' }, 422)
+      return true
+    }
+    // Every probe is a real Messages API call on this plan's own subscription,
+    // so it spends that quota. A stuck client loop or a double click must not
+    // burn it: at most one probe per plan per MANUAL_PROBE_MIN_INTERVAL_MS, measured
+    // from the last recorded probe (ok or not). Inside the window: 429 with
+    // the observation we already have, and no network call.
+    const priorObserved = readClaudePlansState().plans[planId]
+    const lastProbeAt = priorObserved?.lastProbe?.at
+    if (typeof lastProbeAt === 'number') {
+      const waitMs = lastProbeAt + MANUAL_PROBE_MIN_INTERVAL_MS - Date.now()
+      if (waitMs > 0) {
+        json(res, {
+          planId,
+          error: 'probe_throttled',
+          retryAfterSec: Math.ceil(waitMs / 1000),
+          observed: priorObserved,
+        }, 429)
+        return true
+      }
+    }
+    let token: string | null = null
+    try { token = getSecret(target.tokenSecretId) } catch { token = null }
+    if (!token) {
+      // Deliberately NO fleet-token fallback (unlike resolve-plan-token-env's
+      // launch path): probing the fleet token would report someone else's
+      // usage under this plan's name.
+      json(res, { error: 'Token for this plan is missing from the vault' }, 409)
+      return true
+    }
+
+    const result = await probePlanUsage(token)
+    token = null
+    const nowMs = Date.now()
+    // Re-read the state AFTER the (network-bound) probe, right before the
+    // write, to keep the read-modify-write window as short as possible.
+    const state = readClaudePlansState()
+    const observed = observationFromProbe(result, state.plans[planId], nowMs)
+    writeClaudePlansState(recordPlanObservation(state, planId, observed))
+
+    const usage = usageFromProbe(result)
+    logger.info(
+      { id: planId, caller: ctx.auth?.kind ?? 'none', ok: result.ok, error: result.ok ? undefined : result.error, httpStatus: result.httpStatus },
+      'Claude plan usage probed',
+    )
+    const payload = {
+      planId,
+      checkedAt: nowMs,
+      ok: result.ok,
+      ...(result.ok ? {} : { error: result.error, message: result.message }),
+      ...(result.httpStatus !== undefined ? { httpStatus: result.httpStatus } : {}),
+      usage,
+      observed,
+    }
+    // Upstream failures that yielded no usage at all are a 502 (the dashboard
+    // itself is fine; the thing it asked is not). A 429 that still carried
+    // the headers IS a successful measurement ("exhausted until X") -> 200.
+    json(res, payload, usage ? 200 : 502)
+    return true
+  }
+
+  const idMatch = path.match(/^\/api\/claude-plans\/([^/]+)$/)
+
+  // Replace an existing plan's fields. The id in the URL is authoritative --
+  // a differing id in the body is discarded, so this can never rename a plan
+  // into colliding with a different existing entry.
+  if (idMatch && method === 'PUT') {
+    // OWNERGATE2-1104: rewrites a plan in store/claude-plans.json (its configDir or token, the credential agents
+    // on that plan run with) and the vault, so it is owner-only.
+    if (!mayActAsOwner(ctx.auth, req)) {
+      refuseOwner(res, 'Changing a Claude plan needs the dashboard login (an owner session).')
+      return true
+    }
+    let body: unknown
+    try {
+      body = JSON.parse((await readBody(req)).toString())
+    } catch {
+      json(res, { error: 'Invalid JSON' }, 400)
+      return true
+    }
+
+    const current = readClaudePlans()
+    const idx = current.findIndex((p) => p.id === idMatch[1])
+    if (idx === -1) {
+      json(res, { error: 'Not found' }, 404)
+      return true
+    }
+
+    const rawBody = { ...(body && typeof body === 'object' ? body : {}), id: idMatch[1] } as Record<string, unknown>
+    if (hasAmbiguousTokenField(rawBody)) {
+      json(res, { error: 'Invalid plan: token cannot be combined with configDir or tokenSecretId' }, 400)
+      return true
+    }
+    // K1: the same single-line rule as a new plan (commitNewPlan).
+    if (typeof rawBody.label === 'string' && breaksLine(rawBody.label)) {
+      json(res, { error: 'Invalid plan: the label must be a single line, without control characters' }, 400)
+      return true
+    }
+    const { candidate, pendingToken } = prepareTokenCandidate(rawBody, idMatch[1])
+    const plan = validatePlan(candidate, homedir())
+    if (!plan) {
+      // Vault untouched -- an invalid PUT (even one carrying a fresh raw
+      // token) never writes or deletes anything, so this plan's existing
+      // token-mode secret (if any) survives exactly as it was.
+      json(res, {
+        error: 'Invalid plan: label, exactly one of configDir (safe absolute or ~-prefixed path, no traversal/spaces) or token (raw claude setup-token output), planType (personal|team) and channelsAllowed (boolean) are all required',
+      }, 400)
+      return true
+    }
+
+    // Last rejection check, still before any vault write (see
+    // prepareTokenCandidate's header): the same token under a different plan.
+    if (pendingToken) {
+      const otherId = findPlanWithSameToken(current, idMatch[1], pendingToken.value)
+      if (otherId) {
+        json(res, { error: DUPLICATE_TOKEN_ERROR(otherId) }, 409)
+        return true
+      }
+    }
+
+    // Vault write happens only now, after validation succeeded. For an
+    // existing token-mode plan this overwrites the SAME derived id in place
+    // (setSecret upserts), which is why the orphan-check below compares
+    // against plan.tokenSecretId rather than skipping when pendingToken is set.
+    if (pendingToken) setSecret(pendingToken.secretId, pendingToken.label, pendingToken.value)
+
+    // Switching a plan OUT of token-mode (or dropping it via a PUT that omits
+    // `token`) must not orphan the old secret -- the vault-hygiene guarantee
+    // the SSH-key store already gives (docs/vault.md).
+    const previousTokenSecretId = current[idx].tokenSecretId
+    if (previousTokenSecretId && previousTokenSecretId !== plan.tokenSecretId) {
+      deleteOwnTokenSecret(idMatch[1], previousTokenSecretId)
+    }
+
+    const next = [...current]
+    next[idx] = plan
+    writeClaudePlans(next)
+    logger.info({ id: plan.id, mode: plan.tokenSecretId ? 'token' : 'configDir' }, 'Claude plan updated')
+    json(res, plan)
+    return true
+  }
+
+  // Remove a plan. An agent still pointing a claudePlan field at this id
+  // simply starts reporting planUnresolved afterwards (resolveAgentConfigDir
+  // already handles that) -- deleting here does not touch any agent config.
+  if (idMatch && method === 'DELETE') {
+    // OWNERGATE2-1104: removes a plan from store/claude-plans.json and its token from the vault; agents on it lose
+    // their credential, so it is owner-only.
+    if (!mayActAsOwner(ctx.auth, req)) {
+      refuseOwner(res, 'Removing a Claude plan needs the dashboard login (an owner session).')
+      return true
+    }
+    const current = readClaudePlans()
+    const removed = current.find((p) => p.id === idMatch[1])
+    const next = current.filter((p) => p.id !== idMatch[1])
+    if (next.length === current.length) {
+      json(res, { error: 'Not found' }, 404)
+      return true
+    }
+
+    if (removed) deleteOwnTokenSecret(removed.id, removed.tokenSecretId)
+    writeClaudePlans(next)
+    logger.info({ id: idMatch[1] }, 'Claude plan deleted')
+    json(res, { ok: true })
+    return true
+  }
+
+  return false
+}

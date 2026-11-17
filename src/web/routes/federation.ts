@@ -17,7 +17,7 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { PROJECT_ROOT, MAIN_AGENT_ID, BOT_NAME } from '../../config.js'
-import { createAgentMessage, failPendingFederatedMessages } from '../../db.js'
+import { createAgentMessage, failPendingFederatedMessages, closeOutboundByFederatedReceipt, COMPLETION_REPORT_PREFIX } from '../../db.js'
 import { logger } from '../../logger.js'
 import { readBody, json, RequestBodyTooLargeError } from '../http-helpers.js'
 import { isKnownAgent, readAgentDisplayName, readAgentModel } from '../agent-config.js'
@@ -25,6 +25,7 @@ import { parseQualifiedId, isValidIdSegment, formatQualifiedId } from '../federa
 import { catalogAgentNames, listAgentLocalSkills } from '../federation/local-catalog.js'
 import { containsPrivateData, getCapabilitySummary, mainAgentCapabilitySummary, purgeCapabilityCache } from '../federation/capabilities.js'
 import { getEffectiveSettingValue } from '../../settings-store.js'
+import { agentFacingLang } from '../agent-text-lang.js'
 import {
   getFederationConfig,
   federationFileHealth,
@@ -48,6 +49,9 @@ import { resetPeerBackoff } from '../federation/bridge.js'
 import { getFederationStatus, refreshFederationStatus, resetFederationPollerCache } from '../federation/poller.js'
 import { ensureFederationClaudeMdSection } from '../federation/onboarding.js'
 import { hardRestartMarveenChannels } from '../channel-monitor.js'
+import { gateManualRestart, MANUAL_RESTART_FORCE_HINT, wantsForceRestart } from '../manual-restart-gate.js'
+import { MAIN_CHANNELS_SESSION } from '../main-agent.js'
+import { mayActAsOwner, OWNER_SESSION_REQUIRED, refuseOwner } from './auth.js'
 import type { RouteContext } from './types.js'
 
 export const FEDERATION_VERSION = 1
@@ -185,12 +189,9 @@ export function validateInboxPayload(
 // (Skill/agent enumeration lives in federation/local-catalog.ts, shared with
 // the capability-summary runner and the routing directory.)
 
+// PERSONAESC1107: AGENT_TEXT_LANG when set, else DASHBOARD_LANG as before (agent-text-lang.ts agentFacingLang).
 function resolveLang(): 'hu' | 'en' {
-  try {
-    return getEffectiveSettingValue('DASHBOARD_LANG') === 'en' ? 'en' : 'hu'
-  } catch {
-    return 'hu'
-  }
+  return agentFacingLang(() => getEffectiveSettingValue('DASHBOARD_LANG'))
 }
 
 /** Outbound free-text chokepoint: drop the FIELD (never the agent) when a
@@ -288,6 +289,66 @@ function refuseIfConfigUnhealthy(res: RouteContext['res']): boolean {
   return false
 }
 
+// DEVKEYFOLLOW1022: a peer's inbound token admits a REMOTE system into our inbox,
+// so adding a peer, writing the full document (it carries the inbound tokens),
+// rotating and revealing a token, editing a peer (it re-points its outbound
+// token) and switching federation on are credential issuance, the same as a device
+// key (routes/auth.ts, DEVKEYMINT1022): they take the owner's session, also before
+// the first dashboard login exists (OWNERGATE4-1104: refuseOwner then answers
+// setup_required). On the machine itself store/federation.json stays editable.
+const FED_OWNER_SESSION_REQUIRED = {
+  ...OWNER_SESSION_REQUIRED,
+  error: 'Adding a peer or issuing, rotating or revealing its inbound token needs the dashboard login (an owner session). On the machine itself, store/federation.json stays editable.',
+}
+
+function refuseUnlessOwner(ctx: RouteContext): boolean {
+  if (mayActAsOwner(ctx.auth, ctx.req)) return false
+  logger.warn({ fed: true, path: ctx.path, method: ctx.method, kind: ctx.auth?.kind }, 'federation: credential issuance refused (owner session required)')
+  refuseOwner(ctx.res, FED_OWNER_SESSION_REQUIRED.error)
+  return true
+}
+
+// ---- completion receipt from a peer -------------------------------------------
+
+/**
+ * A peer's completion receipt ("[Eredmény] msg_id:<our id> status:<done|failed>", written by
+ * routes/messages.ts federatedReceipt on the PEER's side) names the row WE sent it. Before
+ * this, the receipt arrived as an ordinary inbound message and our own outbound row stayed
+ * `delivered` forever (measured 2026-11-01: msg 773 to kitti/kitti, receipt 774 arrived,
+ * 773 still delivered). Now the receipt also closes that row.
+ *
+ * Strict on purpose: only the exact header line the receipt builder writes, a numeric id
+ * (our ids are integers; "ismeretlen" -- the peer had no ref -- closes nothing), and only
+ * done/failed. `result` is the body after the blank line; it is NOT written to our row
+ * (closeOutboundByFederatedReceipt stores only a pointer to the receipt message).
+ */
+const RECEIPT_HEADER_RE = /^\[Eredmény\] msg_id:(\d{1,15}) status:(done|failed)$/
+
+export function parseFederatedReceipt(content: string): { id: number; status: 'done' | 'failed'; result: string } | null {
+  if (!content.startsWith(COMPLETION_REPORT_PREFIX)) return null
+  const nl = content.indexOf('\n')
+  const header = nl === -1 ? content : content.slice(0, nl)
+  const m = RECEIPT_HEADER_RE.exec(header)
+  if (!m) return null
+  const id = Number(m[1])
+  if (!Number.isSafeInteger(id) || id <= 0) return null
+  const result = nl === -1 ? '' : content.slice(nl + 1).replace(/^\n/, '')
+  return { id, status: m[2] as 'done' | 'failed', result }
+}
+
+/**
+ * Close our outbound row a peer's receipt names. Only for a PEER-AUTHENTICATED caller: a
+ * dashboard-token smoke test has no peer, so it cannot close anything. The DB write itself
+ * checks that the row was sent to THIS peer (closeOutboundByFederatedReceipt), so a peer
+ * cannot close a message we sent someone else by naming its id.
+ */
+export function applyFederatedReceipt(callerPeerId: string | null, content: string, receiptMessageId: number): number | null {
+  if (callerPeerId === null) return null
+  const r = parseFederatedReceipt(content)
+  if (!r) return null
+  return closeOutboundByFederatedReceipt(r.id, callerPeerId, r.status, receiptMessageId) ? r.id : null
+}
+
 // ---- route handler ------------------------------------------------------------
 
 export async function tryHandleFederation(ctx: RouteContext): Promise<boolean> {
@@ -349,9 +410,19 @@ export async function tryHandleFederation(ctx: RouteContext): Promise<boolean> {
     // Content is stored VERBATIM: normalizeKanbanRefs must not run here -- it
     // would rewrite the PEER's #hex card refs against the LOCAL board
     // (content corruption + a card-id oracle for the peer).
-    const msg = createAgentMessage(verdict.from, verdict.to, verdict.content)
+    // The ref is kept ONLY for a peer-authenticated caller, like the dedup key: it is what
+    // the completion receipt names back to that peer (routes/messages.ts federatedReceipt),
+    // and a dashboard-token smoke test has no peer for it to mean anything to.
+    const msg = createAgentMessage(verdict.from, verdict.to, verdict.content, null, null,
+      { remoteRef: callerPeerId !== null ? verdict.ref : null })
     if (callerPeerId !== null && verdict.ref !== null) rememberRef(`${callerPeerId}:${verdict.ref}`, msg.id)
     logger.info({ fedIn: true, callerPeer: callerPeerId, id: msg.id, from: verdict.from, to: verdict.to, ref: verdict.ref }, 'federation inbox: message accepted')
+    // The receipt is still delivered as a message (the agent reads the result there); this
+    // only moves our own outbound row out of `delivered`.
+    const closedOutbound = applyFederatedReceipt(callerPeerId, verdict.content, msg.id)
+    if (closedOutbound !== null) {
+      logger.info({ fedIn: true, callerPeer: callerPeerId, id: msg.id, closedOutbound }, 'federation inbox: completion receipt closed our outbound row')
+    }
     json(res, { id: msg.id, ref: verdict.ref }, 202)
     return true
   }
@@ -451,6 +522,14 @@ export async function tryHandleFederation(ctx: RouteContext): Promise<boolean> {
   // not be loaded on the Federation page, which would 404 the generic
   // /api/agents/:name/restart path). Dashboard-token only (not a wire endpoint).
   if (path === '/api/federation/apply' && method === 'POST') {
+    // FEDAPPLYGATE1018: the apply is a manual main restart too, so it takes the same gate as
+    // /api/marveen/restart: a busy or unreadable pane refuses (409), an explicit {"force": true} cuts the turn.
+    const force = wantsForceRestart(await readBody(ctx.req))
+    if (force) logger.warn({ route: '/api/federation/apply' }, 'manual main restart forced past the pane gate')
+    if (!force) {
+      const gate = await gateManualRestart(MAIN_CHANNELS_SESSION)
+      if (!gate.allow) { json(res, { error: 'restart-blocked', reason: gate.reason, hint: MANUAL_RESTART_FORCE_HINT }, 409); return true }
+    }
     const r = hardRestartMarveenChannels()
     if (r.ok) { json(res, { ok: true }); return true }
     json(res, { error: r.error || 'Restart failed' }, 500)
@@ -461,6 +540,7 @@ export async function tryHandleFederation(ctx: RouteContext): Promise<boolean> {
   // endpoints below; this stays as the scriptable primitive. Requires
   // explicit inboundTokens (it does not mint).
   if (path === '/api/federation/peers' && method === 'PUT') {
+    if (refuseUnlessOwner(ctx)) return true
     const payload = await readJsonBody(ctx)
     if (isErr(payload)) return true
     const validated = validateFederationConfig(payload)
@@ -521,6 +601,11 @@ export async function tryHandleFederation(ctx: RouteContext): Promise<boolean> {
     const payload = await readJsonBody(ctx)
     if (isErr(payload)) return true
     const enabled = payload !== null && typeof payload === 'object' && (payload as Record<string, unknown>).enabled === true
+    // Switching ON admits the paired peers and starts sending our outbound
+    // tokens: the owner's session once a login exists (Marveen, #2175 review).
+    // Switching OFF only takes away, so it stays open; telling the two apart
+    // needs the (small, capped) body, hence the gate after the read.
+    if (enabled && refuseUnlessOwner(ctx)) return true
     const flipped = setFederationEnabledPreservingFile(enabled)
     if (!flipped) { json(res, { error: 'federation.json failed validation -- federation stays disabled; fix or remove the file' }, 409); return true }
     if (!enabled) {
@@ -557,6 +642,7 @@ export async function tryHandleFederation(ctx: RouteContext): Promise<boolean> {
   // Add a peer: the server MINTS the inbound token and returns it ONCE in
   // the creation response (and later via the reveal endpoint).
   if (path === '/api/federation/peers' && method === 'POST') {
+    if (refuseUnlessOwner(ctx)) return true
     const payload = await readJsonBody(ctx)
     if (isErr(payload)) return true
     if (payload === null || typeof payload !== 'object') { json(res, { error: 'Body must be a JSON object' }, 400); return true }
@@ -615,6 +701,11 @@ export async function tryHandleFederation(ctx: RouteContext): Promise<boolean> {
     if (refuseIfConfigUnhealthy(res)) return true
 
     if (method === 'PATCH') {
+      // A new baseUrl sends this peer's outbound token (poller manifest call,
+      // bridge inbox) and our outbound messages to that host, and
+      // shareCapabilitySummaries ships our summaries: re-pointing an existing
+      // credential is issuance too (Samu, #2175 review). DELETE stays open.
+      if (refuseUnlessOwner(ctx)) return true
       const payload = await readJsonBody(ctx)
       if (isErr(payload)) return true
       if (payload === null || typeof payload !== 'object') { json(res, { error: 'Body must be a JSON object' }, 400); return true }
@@ -676,6 +767,7 @@ export async function tryHandleFederation(ctx: RouteContext): Promise<boolean> {
 
   const revealMatch = path.match(/^\/api\/federation\/peers\/([^/]+)\/inbound-token$/)
   if (revealMatch && method === 'GET') {
+    if (refuseUnlessOwner(ctx)) return true
     const id = decodeURIComponent(revealMatch[1]).toLowerCase()
     if (!isValidIdSegment(id)) { json(res, { error: 'invalid peer id' }, 400); return true }
     const peer = getFederationConfig().peers.find((p) => p.id === id)
@@ -690,6 +782,7 @@ export async function tryHandleFederation(ctx: RouteContext): Promise<boolean> {
 
   const rotateMatch = path.match(/^\/api\/federation\/peers\/([^/]+)\/rotate-inbound-token$/)
   if (rotateMatch && method === 'POST') {
+    if (refuseUnlessOwner(ctx)) return true
     const id = decodeURIComponent(rotateMatch[1]).toLowerCase()
     if (!isValidIdSegment(id)) { json(res, { error: 'invalid peer id' }, 400); return true }
     if (refuseIfConfigUnhealthy(res)) return true

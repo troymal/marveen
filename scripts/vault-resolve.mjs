@@ -1,31 +1,182 @@
 #!/usr/bin/env node
 // Resolve vault secret IDs to plaintext values.
 // Reads "ENV_VAR=secret_id" lines from stdin, outputs "ENV_VAR=value" lines.
+//
+// VAULTNEMA912: this script used to close THREE different worlds with the
+// same observable outcome -- exit 0 and empty stdout: a correct call, an
+// unknown label, and a malformed line (no '='). A caller could not tell them
+// apart, and one real round concluded from the silence that "the vault gives
+// no output" and reported a nonexistent outage (Orsi, community-watch #261).
+// Failures are loud now, and the worlds stay distinguishable:
+//   exit 0  every line resolved; stdout carries ENV_VAR=value lines, nothing
+//           is ever logged on the success path
+//   exit 2  at least one malformed input line (missing '=') -- the CALLER's
+//           bug; the offending line is echoed to stderr (caller-provided
+//           text, never vault content)
+//   exit 3  at least one label had no secret -- stderr names the LABEL only,
+//           NEVER the value of any secret
+// Malformed input takes precedence over missing labels in the exit code.
+// Resolved lines are still printed even when another line fails, so a
+// multi-secret caller sees every problem in one run.
+//
+// VAULTRESOLVECASE1105 (2026-11-06): two more silent-empty paths, both measured.
+//   - `node vault-resolve.mjs <ID>` (an id as an ARGUMENT) read an empty stdin and exited 0 with no output, and one
+//     skill recipe calls it that way. Arguments are now refused (exit 2), except the new single-value form below.
+//   - The pipe recipe `... | node vault-resolve.mjs | cut -d= -f2-` reports cut's exit code, so a missing label
+//     became an EMPTY string with exit 0 in the caller. That is how an empty root password reached an SSH login
+//     (srv2127946, 2026-11-05: two "Failed password", half an hour of a false lock-out alarm). This script cannot fix
+//     a caller's pipeline; it offers a form that needs none:
+//       P="$(node vault-resolve.mjs --value <ID>)" || exit 1
+//     prints the raw value only (no ENV_VAR= prefix, no newline added), and the exit code reaches the caller:
+//       exit 3  no secret for the label   exit 4  refused   exit 6  the label holds an EMPTY value
+//     An empty value is refused in this form: an empty password or token is never what the caller wants.
+//   - An empty input (no line at all) is exit 2 now; in the line form an empty value still prints (old callers),
+//     with a warning on stderr naming the label.
+//   The lookup stays case-sensitive: the vault ACL decides per exact id.
 import { createRequire } from 'node:module'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { resolveInBatches, vaultAclMode, dashboardConfigured } from './vault-dashboard-client.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const projectRoot = join(__dirname, '..')
 
-// Dynamic import from compiled dist
-const { getSecret } = await import(join(projectRoot, 'dist', 'web', 'vault.js'))
+// stdout carries the ENV_VAR=value lines and nothing else (see above: "nothing is ever logged on the success path").
+// The vault module's logger writes to stdout, and on macOS without a GUI session (a LaunchDaemon) its Keychain
+// migration fails on every call and logs a warning -- which would end up in an environment variable. This process
+// only READS secrets, so it silences the logger and leaves the migration to the dashboard process. Both must be set
+// BEFORE the module is imported.
+// NOTE: this OVERRIDES an operator-set LOG_LEVEL for this short-lived process on purpose (stdout is the contract). Failures stay
+// visible on STDERR (the lines this script writes itself) and in the exit code; to debug the vault module, run it from a REPL or the
+// dashboard process, not through this script.
+process.env.LOG_LEVEL = 'silent'
+process.env.MARVEEN_VAULT_NO_KEYCHAIN_MIGRATION = '1'
 
-const input = await new Promise(resolve => {
-  let data = ''
-  process.stdin.setEncoding('utf-8')
-  process.stdin.on('data', chunk => { data += chunk })
-  process.stdin.on('end', () => resolve(data))
-})
+const argv = process.argv.slice(2)
+const VALUE_LABEL = /^[^\s=](?:[^\r\n=]*[^\s=])?$/
+let valueMode = false
+// VAULTWRAPMULTI1108: `--escaped` (stdin lines, as the default form): each value on ONE line, with backslash -> \\,
+// line feed -> \n, carriage return -> \r, so a multi-line secret (a PEM key) cannot split into lines that a line
+// reader would take for further ENV_VAR=value pairs. vault-env-wrapper.sh decodes it with printf '%b'. The default
+// form is unchanged for its other callers.
+let escapedMode = false
+const escapeValue = (v) => v.replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\r/g, '\\r')
+let input
+if (argv.length === 1 && argv[0] === '--escaped') {
+  escapedMode = true
+  argv.length = 0
+}
+if (argv.length > 0) {
+  // Exactly ONE label (Dani, #2563 review): no line break (it would make a second input line, and two values would
+  // come out glued together), no '=', and no whitespace at either end. A space INSIDE is allowed: vault ids may
+  // contain an inner space (POST /api/vault trims only the ends).
+  if (argv[0] === '--value' && argv.length === 2 && !VALUE_LABEL.test(argv[1])) {
+    // Not echoed: the argument could be a value pasted by mistake.
+    process.stderr.write(`vault-resolve: the --value label must be one line, without '=' and without whitespace at either end\n`)
+    process.exit(2)
+  }
+  if (argv[0] === '--value' && argv.length === 2) {
+    valueMode = true
+    input = `VALUE=${argv[1]}\n`
+  } else {
+    // The arguments are not echoed: one of them could be a value pasted by mistake.
+    process.stderr.write(`vault-resolve: takes ENV_VAR=secret_id lines on stdin (optionally with '--escaped'), or exactly '--value <secret_id>'; got ${argv.length} other argument(s)\n`)
+    process.exit(2)
+  }
+} else {
+  input = await new Promise(resolve => {
+    let data = ''
+    process.stdin.setEncoding('utf-8')
+    process.stdin.on('data', chunk => { data += chunk })
+    process.stdin.on('end', () => resolve(data))
+  })
+  if (!input.trim()) {
+    process.stderr.write(`vault-resolve: no input line; expected ENV_VAR=secret_id lines on stdin, or '--value <secret_id>'\n`)
+    process.exit(2)
+  }
+}
 
+let malformed = 0
+let refused = 0
+let missing = 0
+const valid = []
 for (const line of input.trim().split('\n')) {
   if (!line.trim()) continue
   const eq = line.indexOf('=')
-  if (eq < 0) continue
+  if (eq < 0) {
+    // The line is caller-provided text (an env var name and/or a label),
+    // never a vault value, so echoing it is safe and names the exact bug.
+    process.stderr.write(`vault-resolve: malformed line (no '='), expected ENV_VAR=secret_id: ${line}\n`)
+    malformed++
+    continue
+  }
   const envVar = line.slice(0, eq)
-  const secretId = line.slice(eq + 1)
-  const value = getSecret(secretId)
-  if (value !== null) {
-    process.stdout.write(`${envVar}=${value}\n`)
+  const secretId = line.slice(eq + 1).trim()
+  // VAULTSZELES826: SSH private keys are consumed only in-process by the SSH feature;
+  // this resolver never hands one out (same rule as isSshPrivateKeyId in vault-acl.ts).
+  if (secretId.startsWith('ssh-key-')) {
+    process.stderr.write(`vault-resolve: refused, SSH private keys are not resolvable here: ${secretId}\n`)
+    refused++
+    continue
+  }
+  // An empty or over-long id is never sent: it counts as missing, like an id the vault does not have.
+  valid.push({ envVar, secretId, unsendable: !secretId || secretId.length > 200 })
+}
+
+// The dashboard first (its vault log, its allowlist); the local vault module only when that cannot be used.
+const ids = [...new Set(valid.filter(v => !v.unsendable).map(v => v.secretId))]
+let fromDashboard = null
+if (ids.length > 0) {
+  const r = await resolveInBatches(projectRoot, ids)
+  if (r.ok) fromDashboard = r
+  else if (vaultAclMode(projectRoot) === 'enforce') {
+    process.stderr.write(`vault-resolve: the dashboard could not be reached (${r.error}); VAULT_ACL_MODE=enforce, nothing is resolved locally\n`)
+    process.exit(malformed > 0 ? 2 : 5)
+  } else if (r.configured) {
+    process.stderr.write(`vault-resolve: WARNING: the dashboard could not be reached (${r.error}); resolving locally, and this read is not in the dashboard's vault log\n`)
+  }
+} else if (valid.length > 0 && (vaultAclMode(projectRoot) === 'enforce' || dashboardConfigured(projectRoot))) {
+  // Only ids that cannot be sent: there is nothing to ask the dashboard. They count as missing, as in its answer; the
+  // local vault is asked only in audit mode without a dashboard token file (the path before the dashboard existed).
+  fromDashboard = { values: Object.create(null), missing: [], refused: [] }
+}
+
+let getSecret = null
+if (!fromDashboard && valid.length > 0) {
+  // Dynamic import from compiled dist
+  ;({ getSecret } = await import(join(projectRoot, 'dist', 'web', 'vault.js')))
+}
+
+for (const { envVar, secretId, unsendable } of valid) {
+  let value = null
+  if (fromDashboard) {
+    // an unsendable id was never sent: it counts as missing
+    const v = !unsendable && Object.prototype.hasOwnProperty.call(fromDashboard.values, secretId) ? fromDashboard.values[secretId] : null
+    if (typeof v === 'string') value = v
+    else if (!unsendable && fromDashboard.refused.some(x => x && x.id === secretId && x.reason === 'acl')) {
+      process.stderr.write(`vault-resolve: refused by the vault allowlist for this agent: ${secretId}\n`)
+      refused++
+      continue
+    }
+  } else if (!unsendable || !dashboardConfigured(projectRoot)) {
+    // with a dashboard token file (the warning fallback) an unsendable id counts as missing here too
+    value = getSecret(secretId)
+  }
+  if (value !== null && value === '' && valueMode) {
+    // The label only; there is no value to leak.
+    process.stderr.write(`vault-resolve: the label holds an EMPTY value: ${secretId}\n`)
+    process.exit(6)
+  } else if (value !== null) {
+    if (value === '') process.stderr.write(`vault-resolve: warning: the label holds an EMPTY value: ${secretId}\n`)
+    process.stdout.write(valueMode ? value : `${envVar}=${escapedMode ? escapeValue(value) : value}\n`)
+  } else {
+    // Label only -- the value does not exist, and even if it did, values
+    // must never reach stderr.
+    process.stderr.write(`vault-resolve: no secret in the vault for label: ${secretId}\n`)
+    missing++
   }
 }
+
+if (malformed > 0) process.exit(2)
+if (missing > 0) process.exit(3)
+if (refused > 0) process.exit(4)

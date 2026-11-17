@@ -8,16 +8,34 @@ import {
 import { getEffectiveSettingValue } from '../../settings-store.js'
 import { readMarveenTelegramConfig, readMarveenDiscordConfig, readMarveenSlackConfig, readMarveenGooglechatConfig, readMarveenTeamsConfig, sendMarveenAvatarChange } from '../telegram.js'
 import { hardRestartMarveenChannels } from '../channel-monitor.js'
+import { mainChannelUnconfigured } from '../main-channel-configured.js'
+import { gateManualRestart, MANUAL_RESTART_FORCE_HINT, wantsForceRestart } from '../manual-restart-gate.js'
+import { scheduleMainRestartWake, wantsMainRestartWake } from '../restart-wake.js'
 import { readFileOr } from '../agent-config.js'
+import { nicknameFor } from '../team-nicknames.js'
 import { parseMultipart } from '../multipart.js'
 import { readBody, json, serveFile } from '../http-helpers.js'
 import { MAIN_CHANNELS_SESSION } from '../main-agent.js'
 import { readActiveModelFromProjectDir, readContextTokensFromProjectDir } from '../active-model.js'
 import { readAutoRestartConfig } from '../auto-restart-store.js'
+import { configDirFor } from '../main-transcript-root.js'
 import type { RouteContext } from './types.js'
+import { logger } from '../../logger.js'
+import { reportNonColourSetting } from '../../css-color.js'
+
+// A colour setting as served to the dashboard; one that is not a CSS colour
+// is logged (once per value) -- the dashboard shows its default for it.
+function colourSetting(key: string): unknown {
+  return reportNonColourSetting(key, getEffectiveSettingValue(key), (ctx, msg) => logger.warn(ctx, msg))
+}
 
 function getActiveMarveenModel(): string {
-  return readActiveModelFromProjectDir(PROJECT_ROOT) ?? 'unknown'
+  // configDirFor, not the host default: when the channels session runs on its
+  // own CLAUDE_CONFIG_DIR, the default root holds a pre-migration transcript
+  // that still parses, so the card would show a model the session stopped
+  // using. Display, not a decision -- but a wrong number here is what makes
+  // someone trust the wrong root elsewhere.
+  return readActiveModelFromProjectDir(PROJECT_ROOT, undefined, configDirFor(MAIN_AGENT_ID)) ?? 'unknown'
 }
 
 // Pure identity-core of the /api/marveen payload: the brand-relevant fields the
@@ -44,6 +62,12 @@ export function buildMarveenIdentityCore(
     role: 'main',
   }
 }
+
+// CORPAVATAR1024 (owner decision 2026-10-18): the bot's and the owner's portraits stay
+// public (auth-gate exempts these two GETs), but no other website may embed them. The
+// dashboard and the Bridge webview load them by a relative URL, from the dashboard's own
+// origin, which same-origin allows; another site's <img> is refused by the browser.
+const AVATAR_CORP = 'same-origin'
 
 export async function tryHandleMarveen(ctx: RouteContext, webDir: string): Promise<boolean> {
   const { req, res, path, method } = ctx
@@ -75,6 +99,8 @@ export async function tryHandleMarveen(ctx: RouteContext, webDir: string): Promi
       // this to pin/label the owner's own message thread instead of a hardcoded
       // literal, so a renamed install recognizes its real owner.
       ownerName: currentOwnerName(),
+      // Character nickname (store/team-nicknames.json), same field as on /api/agents.
+      nickname: nicknameFor(currentBotName()),
       description,
       model: getActiveMarveenModel(),
       tmuxSession: MAIN_CHANNELS_SESSION,
@@ -83,7 +109,7 @@ export async function tryHandleMarveen(ctx: RouteContext, webDir: string): Promi
       // orchestrator id (autoRestartId, part of idCore) so the UI PUTs to the
       // right store entry.
       autoRestart: readAutoRestartConfig(MAIN_AGENT_ID),
-      contextTokens: readContextTokensFromProjectDir(PROJECT_ROOT),
+      contextTokens: readContextTokensFromProjectDir(PROJECT_ROOT, configDirFor(MAIN_AGENT_ID)),
       hasTelegram: tg.hasTelegram,
       hasDiscord: dc.hasDiscord,
       hasSlack: sl.hasSlack,
@@ -99,14 +125,17 @@ export async function tryHandleMarveen(ctx: RouteContext, webDir: string): Promi
       // CHANNEL_PROVIDER env-jébe pinneljük, hogy a UI ne hardcode-olt
       // 'telegram'-mal induljon.
       channelProvider: CHANNEL_PROVIDER,
+      // CHANNELUNCONF1110: the provider whose token is missing (the session then runs without its channel), or null.
+      // The launch rule itself (main-channel-configured.ts), so the banner goes the moment a token is saved.
+      mainChannelUnconfigured: mainChannelUnconfigured(CHANNEL_PROVIDER) ? CHANNEL_PROVIDER : null,
       // Resolved through the settings overrides layer so the UI hot-reloads.
       kanbanAging: {
         warnH: getEffectiveSettingValue('KANBAN_AGING_WARN_H'),
         cautionH: getEffectiveSettingValue('KANBAN_AGING_CAUTION_H'),
         criticalH: getEffectiveSettingValue('KANBAN_AGING_CRITICAL_H'),
-        warnColor: getEffectiveSettingValue('KANBAN_AGING_WARN_COLOR'),
-        cautionColor: getEffectiveSettingValue('KANBAN_AGING_CAUTION_COLOR'),
-        criticalColor: getEffectiveSettingValue('KANBAN_AGING_CRITICAL_COLOR'),
+        warnColor: colourSetting('KANBAN_AGING_WARN_COLOR'),
+        cautionColor: colourSetting('KANBAN_AGING_CAUTION_COLOR'),
+        criticalColor: colourSetting('KANBAN_AGING_CRITICAL_COLOR'),
       },
       // Resolved through the settings overrides layer (override > .env >
       // registry default) instead of the boot-time config.ts constants, so a
@@ -121,14 +150,14 @@ export async function tryHandleMarveen(ctx: RouteContext, webDir: string): Promi
           done: getEffectiveSettingValue('KANBAN_WIP_DONE'),
         },
         warnPct: getEffectiveSettingValue('KANBAN_WIP_WARN_PCT'),
-        okColor: getEffectiveSettingValue('KANBAN_WIP_OK_COLOR'),
-        warnColor: getEffectiveSettingValue('KANBAN_WIP_WARN_COLOR'),
-        fullColor: getEffectiveSettingValue('KANBAN_WIP_FULL_COLOR'),
-        overColor: getEffectiveSettingValue('KANBAN_WIP_OVER_COLOR'),
+        okColor: colourSetting('KANBAN_WIP_OK_COLOR'),
+        warnColor: colourSetting('KANBAN_WIP_WARN_COLOR'),
+        fullColor: colourSetting('KANBAN_WIP_FULL_COLOR'),
+        overColor: colourSetting('KANBAN_WIP_OVER_COLOR'),
       },
       kanbanSwimlanes: {
         defaultGroup: getEffectiveSettingValue('KANBAN_SWIMLANE_DEFAULT_GROUP'),
-        separatorColor: getEffectiveSettingValue('KANBAN_SWIMLANE_SEPARATOR_COLOR') || null,
+        separatorColor: colourSetting('KANBAN_SWIMLANE_SEPARATOR_COLOR') || null,
       },
       kanbanLabels: {
         colors: KANBAN_LABEL_COLORS,
@@ -147,13 +176,26 @@ export async function tryHandleMarveen(ctx: RouteContext, webDir: string): Promi
   }
 
   if (path === '/api/marveen/restart' && method === 'POST') {
+    // A kezi restart nem vagja el a futo turnt. Beragadt fo-agensnel csak explicit {"force": true} atlepi a kaput.
+    const restartBody = await readBody(req)
+    const force = wantsForceRestart(restartBody)
+    if (force) logger.warn({ route: '/api/marveen/restart' }, 'manual main restart forced past the pane gate')
+    if (!force) {
+      const gate = await gateManualRestart(MAIN_CHANNELS_SESSION)
+      if (!gate.allow) { json(res, { error: 'restart-blocked', reason: gate.reason, hint: MANUAL_RESTART_FORCE_HINT }, 409); return true }
+    }
     const result = hardRestartMarveenChannels()
     if (!result.ok) { json(res, { error: result.error || 'Restart failed' }, 500); return true }
+    // MAINRESTARTWAKE1115: the fresh session gets no prompt from anyone, so a restart that took
+    // owes it one wake ({"wake": false} switches it off). Only here, after ok: a refused or failed
+    // restart left the old session as it was. See restart-wake.ts.
+    if (wantsMainRestartWake(restartBody)) scheduleMainRestartWake(MAIN_AGENT_ID, MAIN_CHANNELS_SESSION, join(PROJECT_ROOT, 'HANDOFF.md'))
     json(res, { ok: true })
     return true
   }
 
   if (path === '/api/marveen/avatar' && method === 'GET') {
+    res.setHeader('Cross-Origin-Resource-Policy', AVATAR_CORP)
     // Avatars are ~1MB each and rarely change: let browsers reuse them for an
     // hour without a round-trip (an avatar swapped in another session shows up
     // after at most 1h, then ETag revalidation; the swapping session itself
@@ -164,6 +206,23 @@ export async function tryHandleMarveen(ctx: RouteContext, webDir: string): Promi
     }
     const fallback = join(webDir, 'avatars', '01_robot.png')
     if (existsSync(fallback)) { serveFile(req, res, fallback, { cacheSeconds: 3600 }); return true }
+    res.writeHead(404); res.end()
+    return true
+  }
+
+  // The owner's own portrait, for the kanban lanes and the owner strip.
+  // Read-only on purpose: there is no upload route, the picture is put in place
+  // on disk (store/owner-avatar.{png,jpg,jpeg,webp}), the same way an agent
+  // avatar is. No gallery fallback either: a generic robot standing in for the
+  // owner would be worse than the initial the board already draws, and the
+  // frontend falls back to that initial on a 404. no-cache (revalidate) rather
+  // than a max-age, because nothing busts the URL when the file is replaced.
+  if (path === '/api/marveen/owner-avatar' && method === 'GET') {
+    res.setHeader('Cross-Origin-Resource-Policy', AVATAR_CORP)
+    for (const ext of ['.png', '.jpg', '.jpeg', '.webp']) {
+      const p = join(PROJECT_ROOT, 'store', `owner-avatar${ext}`)
+      if (existsSync(p)) { serveFile(req, res, p); return true }
+    }
     res.writeHead(404); res.end()
     return true
   }

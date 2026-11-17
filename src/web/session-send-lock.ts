@@ -29,13 +29,29 @@
 // sendPromptToSession, so no in-process lock can reach it (a cross-process file
 // lock would be a separate change). A reader must not assume the pane is fully
 // serialized: it is serialized for the two acquirers above, no more.
+//
+// Since then, brought under the lane one by one (each with a fail-closed
+// acquire -- see pane-writers-under-send-lock.test.ts for the per-writer
+// contract): channel-mcp-reconnect, channel-plugin-unlock, reauth-healer,
+// agent-worker's /clear, the pre-emit modal dismissals (#895), the identity
+// /rename (IDENTLANE910, #1272), and the two not-ready-path janitors --
+// clearStaleParkedInput and clearFeedbackModalAndRecheck (PANEWRITERS910).
+// Still uncovered: routes/agent-terminal.ts (operator-driven keystrokes) and
+// the cross-process channel-plugin delivery above.
 
 const delay = (ms: number): Promise<void> => new Promise(res => setTimeout(res, ms))
 
 // Default fail-open budget: how long a `deliver` caller waits for a busy lane
 // before writing WITHOUT the lock. Sized well above a normal chunked delivery
 // (a long message is seconds) so fail-open only trips on a genuinely stuck
-// holder, never on ordinary queueing.
+// holder, never on ordinary queueing. What one sendPromptToSession call can hold
+// the lane for: its echo and settle waits together are capped at
+// PRE_ENTER_WAIT_BUDGET_MS (35 s, #2144), plus the retry loop's polls and
+// placeholder clears, plus its TYPING time. Typing is NOT bounded (it predates
+// #2135): about 30 ms plus one tmux call per 80 characters, once per send and
+// per clear-and-resend, so a long prompt on a slow or remote pane can still
+// hold the lane past this budget. A writer queued behind several holders can
+// also run out of it: the budget counts from when the writer joins the queue.
 export const DEFAULT_DELIVER_WAIT_BUDGET_MS = 60_000
 
 interface Lane {

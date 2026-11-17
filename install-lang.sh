@@ -40,10 +40,27 @@ _t() {
     hu:prompt_login) echo "  Szeretnéd most bejelentkezni? (i/n) " ;;
     en:prompt_your_name) echo "  Your name? " ;;
     hu:prompt_your_name) echo "  Mi a neved? " ;;
-    en:prompt_channel_select_macos) echo "  Choose (1/2) [1]: " ;;
-    hu:prompt_channel_select_macos) echo "  Válassz (1/2) [1]: " ;;
+    en:prompt_channel_select_macos) echo "  Choose (1/2/3) [1]: " ;;
+    hu:prompt_channel_select_macos) echo "  Válassz (1/2/3) [1]: " ;;
     en:prompt_channel_select_linux) echo "  Choose (1/2/3) [1]: " ;;
     hu:prompt_channel_select_linux) echo "  Válassz (1/2/3) [1]: " ;;
+    # GROMZONOPROVIDER1108: the 4-option prompts are NEW keys; the 3-option ones above stay as they are, since an
+    # already released Bridge's vendored installer fetches this file from main and still asks with them.
+    en:prompt_channel_select4) echo "  Choose (1/2/3/4) [1]: " ;;
+    hu:prompt_channel_select4) echo "  Válassz (1/2/3/4) [1]: " ;;
+    en:channel_option_gromzo) echo "Gromzo (the Marveen app on your phone; no bot, no Bun)" ;;
+    hu:channel_option_gromzo) echo "Gromzo (a Marveen alkalmazás a telefonodon; bot és Bun nélkül)" ;;
+    # EE2392D3: the 5-option prompt is a NEW key, like the 4-option one above (released Bridges keep asking with theirs).
+    en:prompt_channel_select5) echo "  Choose (1/2/3/4/5) [1]: " ;;
+    hu:prompt_channel_select5) echo "  Válassz (1/2/3/4/5) [1]: " ;;
+    en:channel_option_teams) echo "Microsoft Teams (an Azure Bot; needs Bun)" ;;
+    hu:channel_option_teams) echo "Microsoft Teams (Azure Bot; Bun kell hozzá)" ;;
+    en:prompt_teams_app_id) echo "  Azure Bot App ID (TEAMS_BOT_APP_ID, or leave empty, set later): " ;;
+    hu:prompt_teams_app_id) echo "  Azure Bot App ID (TEAMS_BOT_APP_ID, vagy hagyd üresen, később is beállíthatod): " ;;
+    en:prompt_teams_tenant_id) echo "  Tenant ID (TEAMS_BOT_TENANT_ID): " ;;
+    hu:prompt_teams_tenant_id) echo "  Tenant ID (TEAMS_BOT_TENANT_ID): " ;;
+    en:prompt_teams_app_password) echo "  Client secret (TEAMS_BOT_APP_PASSWORD, not shown while typing): " ;;
+    hu:prompt_teams_app_password) echo "  Client secret (TEAMS_BOT_APP_PASSWORD, gépelés közben nem látszik): " ;;
     en:prompt_telegram_token) echo "  Telegram bot token (or leave empty, set later): " ;;
     hu:prompt_telegram_token) echo "  Telegram bot token (vagy hagyd üresen, később is beállíthatod): " ;;
     en:prompt_slack_bot_token) echo "  Bot Token (xoxb-...): " ;;
@@ -75,6 +92,8 @@ _t() {
     hu:warn_pair_missing) echo "  FIGYELEM: Telegram párosítás nem történt meg!" ;;
     en:success_installed) echo "  ✓ Marveen successfully installed!" ;;
     hu:success_installed) echo "  ✓ Marveen sikeresen telepítve!" ;;
+    en:success_installed_services_down) echo "  ! Marveen is installed, but its services are NOT running yet (see below)." ;;
+    hu:success_installed_services_down) echo "  ! Marveen telepítve, de a szolgáltatások MÉG NEM FUTNAK (lásd lent)." ;;
     # ── Tagline / wizard ─────────────────────────────────────────────
     en:tagline) echo "Your AI team, running while you sleep." ;;
     hu:tagline) echo "AI csapatod, ami fut amíg te alszol." ;;
@@ -117,12 +136,12 @@ _t() {
     hu:macos.auth_later) echo "  A telepites folytatodik. Belepheted kesobb: claude auth login" ;;
     en:macos.firstrun_done) echo "  Claude Code first-run setup done" ;;
     hu:macos.firstrun_done) echo "  Claude Code first-run beállítás kész" ;;
-    en:macos.headless_test) echo "  Headless Claude Code test..." ;;
-    hu:macos.headless_test) echo "  Headless Claude Code teszt..." ;;
-    en:macos.headless_ok) echo "  Headless Claude Code working (claude --print responded)" ;;
-    hu:macos.headless_ok) echo "  Headless Claude Code futtathato (claude --print valaszolt)" ;;
-    en:macos.headless_fail) echo "Headless Claude Code probe FAILED. Agent creation WILL fail later." ;;
-    hu:macos.headless_fail) echo "Headless Claude Code probe SIKERTELEN. Az agent-letrehozas KESOBB EL fog hasalni." ;;
+    en:macos.headless_test) echo "  Checking your terminal's Claude login (headless)..." ;;
+    hu:macos.headless_test) echo "  A terminálod Claude-bejelentkezésének ellenőrzése (headless)..." ;;
+    en:macos.headless_ok) echo "  Your terminal's Claude login works (claude --print responded)" ;;
+    hu:macos.headless_ok) echo "  A terminálod Claude-bejelentkezése működik (claude --print válaszolt)" ;;
+    en:macos.headless_fail) echo "Your terminal's Claude login did not answer (claude --print). This is NOT the agents' credential: the background services use their own, which is checked separately further down." ;;
+    hu:macos.headless_fail) echo "A terminálod Claude-bejelentkezése nem válaszolt (claude --print). Ez NEM az ügynökök hitelesítője: a háttérszolgáltatások saját kulcsát a telepítő lent külön ellenőrzi." ;;
     # ── Channel selection ─────────────────────────────────────────────
     en:macos.channel_select_hint) echo "  Which channel should your AI assistant use?" ;;
     hu:macos.channel_select_hint) echo "  Melyik csatornan kommunikaljon az AI asszisztensed?" ;;
@@ -139,6 +158,11 @@ _t() {
     hu:macos.managed_create) echo "  Managed settings létrehozása szükséges (sudo)." ;;
     en:macos.managed_created) echo "  managed-settings.json created" ;;
     hu:macos.managed_created) echo "  managed-settings.json létrehozva" ;;
+    # #1874: said BEFORE the first root step that reads or writes managed-settings.json
+    en:managed.notice_what) echo "Next, the channel switch goes into the machine-wide Claude Code settings (managed-settings.json). Without it, incoming messages stall on a company (Team/Enterprise) Claude account." ;;
+    hu:managed.notice_what) echo "Most a gépszintű Claude Code-beállításba (managed-settings.json) kerül a csatorna-engedély. Enélkül céges (Team/Enterprise) Claude-fióknál elakadnak a bejövő üzenetek." ;;
+    en:managed.notice_sudo) echo "It is a system file, so the next step may ask for this computer's password (sudo)." ;;
+    hu:managed.notice_sudo) echo "Ez rendszerfájl, ezért a következő lépés kérheti a gép jelszavát (sudo)." ;;
     # ── Agent ID / build ──────────────────────────────────────────────
     en:macos.agent_id_info) echo "  Internal agent ID: " ;;
     hu:macos.agent_id_info) echo "  Ügynök belső azonosító: " ;;
@@ -162,6 +186,8 @@ _t() {
     hu:macos.tg_channel_configured) echo "  Telegram csatorna konfigurálva" ;;
     en:macos.slack_channel_configured) echo "  Slack channel configured" ;;
     hu:macos.slack_channel_configured) echo "  Slack csatorna konfigurálva" ;;
+    en:macos.discord_channel_configured) echo "  Discord channel configured" ;;
+    hu:macos.discord_channel_configured) echo "  Discord csatorna konfigurálva" ;;
     # ── Plugin ────────────────────────────────────────────────────────
     en:macos.plugin_retry) echo "  First attempt failed, retrying..." ;;
     hu:macos.plugin_retry) echo "  Elso probalkozas sikertelen, ujraprobalok..." ;;
@@ -187,6 +213,10 @@ _t() {
     hu:macos.nomic_downloading) echo "  nomic-embed-text modell letöltése (~274 MB)..." ;;
     en:macos.ollama_done) echo "  Ollama + nomic-embed-text ready" ;;
     hu:macos.ollama_done) echo "  Ollama + nomic-embed-text kész" ;;
+    en:macos.ollama_skipped) echo "Ollama / nomic-embed-text could not be set up -- semantic memory search is skipped, keyword search still works." ;;
+    hu:macos.ollama_skipped) echo "Ollama / nomic-embed-text nem állítható be -- a szemantikus memória-keresés kimarad, a kulcsszavas működik." ;;
+    en:macos.ollama_skipped_hint) echo "Later, by hand: install Ollama from https://ollama.com/download, then: ollama pull nomic-embed-text" ;;
+    hu:macos.ollama_skipped_hint) echo "Később kézzel: Ollama innen: https://ollama.com/download, utána: ollama pull nomic-embed-text" ;;
     # ── Whisper / ffmpeg ──────────────────────────────────────────────
     en:macos.whisper_installing) echo "  Installing Whisper (speech-to-text)..." ;;
     hu:macos.whisper_installing) echo "  Whisper telepítés (beszéd -> szöveg leirat)..." ;;
@@ -202,6 +232,10 @@ _t() {
     hu:macos.ffmpeg_installing) echo "  ffmpeg telepítés..." ;;
     en:macos.ffmpeg_done) echo "  ffmpeg ready" ;;
     hu:macos.ffmpeg_done) echo "  ffmpeg kész" ;;
+    en:macos.ffmpeg_skipped) echo "ffmpeg could not be installed (no Homebrew?) -- audio/video processing is skipped." ;;
+    hu:macos.ffmpeg_skipped) echo "ffmpeg nem telepíthető (nincs Homebrew?) -- a hang/videó feldolgozás kimarad." ;;
+    en:macos.ffmpeg_skipped_hint) echo "Later, by hand: brew install ffmpeg   (or with MacPorts: sudo port install ffmpeg)" ;;
+    hu:macos.ffmpeg_skipped_hint) echo "Később kézzel: brew install ffmpeg   (vagy MacPortsszal: sudo port install ffmpeg)" ;;
     # ── LaunchAgent / services ────────────────────────────────────────
     en:macos.launchagents_created) echo "  LaunchAgents created" ;;
     hu:macos.launchagents_created) echo "  LaunchAgent-ek létrehozva" ;;
@@ -224,8 +258,13 @@ _t() {
     # ── Done section ──────────────────────────────────────────────────
     en:dash.token_hint) echo "  (Open once; the browser will remember the token)" ;;
     hu:dash.token_hint) echo "  (Nyisd meg egyszer, utana a bongeszo megjegyzi a tokent)" ;;
-    en:dash.no_token_hint) echo "  (The token URL can be found in the server log)" ;;
-    hu:dash.no_token_hint) echo "  (A tokenes URL-t a szerver logban talalod)" ;;
+    # INSTSTDERRTMP1104: the server prints the token URL only to a terminal
+    # (src/web.ts, non-TTY branch), so under launchd/systemd the old "server
+    # log" pointer led nowhere; the token lives in store/.dashboard-token.
+    en:dash.no_token_hint) echo "  (The access token is written to store/.dashboard-token when the dashboard first starts; open http://localhost:${WEB_PORT:-3420}/?token=<that value> once)" ;;
+    hu:dash.no_token_hint) echo "  (A belépő token a dashboard első indulásakor a store/.dashboard-token fájlba kerül; nyisd meg egyszer: http://localhost:${WEB_PORT:-3420}/?token=<a fájl tartalma>)" ;;
+    en:dash.token_file_hint) echo "  (Not a terminal, so the token is not printed. It is in store/.dashboard-token; open http://localhost:${WEB_PORT:-3420}/?token=<that value> once)" ;;
+    hu:dash.token_file_hint) echo "  (Nem terminálba fut a kimenet, ezért a tokent nem írjuk ki. A store/.dashboard-token fájlban van; nyisd meg egyszer: http://localhost:${WEB_PORT:-3420}/?token=<a fájl tartalma>)" ;;
     en:telegram.write_hint) echo "  Telegram: Write to your bot!" ;;
     hu:telegram.write_hint) echo "  Telegram: Irj a botodnak!" ;;
     en:next_steps.title) echo "  Next steps:" ;;
@@ -257,6 +296,66 @@ _t() {
     hu:linux.apt_lock_still_prefix) echo "még mindig fogja:" ;;
     en:linux.apt_lock_freed_prefix) echo "Package manager lock released after" ;;
     hu:linux.apt_lock_freed_prefix) echo "A csomagkezelő zárolás felszabadult" ;;
+    # LINUXINSTPREREQ1104 PR2: --admin-prereq and the non-admin pre-check.
+    en:linux.adminprereq_need_root) echo "--admin-prereq needs root. Run it as an administrator:" ;;
+    hu:linux.adminprereq_need_root) echo "Az --admin-prereq root jogot kér. Egy rendszergazda futtassa így:" ;;
+    en:linux.nonadmin_head) echo "This user cannot run root steps (not root, no passwordless sudo, not in sudo/admin/wheel), and these machine-level steps are missing:" ;;
+    hu:linux.nonadmin_head) echo "Ez a felhasználó nem tud rendszergazdai lépést futtatni (nem root, nincs jelszó nélküli sudo, nincs a sudo/admin/wheel csoportban), és ezek a gépszintű lépések hiányoznak:" ;;
+    en:linux.nonadmin_pkgs) echo "packages:" ;;
+    hu:linux.nonadmin_pkgs) echo "csomagok:" ;;
+    en:linux.nonadmin_node) echo "Node.js 20 or newer (now: major version)" ;;
+    hu:linux.nonadmin_node) echo "Node.js 20 vagy újabb (most: fő verzió)" ;;
+    en:linux.nonadmin_node_missing) echo "Node.js 20 or newer (now: not installed)" ;;
+    hu:linux.nonadmin_node_missing) echo "Node.js 20 vagy újabb (most: nincs telepítve)" ;;
+    en:linux.nonadmin_linger) echo "keeping this user's services running (loginctl linger): off; without it the dashboard stops after the install" ;;
+    hu:linux.nonadmin_linger) echo "a felhasználó szolgáltatásainak futva tartása (loginctl linger): nincs bekapcsolva; nélküle a dashboard a telepítés után leáll" ;;
+    en:linux.adminprereq_user_needs_flag) echo "--user goes only with --admin-prereq." ;;
+    hu:linux.adminprereq_user_needs_flag) echo "A --user csak az --admin-prereq mellett használható." ;;
+    en:linux.adminprereq_user_unknown) echo "No such user:" ;;
+    hu:linux.adminprereq_user_unknown) echo "Nincs ilyen felhasználó:" ;;
+    en:linux.adminprereq_linger_ok) echo "its services may keep running (loginctl linger):" ;;
+    hu:linux.adminprereq_linger_ok) echo "a szolgáltatásai futva maradhatnak (loginctl linger):" ;;
+    en:linux.adminprereq_linger_na) echo "no loginctl (no systemd): linger is not needed here" ;;
+    hu:linux.adminprereq_linger_na) echo "nincs loginctl (systemd nélküli rendszer): a linger itt nem kell" ;;
+    en:linux.adminprereq_linger_fail) echo "loginctl enable-linger failed for" ;;
+    hu:linux.adminprereq_linger_fail) echo "a loginctl enable-linger nem sikerült ehhez:" ;;
+    en:linux.adminprereq_linger_nouser) echo "no user named (--user): after a non-admin install its services would stop with its session. Run again with the user's name:" ;;
+    hu:linux.adminprereq_linger_nouser) echo "nem adtál meg felhasználót (--user): a nem-admin telepítés után a szolgáltatásai a munkamenettel leállnának. Futtasd újra a nevével:" ;;
+    en:linux.nonadmin_skips) echo "Without sudo, the semantic memory (ollama) and the bumblebee supply-chain scan are left out; they need root and are not part of --admin-prereq yet." ;;
+    hu:linux.nonadmin_skips) echo "Sudo nélkül a szemantikus memória (ollama) és a bumblebee ellátási-lánc vizsgálat kimarad; ezek root jogot kérnek, és az --admin-prereq még nem tartalmazza őket." ;;
+    en:linux.adminprereq_next_same) echo "run the installer again the same way it was started (no sudo needed)" ;;
+    hu:linux.adminprereq_next_same) echo "indítsa újra a telepítőt ugyanúgy, ahogy elindította (sudo nem kell)" ;;
+    en:linux.nonadmin_gate_ok) echo "the managed-settings channel gate: already on" ;;
+    hu:linux.nonadmin_gate_ok) echo "a managed-settings csatorna-kapu: már be van kapcsolva" ;;
+    en:linux.nonadmin_gate_missing) echo "the managed-settings channel gate (/etc/claude-code): not set; without it, incoming messages stop on a team/enterprise Claude account" ;;
+    hu:linux.nonadmin_gate_missing) echo "a managed-settings csatorna-kapu (/etc/claude-code): nincs beállítva; nélküle céges (Team/Enterprise) Claude-fióknál elakadnak a bejövő üzenetek" ;;
+    en:linux.nonadmin_gate_unknown) echo "the managed-settings channel gate: cannot be checked yet (python3 is missing)" ;;
+    hu:linux.nonadmin_gate_unknown) echo "a managed-settings csatorna-kapu: még nem ellenőrizhető (hiányzik a python3)" ;;
+    en:linux.nonadmin_cmd_lead) echo "An administrator runs this once (it installs only these; no clone, no services), then start this installer again as this user:" ;;
+    hu:linux.nonadmin_cmd_lead) echo "Egy rendszergazda futtassa ezt egyszer (csak ezeket telepíti; nincs klón, nincs szolgáltatás), utána indítsd újra ezt a telepítőt ezzel a felhasználóval:" ;;
+    en:linux.nonadmin_sudo_hint) echo "If this user can sudo after all (its own sudoers line), run sudo -v first, then the installer again." ;;
+    hu:linux.nonadmin_sudo_hint) echo "Ha ez a felhasználó mégis tud sudózni (saját sudoers-sor), előbb futtasd: sudo -v, utána a telepítőt újra." ;;
+    en:linux.adminprereq_done_head) echo "The machine-level prerequisites are done:" ;;
+    hu:linux.adminprereq_done_head) echo "A gépszintű előfeltételek kész:" ;;
+    en:linux.adminprereq_pkgs_installed) echo "installed:" ;;
+    hu:linux.adminprereq_pkgs_installed) echo "telepítve:" ;;
+    en:linux.adminprereq_pkgs_present) echo "every package was already there" ;;
+    hu:linux.adminprereq_pkgs_present) echo "minden csomag megvolt már" ;;
+    en:linux.adminprereq_gate_ok) echo "the managed-settings channel gate is on" ;;
+    hu:linux.adminprereq_gate_ok) echo "a managed-settings csatorna-kapu be van kapcsolva" ;;
+    en:linux.adminprereq_gate_manual) echo "the managed-settings channel gate could not be set; its script prints the manual step (sudo bash scripts/ensure-managed-channels-enabled.sh)" ;;
+    hu:linux.adminprereq_gate_manual) echo "a managed-settings csatorna-kapu nem állt be; a szkriptje kiírja a kézi lépést (sudo bash scripts/ensure-managed-channels-enabled.sh)" ;;
+    en:linux.adminprereq_next_lead) echo "Next, as the user Marveen will run as (no sudo needed):" ;;
+    hu:linux.adminprereq_next_lead) echo "Következő lépés, annak a felhasználónak a nevében, akivel a Marveen futni fog (sudo nem kell):" ;;
+    # LINUXINSTPREREQ1104: Node.js >= 20, checked after the package step too.
+    en:linux.node_too_old) echo "Node.js is too old for Marveen (v20 or newer is needed). The installed major version:" ;;
+    hu:linux.node_too_old) echo "A Node.js túl régi a Marveenhez (legalább v20 kell). A telepített fő verzió:" ;;
+    en:linux.node_distro_too_old) echo "The nodesource repository could not be added, and this distribution's own nodejs package is too old (v20 or newer is needed), so it was not installed. Its major version:" ;;
+    hu:linux.node_distro_too_old) echo "A nodesource tárolót nem sikerült hozzáadni, a disztribúció saját nodejs csomagja pedig túl régi (legalább v20 kell), ezért nem telepítettem. A fő verziója:" ;;
+    en:linux.node_fix_lead) echo "Fix: run this (it needs internet access to deb.nodesource.com), then start the installer again:" ;;
+    hu:linux.node_fix_lead) echo "Javítás: futtasd ezt (a deb.nodesource.com elérése kell hozzá), majd indítsd újra a telepítőt:" ;;
+    en:linux.node_fix_rpm) echo "Fix: install Node.js 20 or newer (from your distribution's nodejs module stream or the nodejs.org packages), then start the installer again." ;;
+    hu:linux.node_fix_rpm) echo "Javítás: telepíts Node.js 20-at vagy újabbat (a disztribúció nodejs modul-folyamából vagy a nodejs.org csomagjaiból), majd indítsd újra a telepítőt." ;;
     en:linux.apt_lock_unknown) echo "Cannot check who holds the package-manager lock (fuser not installed) -- if it is busy, apt itself will wait up to 3 minutes." ;;
     hu:linux.apt_lock_unknown) echo "Nem tudom megnézni, ki fogja a csomagkezelő zárolást (nincs fuser) -- ha foglalt, az apt maga vár rá legfeljebb 3 percig." ;;
     en:linux.apt_lock_timeout_head) echo "The package-manager lock is STILL held after 5 minutes by:" ;;
@@ -290,6 +389,8 @@ _t() {
     hu:linux.tg_channel_configured) echo "Telegram csatorna konfigurálva" ;;
     en:linux.slack_channel_configured) echo "Slack channel configured" ;;
     hu:linux.slack_channel_configured) echo "Slack csatorna konfigurálva" ;;
+    en:linux.teams_channel_configured) echo "Teams channel configured" ;;
+    hu:linux.teams_channel_configured) echo "Teams csatorna konfigurálva" ;;
     en:linux.discord_channel_configured) echo "Discord channel configured" ;;
     hu:linux.discord_channel_configured) echo "Discord csatorna konfigurálva" ;;
     en:linux.ollama_starting) echo "  Starting Ollama service..." ;;
@@ -383,6 +484,10 @@ _t() {
     hu:npm.sudo_note) echo "Telepítés sudo-val (a rendszergazdai jelszót kérheti)..." ;;
     en:npm.aborted) echo "Stopped: the global npm directory is not writable and no remedy was chosen." ;;
     hu:npm.aborted) echo "Megálltam: a globális npm könyvtár nem írható, és nem választottál megoldást." ;;
+    en:macos.root_npm_refused) echo "Not running npm as root: npm or node is not a root-owned file in a root-owned folder, so a non-admin process could have replaced it. Install Claude Code yourself, after checking where npm comes from:" ;;
+    en:macos.root_npm_bun_failed) echo "Bun was not installed as root: either npm or node is not a root-owned file in a root-owned folder (then npm is not run as root at all), or npm's install failed (its last lines are below). Install Bun yourself, after checking where npm comes from:" ;;
+    hu:macos.root_npm_bun_failed) echo "A Bun nem települt rootként: vagy az npm vagy a node nem root-tulajdonú fájl root-tulajdonú mappában (ilyenkor az npm-et rootként el sem indítom), vagy az npm telepítése hibázott (az utolsó sorai lent). Telepítsd a Bunt magad, miután megnézted, honnan jön az npm:" ;;
+    hu:macos.root_npm_refused) echo "Az npm-et nem futtatom rootként: az npm vagy a node nem root-tulajdonú fájl root-tulajdonú mappában, így egy nem admin folyamat is kicserélhette. Telepítsd a Claude Code-ot magad, miután megnézted, honnan jön az npm:" ;;
     # Error-translation layer (NPMPERM1/APTLOCK1/MACOSOLD1 -- the first three patterns)
     en:errxl.dpkg_lock) echo "TRANSLATED: the package manager (apt/dpkg) is locked by another process -- on a fresh system this is the automatic update. Wait a few minutes and re-run the installer." ;;
     hu:errxl.dpkg_lock) echo "FORDÍTÁS: a csomagkezelőt (apt/dpkg) egy másik folyamat zárolja -- friss rendszeren ez az automatikus frissítés. Várj pár percet, és indítsd újra a telepítőt." ;;
@@ -487,7 +592,23 @@ explain_install_error() {
     echo "$tail_txt" | grep -qiE '(^|\n)(brew|Homebrew)' && tool="Homebrew"
     echo "$tail_txt" | grep -q 'curl:' && tool="curl"
     echo -e "${ORANGE}$(_t errxl.unknown_head) ${tool}${NC}"
-    tail -n 5 "$log" 2>/dev/null | sed 's/^/    /'
+    tail -n 5 "$log" 2>/dev/null | redact_install_line | sed 's/^/    /'
     echo -e "  $(_t errxl.unknown_next)"
   fi
+}
+
+# INSTSTDERRTMP1104: the raw stderr lines above reach the screen AND whatever
+# captures stdout (the Bridge, a CI log). Mask the shapes a credential takes on
+# a command line or in an error message. A filter, not a guarantee: the real
+# protection is that secrets never reach stderr; this only keeps a slip from
+# being repeated into a second capture.
+redact_install_line() {
+  LC_ALL=C sed -E \
+    -e 's/sk-ant-[A-Za-z0-9_-]+/sk-ant-[redacted]/g' \
+    -e 's/(xox[abprs]-)[A-Za-z0-9-]+/\1[redacted]/g' \
+    -e 's/[0-9]{6,12}:[A-Za-z0-9_-]{30,}/[redacted-bot-token]/g' \
+    -e 's/([?&](token|key|secret|password)=)[^&[:space:]"]+/\1[redacted]/g' \
+    -e 's/((TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|_KEY)=)[^[:space:]"]+/\1[redacted]/g' \
+    -e 's/(Bearer )[A-Za-z0-9._~+\/=-]+/\1[redacted]/g' \
+    -e 's/[0-9a-fA-F]{40,}/[redacted-hex]/g'
 }

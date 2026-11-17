@@ -1,3 +1,4 @@
+import { allowTargetSessionsForTest } from './helpers/allow-target-sessions.js'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ScheduledTask } from '../web/scheduled-tasks-io.js'
 
@@ -67,12 +68,33 @@ vi.mock('../channel-provider.js', async (importOriginal) => {
   }
 })
 
+// Scheduled-task registry: this suite drives the runner with fixture tasks that never went
+// through the dashboard API; the registry gate is covered by
+// schedule-source-registry.test.ts, so here it is a passthrough.
+vi.mock('../web/schedule-registry.js', () => ({
+  filterRegisteredTasks: <T,>(tasks: T[]) => tasks,
+  backfillScheduledTaskRegistryOnce: () => ({ ran: false, registered: [] }),
+  verifyScheduledTask: () => ({ ok: true }),
+  describeVerdict: () => '',
+}))
+
 vi.mock('../web/scheduled-tasks-io.js', () => ({
   listScheduledTasks: () => mockListScheduledTasks(),
+  readScheduledTask: (n: string) => (mockListScheduledTasks() as Array<{ name: string }>).find(t => t.name === n) ?? null,
   SCHEDULED_TASKS_DIR: '/tmp/marveen-parked-janitor-no-tasks-dir',
+  // SCHEDPROMPTREF917: attemptFireTask reads these on every fire (size-guard
+  // + inline/snapshot threshold). Real values -- the fixtures' short prompts
+  // must stay well under them so the size-guard/snapshot path never trips.
+  SCHEDULED_TASK_INLINE_MAX_CHARS: 1_500,
+  SCHEDULED_TASK_BODY_WARN_CHARS: 20_000,
+  MAX_SCHEDULED_TASK_PROMPT_LEN: 50_000,
 }))
 
 vi.mock('../web/agent-process.js', () => ({
+  withTmuxBatch: (fn: () => unknown) => fn(),
+  // The not-ready-path modal clear: false = no modal, so every caller keeps
+  // its existing skip/busy behaviour and these fixtures are unaffected.
+  clearFeedbackModalAndRecheck: () => false,
   agentSessionName: (name: string) => `agent-${name}`,
   isAgentRunning: () => true,
   isSessionReadyForPrompt: () => mockSessionReady(),
@@ -181,3 +203,6 @@ describe('schedule runner: stale-parked-input janitor on the retry queue', () =>
     expect(mockClearParked).not.toHaveBeenCalled()
   })
 })
+
+// OWNEREXEC1109: these fixtures route by made-up session names; the runner types only into fleet sessions, so exactly these are listed (helpers/allow-target-sessions.ts).
+allowTargetSessionsForTest(['parked-test-session'])

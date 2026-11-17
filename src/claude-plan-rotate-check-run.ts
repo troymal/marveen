@@ -1,0 +1,253 @@
+// The body of scripts/claude-plan-rotate-check.ts (see the long header
+// comment there for the ROTATE / NO_ALTERNATIVE / FLEET_* stdout contract).
+// It lives here, not in the script, so a test can drive runRotateCheck() with
+// its collaborators mocked (claude-plan-rotate-check-run.test.ts): the script
+// itself only calls it, and a top-level `await main()` cannot be imported.
+import { execFileSync } from 'node:child_process'
+import { join } from 'node:path'
+import {
+  decideAndRecord, pendingFleetReport, activeReadingNearLimit, activeReadingFromUsageCollect, activeReadingFromProbe, exhaustedReadingFrom429,
+  type ActiveReading,
+} from './claude-plan-rotate-heartbeat.js'
+import { readClaudePlans, subAgentTokenPlanIds, type ClaudePlan } from './web/claude-plans.js'
+import { readClaudePlansState, writeClaudePlansState, recordPlanObservation } from './web/claude-plans-state.js'
+import { probePlanUsage, observationFromProbe, selectPlansToProbe, usageFromProbe, PROBE_SOURCE } from './claude-plan-usage-probe.js'
+import { getSecret } from './web/vault.js'
+import { getEffectiveSettingValue } from './settings-store.js'
+import { MAIN_AGENT_ID, PROJECT_ROOT } from './config.js'
+import { readAgentAuthMode } from './web/agent-config.js'
+
+function settingIsOn(key: string): boolean {
+  try { return String(getEffectiveSettingValue(key)) === '1' } catch { return false }
+}
+
+// On-demand refresh of IDLE plans' usage (live probe, see
+// src/claude-plan-usage-probe.ts). The heartbeat below only ever observes the
+// plan the main agent is on, so without this an idle plan's "last known %"
+// (and estimateWindowFree's input for it) is frozen at whenever it was last
+// active. selectPlansToProbe() decides who is due: 2+ plans only (single-plan
+// installs: zero new calls), token-mode only, never the main agent's active
+// plan, at most once per 30 min per plan. Runs BEFORE the rotation decision so
+// that decision sees the fresh numbers. Prints nothing on stdout -- stdout is
+// the ROTATE/NO_ALTERNATIVE channel the scheduled task's prompt parses.
+// Only runs when CLAUDE_PLAN_USAGE_REFRESH=1 AND the active plan is near a
+// limit (activePlanNearLimit, see runRotateCheck).
+export async function refreshIdlePlans(): Promise<void> {
+  const plans = readClaudePlans()
+  const due = selectPlansToProbe({
+    plans,
+    state: readClaudePlansState(),
+    activeAgentId: MAIN_AGENT_ID,
+    nowMs: Date.now(),
+    // SUBPLANTOKEN1110: a plan a sub-agent runs on is not idle.
+    reservedPlanIds: subAgentTokenPlanIds(plans),
+  })
+  for (const plan of due) {
+    let token: string | null = null
+    try { token = plan.tokenSecretId ? getSecret(plan.tokenSecretId) : null } catch { token = null }
+    if (!token) {
+      console.error(`claude-plan-rotate-check: probe skipped for plan=${plan.id}: token missing from vault`)
+      continue
+    }
+    const result = await probePlanUsage(token)
+    token = null
+    const nowMs = Date.now()
+    const state = readClaudePlansState()
+    writeClaudePlansState(recordPlanObservation(state, plan.id, observationFromProbe(result, state.plans[plan.id], nowMs)))
+    if (!result.ok) console.error(`claude-plan-rotate-check: probe plan=${plan.id} error=${result.error} status=${result.httpStatus ?? '-'}`)
+  }
+}
+
+// The main agent's active plan when it is a TOKEN-mode plan that is actually
+// in effect, else null. Mirrors the launch-side gate (agent-process.ts
+// resolveActiveMainPlan + main-agent-isolated-config.mjs precedence): a
+// recorded plan only drives the main agent's login with
+// MAIN_AGENT_ISOLATED_CONFIG=1, 2+ plans, and no explicit
+// MAIN_AGENT_CONFIG_DIR. Outside that, the main agent runs on the host login,
+// which is exactly what usage-collect.py reads.
+export function activeTokenPlan(plans: ClaudePlan[]): ClaudePlan | null {
+  if (!settingIsOn('MAIN_AGENT_ISOLATED_CONFIG')) return null
+  let explicitDir = ''
+  try { explicitDir = String(getEffectiveSettingValue('MAIN_AGENT_CONFIG_DIR') ?? '').trim() } catch { explicitDir = '' }
+  if (explicitDir) return null
+  if (plans.length < 2) return null
+  const activeId = readClaudePlansState().activePlanByAgent[MAIN_AGENT_ID]
+  const plan = plans.find((p) => p.id === activeId)
+  return plan?.tokenSecretId ? plan : null
+}
+
+// Live usage of the ACTIVE token-mode plan, read with its own token -- the
+// same probe as POST /api/claude-plans/:id/probe. Runs on every heartbeat
+// tick: the per-plan probe throttles (30 min idle, 60 s manual) exist to keep
+// idle plans' quota untouched, and do not apply to the plan the main agent is
+// spending anyway. The outcome is recorded as that plan's observation either
+// way; null (no reading) on a missing token or a probe without usage headers,
+// which the decision treats as "unknown" (fail open, stay silent).
+async function probeActivePlan(plan: ClaudePlan): Promise<ActiveReading | null> {
+  let token: string | null = null
+  try { token = plan.tokenSecretId ? getSecret(plan.tokenSecretId) : null } catch { token = null }
+  if (!token) {
+    console.error(`claude-plan-rotate-check: active plan=${plan.id}: token missing from vault`)
+    return null
+  }
+  const result = await probePlanUsage(token)
+  token = null
+  const nowMs = Date.now()
+  const state = readClaudePlansState()
+  // Read BEFORE this probe is recorded: "the previous probe was a header-less 429 too" (P4).
+  const previousProbe = state.plans[plan.id]?.lastProbe
+  writeClaudePlansState(recordPlanObservation(state, plan.id, observationFromProbe(result, state.plans[plan.id], nowMs)))
+  if (!result.ok) console.error(`claude-plan-rotate-check: active probe plan=${plan.id} error=${result.error} status=${result.httpStatus ?? '-'}`)
+  const reading = activeReadingFromProbe(usageFromProbe(result), PROBE_SOURCE)
+  if (reading || result.ok || result.error !== 'rate_limited') return reading
+  // PLANROTATEDEADLOCK1115 P4: a 429 the reading above could not use (no 5h window).
+  const exhausted = exhaustedReadingFrom429({
+    usage: usageFromProbe(result), retryAfterSec: result.retryAfterSec, previous: previousProbe, nowMs, source: PROBE_SOURCE,
+  })
+  console.error(`claude-plan-rotate-check: active probe plan=${plan.id} 429 without a 5h window: ${exhausted ? 'read as exhausted' : 'no reading (a single short header-less 429)'}`)
+  return exhausted
+}
+
+/**
+ * PLANROTATEDEADLOCK1115 P1: one stdout line of the check, as an action. `kind` is its first word (ROTATE,
+ * NO_ALTERNATIVE, FLEET_..., SUBAGENT_...), `fields` its key=value pairs (ids; a label field with a space is cut at
+ * the space), `line` the line exactly as the script prints it.
+ */
+export interface RotationAction {
+  kind: string
+  line: string
+  fields: Record<string, string>
+}
+
+export function rotationActionFromLine(line: string): RotationAction {
+  const fields: Record<string, string> = {}
+  for (const m of line.matchAll(/(\w+)=(\S*)/g)) fields[m[1]] = m[2]
+  return { kind: line.split(' ', 1)[0], line, fields }
+}
+
+export interface RotateCheckDeps {
+  /** Called with each action the moment it is decided, where the script used to print its line. */
+  onAction?: (action: RotationAction) => void
+}
+
+/** The check, deciding but not printing: the lines runRotateCheck prints, as actions, in the same order. */
+export async function rotateCheckOnce(deps: RotateCheckDeps = {}): Promise<RotationAction[]> {
+  const actions: RotationAction[] = []
+  const emit = (line: string): void => {
+    const action = rotationActionFromLine(line)
+    actions.push(action)
+    deps.onAction?.(action)
+  }
+  // Report a finished fleet leg once (see pendingFleetReport). Independent of
+  // the usage reading below, so a failing collector never swallows the report.
+  try {
+    const report = pendingFleetReport(readClaudePlansState(), Date.now())
+    if (report) {
+      writeClaudePlansState(report.nextState)
+      emit(report.printLine)
+    }
+  } catch (err) {
+    console.error('claude-plan-rotate-check: fleet report failed:', err instanceof Error ? err.name : 'error')
+  }
+
+  // Rotation off means a quiet tick: no active probe, no idle probes, no
+  // usage-collect, no decision. Every probe is a live API call that spends the
+  // probed plan's own quota, and with rotation off nobody acts on the numbers
+  // (PR #1602 review: a leftover task made 1 live probe per tick this way).
+  // The fleet report above still runs: it closes a rotation that already
+  // happened before the switch was turned off.
+  if (!settingIsOn('CLAUDE_ROTATION_ENABLED')) return actions
+
+  // SUBPLANTOKEN1110 2nd PR: the sub-agents on token plans, FIRST -- their
+  // lines must come before a main-agent ROTATE, whose POST restarts the very
+  // session that processes them. Independent of the main agent's preconditions
+  // below (isolation, API key, usage-collect): a sub-agent's plan is its own.
+  // The launcher wiring is loaded only when some sub-agent names a token plan.
+  try {
+    const plans = readClaudePlans()
+    if (subAgentTokenPlanIds(plans).size > 0) {
+      const { runSubAgentStage } = await import('./web/claude-plan-subagent-wiring.js')
+      const sub = await runSubAgentStage(plans, readClaudePlansState(), Date.now())
+      writeClaudePlansState(sub.state)
+      for (const line of sub.lines) emit(line)
+    }
+  } catch (err) {
+    console.error('claude-plan-rotate-check: sub-agent stage failed:', err instanceof Error ? err.name : 'error')
+  }
+
+  // The active plan's usage, from exactly ONE source (see ActiveReading):
+  // its own probe when it is a token-mode plan in effect, otherwise
+  // usage-collect.py (the host login, which is then the right account).
+  const tokenPlan = activeTokenPlan(readClaudePlans())
+  let reading: ActiveReading | null
+  if (tokenPlan) {
+    try {
+      reading = await probeActivePlan(tokenPlan)
+    } catch (err) {
+      console.error('claude-plan-rotate-check: active plan probe failed:', err instanceof Error ? err.name : 'error')
+      reading = null
+    }
+  } else {
+    try {
+      const out = execFileSync('python3', [join(PROJECT_ROOT, 'scripts', 'usage-collect.py'), '--json'], {
+        cwd: PROJECT_ROOT,
+        encoding: 'utf-8',
+        timeout: 30_000,
+      })
+      reading = activeReadingFromUsageCollect(JSON.parse(out))
+    } catch (err) {
+      // Fail open and silent on stdout (no action taken), loud on stderr --
+      // mirrors quota-snapshot.ts's "everything degrades to null" rule.
+      console.error('claude-plan-rotate-check: usage-collect.py failed:', err instanceof Error ? err.message : err)
+      return actions
+    }
+  }
+
+  // Idle-plan probes happen on demand only: when the active plan is near a
+  // limit (IDLE_PROBE_GATE, a little below the rotation thresholds), so the
+  // decision below -- in this same tick -- ranks the candidates on fresh
+  // numbers. With a healthy active plan nothing is probed: every probe spends
+  // the probed plan's own quota for a decision nobody is about to make.
+  // CLAUDE_PLAN_USAGE_REFRESH (default on) is the operator's off switch.
+  try {
+    if (settingIsOn('CLAUDE_PLAN_USAGE_REFRESH') && activeReadingNearLimit(reading, Date.now())) await refreshIdlePlans()
+  } catch (err) {
+    // Never let the probe pass take the rotation heartbeat down with it.
+    console.error('claude-plan-rotate-check: idle-plan probe pass failed:', err instanceof Error ? err.name : 'error')
+  }
+
+  // Re-checked on purpose (defence in depth): this is the last gate before a
+  // ROTATE line, so it must not depend on the early return above staying put.
+  if (!settingIsOn('CLAUDE_ROTATION_ENABLED') || !settingIsOn('MAIN_AGENT_ISOLATED_CONFIG')) return actions
+  // MAINAUTH1107: the owner put the main agent on an API key. A rotation would move it onto a plan's own login
+  // (rotated: the key is unset) or token, i.e. silently off the key the owner chose. Never decided here.
+  // A plan already active for the main agent wins over api (main-auth: own-login / plan-token conflict), so the
+  // rotation keeps managing that plan; only a main that really runs on the key is left alone.
+  if (readAgentAuthMode(MAIN_AGENT_ID) === 'api' && !readClaudePlansState().activePlanByAgent[MAIN_AGENT_ID]) {
+    console.error('claude-plan-rotate-check: the main agent runs on an API key (authMode=api), no rotation decision')
+    return actions
+  }
+
+  const plansNow = readClaudePlans()
+  const result = decideAndRecord({
+    agentId: MAIN_AGENT_ID,
+    plans: plansNow,
+    // SUBPLANTOKEN1110: never rotate the main agent onto a sub-agent's token plan.
+    reservedPlanIds: subAgentTokenPlanIds(plansNow),
+    // Read AFTER the probes, so their fresh observations are what the
+    // candidates are ranked on.
+    state: readClaudePlansState(),
+    activeReading: reading,
+    nowMs: Date.now(),
+  })
+
+  if (result.nextState) writeClaudePlansState(result.nextState)
+  if (result.printLine) emit(result.printLine)
+  return actions
+}
+
+export async function runRotateCheck(): Promise<void> {
+  // Printed the moment each action is decided, as before the split: the order against stderr, and a line already
+  // printed when a later step throws, stay as they were.
+  await rotateCheckOnce({ onAction: (action) => console.log(action.line) })
+}

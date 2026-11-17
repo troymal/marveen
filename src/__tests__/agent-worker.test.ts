@@ -100,14 +100,32 @@ describe('workerHomeFor (WORKERHOME1: worker home derives from MAIN_AGENT_ID)', 
 })
 
 describe('workerStartAllowed (WORKERHOME1: WEB_ONLY must suppress every worker start)', () => {
+  // An explicit install root: the default (PROJECT_ROOT) would make these depend on where the suite runs
+  // (a worktree checkout is itself a second instance).
+  const install = { projectRoot: '/Users/x/ClaudeClaw', isGitFile: () => false, tmpDir: '/var/folders/zz/T' }
+
   it('blocks in WEB_ONLY staging', () => {
-    expect(workerStartAllowed({ WEB_ONLY: 'true' })).toBe(false)
+    expect(workerStartAllowed({ WEB_ONLY: 'true' }, install)).toBe(false)
   })
 
   it('allows on a normal install (unset or explicit false)', () => {
-    expect(workerStartAllowed({})).toBe(true)
-    expect(workerStartAllowed({ WEB_ONLY: 'false' })).toBe(true)
-    expect(workerStartAllowed({ WEB_ONLY: '' })).toBe(true)
+    expect(workerStartAllowed({}, install)).toBe(true)
+    expect(workerStartAllowed({ WEB_ONLY: 'false' }, install)).toBe(true)
+    expect(workerStartAllowed({ WEB_ONLY: '' }, install)).toBe(true)
+  })
+
+  it('#2419 follow-up: blocks a second instance (worktree, linked worktree, temp clone) unless it opts in', () => {
+    const second = [
+      { projectRoot: '/Users/x/ClaudeClaw/.claude/worktrees/wt1', isGitFile: () => false, tmpDir: '/var/folders/zz/T' },
+      { projectRoot: '/Users/x/abel-wt-bridgemeasure', isGitFile: () => true, tmpDir: '/var/folders/zz/T' },
+      { projectRoot: '/private/tmp/canary', isGitFile: () => false, tmpDir: '/var/folders/zz/T' },
+    ]
+    for (const where of second) {
+      expect(workerStartAllowed({}, where), where.projectRoot).toBe(false)
+      expect(workerStartAllowed({ MARVEEN_ALLOW_SECOND_INSTANCE_SERVICES: '1' }, where), where.projectRoot).toBe(true)
+      expect(workerStartAllowed({ MARVEEN_ALLOW_SECOND_INSTANCE_SERVICES: 'true' }, where), where.projectRoot).toBe(false)
+      expect(workerStartAllowed({ WEB_ONLY: 'true', MARVEEN_ALLOW_SECOND_INSTANCE_SERVICES: '1' }, where), where.projectRoot).toBe(false)
+    }
   })
 
   // String-contract wiring guard (house idiom: the pure predicate alone cannot
@@ -141,5 +159,47 @@ describe('workerStartAllowed (WORKERHOME1: WEB_ONLY must suppress every worker s
     const src = readFileSync(join(__dirname, '../web/agent-worker.ts'), 'utf-8')
     expect(src).toContain("tryResolveFromPath('claude')")
     expect(src).not.toMatch(/`claude --dangerously-skip-permissions/)
+  })
+})
+
+describe('worker custom-provider inheritance (subscription-less fleet support)', () => {
+  // String-contract guard: the source must wire the custom provider path so
+  // that subscription-less fleets (custom LiteLLM / OpenRouter endpoint) get
+  // working background workers without extra config.
+
+  it('buildCustomProviderLaunchEnv is imported from agent-process', () => {
+    const __dirname = dirname(fileURLToPath(import.meta.url))
+    const src = readFileSync(join(__dirname, '../web/agent-worker.ts'), 'utf-8')
+    expect(src).toContain('buildCustomProviderLaunchEnv')
+    expect(src).toContain('stampCustomApiKeyApproval')
+  })
+
+  it('buildCustomProviderLaunchEnv is only called when no MARVEEN_WORKER_MODEL override is set', () => {
+    const __dirname = dirname(fileURLToPath(import.meta.url))
+    const src = readFileSync(join(__dirname, '../web/agent-worker.ts'), 'utf-8')
+    // The call must be guarded by a WORKER_MODEL_OVERRIDE falsy check so an
+    // explicit override skips the custom-provider lookup entirely.
+    expect(src).toMatch(/if\s*\(\s*!WORKER_MODEL_OVERRIDE\s*\)[\s\S]{1,500}buildCustomProviderLaunchEnv/)
+  })
+
+  it('launch string concatenates customEnvPrefix between config-dir export and cd', () => {
+    const __dirname = dirname(fileURLToPath(import.meta.url))
+    const src = readFileSync(join(__dirname, '../web/agent-worker.ts'), 'utf-8')
+    // The launch template must include customEnvPrefix in its concatenation chain.
+    expect(src).toContain('customEnvPrefix')
+    // Both the CLAUDE_CONFIG_DIR export and the cd must appear alongside it in
+    // the same launch-building block.
+    const launchBlock = src.slice(src.indexOf('const launch ='), src.indexOf('const launch =') + 600)
+    expect(launchBlock).toContain('CLAUDE_CONFIG_DIR')
+    expect(launchBlock).toContain('customEnvPrefix')
+    expect(launchBlock).toContain('ctx.home')
+  })
+
+  it('x-api-key path stamps .claude.json approval in the worker configDir', () => {
+    const __dirname = dirname(fileURLToPath(import.meta.url))
+    const src = readFileSync(join(__dirname, '../web/agent-worker.ts'), 'utf-8')
+    // stampCustomApiKeyApproval must be called with ctx.configDir in scope.
+    expect(src).toContain('stampCustomApiKeyApproval')
+    expect(src).toContain("ctx.configDir, '.claude.json'")
   })
 })

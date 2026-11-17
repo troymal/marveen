@@ -128,6 +128,7 @@ describe('mint + storage discipline', () => {
       lastUsedAt: null,
       expiresAt: null,
       installId: null,
+      scope: 'full',
     })
   })
 })
@@ -136,7 +137,7 @@ describe('gate integration (Bearer + SSE lanes)', () => {
   it('a minted key authenticates as kind device on the Bearer lane', () => {
     const minted = createDeviceKey('bridge')
     const r = resolveAuth(mkReq({ authorization: `Bearer ${minted.key}` }), mkUrl('/api/memories'), '/api/memories', 'GET', TOKEN)
-    expect(r).toEqual({ kind: 'device', device: 'bridge', deviceId: minted.id })
+    expect(r).toEqual({ kind: 'device', device: 'bridge', deviceId: minted.id, scope: 'full' })
   })
   it('the dashboard token still wins precedence (checked first)', () => {
     createDeviceKey('bridge')
@@ -147,7 +148,7 @@ describe('gate integration (Bearer + SSE lanes)', () => {
     const minted = createDeviceKey('phone')
     const path = '/api/agents/zara/pane/stream'
     const r = resolveAuth(mkReq(), mkUrl(path, `?token=${minted.key}`), path, 'GET', TOKEN)
-    expect(r).toEqual({ kind: 'device', device: 'phone', deviceId: minted.id })
+    expect(r).toEqual({ kind: 'device', device: 'phone', deviceId: minted.id, scope: 'full' })
   })
   it('a device key is NOT honored via ?token= on a non-SSE path', () => {
     const minted = createDeviceKey('phone')
@@ -165,7 +166,7 @@ describe('restart survival', () => {
   it('resolves a key from the DB after the in-memory cache is dropped', () => {
     const minted = createDeviceKey('bridge')
     _clearDeviceKeyCacheForTest()
-    expect(resolveDeviceKey(minted.key)).toEqual({ id: minted.id, name: 'bridge' })
+    expect(resolveDeviceKey(minted.key)).toEqual({ id: minted.id, name: 'bridge', scope: 'full' })
   })
   it('tracks last_used on resolve', () => {
     const minted = createDeviceKey('bridge')
@@ -209,8 +210,11 @@ describe('revocation + expiry', () => {
 })
 
 describe('management endpoints (mint/list/revoke)', () => {
-  it('token mints a key; the raw value appears in the response ONCE and never in list', async () => {
-    const r = await call('POST', '/api/auth/device-keys', { auth: TOKEN_AUTH, body: { name: 'MacBook Bridge' } })
+  // OWNERGATE4-1104: minting and revoking take the owner (a session here); the bare token mints only the first key of
+  // an install with no login (credential-issuance-owner-session.test.ts), and this DB has had keys before.
+  const OWNER_AUTH: RouteContext['auth'] = { kind: 'session', user: 'op' }
+  it('the owner mints a key; the raw value appears in the response ONCE and never in list', async () => {
+    const r = await call('POST', '/api/auth/device-keys', { auth: OWNER_AUTH, body: { name: 'MacBook Bridge' } })
     expect(r.res.statusCode).toBe(201)
     const body = r.json()
     expect(String(body.key).startsWith('mvdk_')).toBe(true)
@@ -223,23 +227,23 @@ describe('management endpoints (mint/list/revoke)', () => {
     expect(r.res.statusCode).toBe(201)
   })
   it('mint validates the name', async () => {
-    const r = await call('POST', '/api/auth/device-keys', { auth: TOKEN_AUTH, body: { name: '' } })
+    const r = await call('POST', '/api/auth/device-keys', { auth: OWNER_AUTH, body: { name: '' } })
     expect(r.res.statusCode).toBe(400)
   })
   it('mint validates expires_in_days', async () => {
-    const r = await call('POST', '/api/auth/device-keys', { auth: TOKEN_AUTH, body: { name: 'x', expires_in_days: -5 } })
+    const r = await call('POST', '/api/auth/device-keys', { auth: OWNER_AUTH, body: { name: 'x', expires_in_days: -5 } })
     expect(r.res.statusCode).toBe(400)
-    const r2 = await call('POST', '/api/auth/device-keys', { auth: TOKEN_AUTH, body: { name: 'x', expires_in_days: 30 } })
+    const r2 = await call('POST', '/api/auth/device-keys', { auth: OWNER_AUTH, body: { name: 'x', expires_in_days: 30 } })
     expect(r2.res.statusCode).toBe(201)
     expect(r2.json().expires_at).toBeGreaterThan(Math.floor(Date.now() / 1000))
   })
   it('DELETE revokes by id; the key stops resolving', async () => {
-    const minted = await call('POST', '/api/auth/device-keys', { auth: TOKEN_AUTH, body: { name: 'phone' } })
+    const minted = await call('POST', '/api/auth/device-keys', { auth: OWNER_AUTH, body: { name: 'phone' } })
     const { id, key } = minted.json() as { id: number; key: string }
-    const del = await call('DELETE', `/api/auth/device-keys/${id}`, { auth: TOKEN_AUTH })
+    const del = await call('DELETE', `/api/auth/device-keys/${id}`, { auth: OWNER_AUTH })
     expect(del.res.statusCode).toBe(200)
     expect(resolveDeviceKey(key)).toBeNull()
-    const again = await call('DELETE', `/api/auth/device-keys/${id}`, { auth: TOKEN_AUTH })
+    const again = await call('DELETE', `/api/auth/device-keys/${id}`, { auth: OWNER_AUTH })
     expect(again.res.statusCode).toBe(404)
   })
 })

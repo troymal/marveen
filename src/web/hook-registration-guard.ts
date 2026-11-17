@@ -23,8 +23,9 @@ import { atomicWriteFileSync } from './atomic-write.js'
 
 // Hook script filenames this app registers into settings.json files
 // (templates/settings.json.template, ensureAgentStalenessHook, the
-// PreToolUse gates, and the telegram-progress installer). Used to decide
-// whether a missing-file hook entry is OURS (prunable) or foreign (kept).
+// PreToolUse gates, and the telegram/slack-progress watchdog installers).
+// Used to decide whether a missing-file hook entry is OURS (prunable) or
+// foreign (kept).
 export const KNOWN_HOOK_SCRIPTS: readonly string[] = [
   'taskstate-replay.py',
   'voice-reply-directive.py',
@@ -32,13 +33,41 @@ export const KNOWN_HOOK_SCRIPTS: readonly string[] = [
   'provenance-gate.py',
   'email-send-gate.mjs',
   'self-pace-gate.mjs',
+  'db-write-gate.mjs',
+  'mxd-path-gate.mjs',
   'telegram_progress.py',
   'telegram_progress_clear.py',
   'telegram_progress_watchdog.py',
+  // The Slack counterpart: the three settings hooks are repo-shipped in
+  // .claude/settings.json (#1305); the watchdog comes from
+  // scripts/install-slack-progress-hook.sh.
+  'slack_progress.py',
+  'slack_progress_clear.py',
+  'slack_progress_reply_clear.py',
+  'slack_progress_watchdog.py',
+  // PELENKAGCHAT1113: one script on two events (UserPromptSubmit records the
+  // inbound's thread, PreToolUse judges the Google Chat reply), in both the
+  // project settings and the sub-agent template.
+  'googlechat-thread-guard.py',
   'inbox-drain.py',
   'channel-inbox-drain.py',
   'ledger-capture.py',
+  // The Telegram sub-agent reply fix trio (telegram-subagent-reply-fix.py):
+  // without these here a stale entry survives every boot while its
+  // ledger-capture sibling is pruned (KNOWNTRIO924, review 2026-09-24).
+  'ledger-outbound.py',
+  'telegram-reply-guard.py',
+  'telegram-reply-directive.py',
   'skill-usage-capture.py',
+  'tool-log-capture.py',
+  'memory-frontmatter-gate.py',
+  'memory-frontmatter-bash-gate.py',
+  'shell-rescan-guard.py',
+  // The /clear continuity pair: SessionEnd capture + SessionStart replay.
+  'clear-capture.py',
+  'clear-replay.py',
+  // Prompt-arrival stub writer that backstops the PreCompact taskstate write.
+  'taskstate-stub.py',
 ]
 
 // Path fragment that marks a checkout as an agent worktree. Kept
@@ -124,6 +153,39 @@ export function shouldRegisterHooks(opts: {
     return { register: false, reason: 'WEB_ONLY staging mode' }
   }
   return { register: true }
+}
+
+// The opt-in for a second instance that runs the background services on purpose (Samu 64702, 64709):
+// read from the PROCESS environment, where WEB_ONLY is read (src/web.ts; there is no dotenv, so neither
+// of the two has any effect in the instance's .env file), and logged at start when it is on.
+export const ALLOW_SECOND_INSTANCE_SERVICES_KEY = 'MARVEEN_ALLOW_SECOND_INSTANCE_SERVICES'
+
+export interface BackgroundServicesDecision {
+  run: boolean
+  /** Why the services are off, or why they run although this is a second instance. */
+  reason?: string
+  /** True when a second instance runs them only because of the opt-in. */
+  override?: boolean
+}
+
+// May this instance run the background services (schedule runner, message router, monitors, worker
+// pre-start, persona-file ensures)? The same second-instance decision as the hook registration: a
+// worktree checkout or a temp-dir clone reads the user-global scheduled tasks and the shared tmux
+// server, so its schedule runner fires the live fleet's tasks into live sessions (2026-11-01 15:23,
+// Abel's worktree instance without WEB_ONLY). WEB_ONLY=true always turns them off; a second instance
+// turns them back on only with the explicit opt-in (allowSecondInstance).
+export function shouldRunBackgroundServices(opts: {
+  projectRoot: string
+  webOnly: boolean
+  allowSecondInstance: boolean
+  isGitFile?: (root: string) => boolean
+  tmpDir?: string
+}): BackgroundServicesDecision {
+  if (opts.webOnly) return { run: false, reason: 'WEB_ONLY staging mode' }
+  const second = shouldRegisterHooks({ projectRoot: opts.projectRoot, webOnly: false, isGitFile: opts.isGitFile, tmpDir: opts.tmpDir })
+  if (second.register) return { run: true }
+  if (opts.allowSecondInstance) return { run: true, override: true, reason: second.reason }
+  return { run: false, reason: second.reason }
 }
 
 type CommandHook = { type?: string; command?: string; [k: string]: unknown }

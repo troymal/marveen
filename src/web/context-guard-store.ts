@@ -49,3 +49,65 @@ export function writeContextGuardConfig(name: string, cfg: unknown): ContextGuar
   atomicWriteFileSync(STORE_PATH, JSON.stringify(raw, null, 2))
   return normalized
 }
+
+/**
+ * Apply a PUT body to one agent's config: MERGE it over the stored config, so
+ * a key the caller leaves out keeps its current value, then normalize.
+ *
+ * The endpoint used to REPLACE the row with the normalized body, and
+ * normalize() fills every omitted key with its default -- `enabled` included,
+ * which is false (opt-in). So `{"limitTokens": 600000}` answered 200 {ok:true}
+ * while switching the guard OFF, and the dashboard's own guard panel, which
+ * sends 6 of the 12 fields, reset the idle-flush and daily-handoff tiers of
+ * every agent it saved. An endpoint that refuses an unknown key loudly (see
+ * checkConfigPutFields) but defaults a missing one silently looks strict
+ * exactly where it is not.
+ *
+ * An explicit null is a value, not an omission: `{"limitTokens": null}` still
+ * clears the override. An agent with no row merges over the disabled default,
+ * so a partial PUT never arms a guard that nobody enabled.
+ */
+export function mergeContextGuardConfig(name: string, patch: unknown): ContextGuardConfig {
+  const raw = readRaw()
+  const { merged } = previewContextGuardMerge(name, patch)
+  raw[name] = merged
+  atomicWriteFileSync(STORE_PATH, JSON.stringify(raw, null, 2))
+  return merged
+}
+
+/** OWNERGATE3-1104: what mergeContextGuardConfig WOULD store, without writing: the normalized current config and
+ *  the normalized merge of the patch over it. The route compares the two (contextGuardWeakenings) before it writes. */
+export function previewContextGuardMerge(name: string, patch: unknown): { current: ContextGuardConfig; merged: ContextGuardConfig } {
+  const raw = readRaw()
+  const current = name in raw ? normalizeContextGuardConfig(raw[name]) : { ...DEFAULT_CONTEXT_GUARD }
+  const fields = (patch && typeof patch === 'object' && !Array.isArray(patch)) ? patch as Record<string, unknown> : {}
+  return { current, merged: normalizeContextGuardConfig({ ...current, ...fields }) }
+}
+
+/**
+ * Arm the context guard for an agent that has JUST been created.
+ *
+ * A new agent must come up with the guard ON (fleet policy, 2026-09-08). The
+ * obvious implementation -- flipping DEFAULT_CONTEXT_GUARD.enabled to true --
+ * is the wrong one, because that default is also the answer for every agent
+ * that has NO entry, and some of those are deliberate:
+ *
+ *   - hidden technical workers (agents/heartbeat and friends) run with the
+ *     saturation net ONLY; the proactive handoff/restart tiers are switched
+ *     off for them on purpose (see context-guard-hidden-worker.test.ts), and
+ *     a global default would arm them silently;
+ *   - an operator who never opened the guard panel for an existing agent has
+ *     not consented to handoff-and-restart cycles on it.
+ *
+ * Writing an EXPLICIT row at creation time keeps the default-off fallback
+ * intact and changes exactly one thing: agents born from here on.
+ *
+ * Idempotent by design. An agent that already has a row keeps it untouched and
+ * the function returns null -- re-running a creation/import path must never
+ * overwrite an operator's deliberate `enabled: false`.
+ */
+export function seedContextGuardForNewAgent(name: string): ContextGuardConfig | null {
+  const raw = readRaw()
+  if (name in raw) return null
+  return writeContextGuardConfig(name, { ...DEFAULT_CONTEXT_GUARD, enabled: true })
+}

@@ -13,15 +13,17 @@
 
 > AI csapatod, ami fut amíg te alszol.
 
-Marveen egy AI asszisztens keretrendszer, ami Claude Code-ra épül. Saját AI csapatot építhetsz, akik Telegramon vagy Slacken kommunikálnak veled, önállóan dolgoznak, és egymással is együttműködnek.
+Marveen egy AI asszisztens keretrendszer, ami Claude Code-ra épül. Saját AI csapatot építhetsz, akik Telegramon, Slacken vagy Discordon kommunikálnak veled, önállóan dolgoznak, és egymással is együttműködnek.
+
+Marveen is a self-hostable **agent harness** for Claude Code: it runs a team of AI agents, each with its own chat channel (Telegram, Slack or Discord), persistent memory, scheduled tasks, and MCP tools, lets them delegate work to one another, and gives you a web dashboard to watch and steer them.
 
 ## Funkciók
 
-- **AI Csapat**: Több ágens, mindegyik saját csatornával (Telegram vagy Slack), személyiséggel és memóriával
+- **AI Csapat**: Több ágens, mindegyik saját csatornával (Telegram, Slack vagy Discord), személyiséggel és memóriával
 - **Mission Control**: Web dashboard (http://localhost:3420) a csapat kezeléséhez
 - **Inter-agent kommunikáció**: Az ágensek delegálhatnak egymásnak feladatokat
 - **Ütemezések**: Cron-alapú feladatok automatikus futtatása
-- **Kanban**: Feladattábla AI auto-bontással; Jira-szerű nézetek — swimlane (csoportosítás felelős vagy prioritás szerint), oszloponkénti WIP-limit, beakadt-kártya jelzés (card-aging), alfeladat-beágyazás és kártya-szerkesztő
+- **Kanban**: Feladattábla AI auto-bontással; Jira-szerű nézetek: swimlane (csoportosítás felelős vagy prioritás szerint), oszloponkénti WIP-limit, beakadt-kártya jelzés (card-aging), részfeladat-beágyazás és kártya-szerkesztő
 - **Heartbeat**: Csendes háttér-monitorozás, csak fontosnál szól (naptár, email, kanban)
 - **Memória**: Hot/Warm/Cold tier rendszer, hibrid kereséssel (FTS5 + vektor) és gráf nézettel
 - **MCP Connectorok**: Gmail, Calendar, Drive, Notion, Slack és más szolgáltatások
@@ -40,7 +42,7 @@ Részletes, funkciónkénti leírások a [`docs/`](docs/README.md) mappában —
 | Ügynök-flotta + inter-agent | [docs/agent-fleet.md](docs/agent-fleet.md) |
 | Föderáció (több példány összekötése, dashboard-menüvel) | [docs/federation.md](docs/federation.md) |
 | Skill-factory (öntanulás) | [docs/skill-factory.md](docs/skill-factory.md) |
-| Channels (Telegram / Slack) | [docs/channels.md](docs/channels.md) |
+| Channels (Telegram / Slack / Discord) | [docs/channels.md](docs/channels.md) |
 | Printing-press CLI-k | [docs/printing-press-cli.md](docs/printing-press-cli.md) |
 | Skool CLI | [docs/skool-cli.md](docs/skool-cli.md) |
 | connectors.hu | [docs/connectors-hu.md](docs/connectors-hu.md) |
@@ -52,6 +54,7 @@ Részletes, funkciónkénti leírások a [`docs/`](docs/README.md) mappában —
 | Beszélgetés-folytonosság | [docs/conversation-continuity.md](docs/conversation-continuity.md) |
 | Channel reply-guard | [docs/channel-reply-guard.md](docs/channel-reply-guard.md) |
 | Telegram haladásjelző | [docs/telegram-progress-indicator.md](docs/telegram-progress-indicator.md) |
+| Slack haladásjelző | [docs/slack-progress-indicator.md](docs/slack-progress-indicator.md) |
 | Új asszisztens onboarding | [docs/onboarding-uj-asszisztens.md](docs/onboarding-uj-asszisztens.md) |
 
 ## Öntanulás & Seed-ek
@@ -104,6 +107,22 @@ A Windows telepítő automatikusan beállítja a WSL-t (Windows Subsystem for Li
 > ```
 > Ez a megbízható út, ha a `wsl.exe`/Windows-claude környezet összeakad.
 
+### Docker (English)
+
+Marveen also runs as a container with Docker Compose, on any Linux server with Docker:
+
+<!-- DOCKERGUIDEBUILD1108 (decided before the release, owner, with the Tuesday promote): the image is not published
+     yet (MARVEEN_PUBLISH_IMAGE is off), so "docker compose up -d" stops with "error from registry: denied" and does
+     not build by itself (measured on a Hostinger VPS, HOSTINGERDOCKER1107). Either this step says "--build" or the
+     image is published. Do not ship this step unchanged. -->
+```bash
+git clone https://github.com/Szotasz/marveen.git && cd marveen
+docker compose up -d
+docker compose logs marveen   # the dashboard link
+```
+
+The dashboard listens on the server's `127.0.0.1` only: connect with Marveen Bridge or an SSH tunnel, or use your own domain with automatic HTTPS (`MARVEEN_DOMAIN=... docker compose --profile tls up -d`). The setup wizard in the dashboard asks for the owner, the Claude login (`claude setup-token`) and the chat channel. Full guide: [docs/docker.md](docs/docker.md).
+
 A telepítő végigvezet a beállításokon:
 1. Függőségek ellenőrzése és telepítése
 2. Claude Code bejelentkezés
@@ -144,9 +163,9 @@ A `MAIN_AGENT_ID` és `SERVICE_ID` értékeket a telepítő automatikusan szárm
 ### Dashboard
 Nyisd meg: http://localhost:3420
 
-### Csatorna (Telegram vagy Slack)
+### Csatorna (Telegram, Slack vagy Discord)
 
-A telepítés során választhatsz csatorna providert. Az alapértelmezett a Telegram.
+A telepítés során választhatsz csatorna providert (Linuxon és macOS-en is). Az alapértelmezett a Telegram.
 
 #### Telegram (alapértelmezett)
 Írj a botodnak Telegramon -- Marveen válaszol.
@@ -169,6 +188,27 @@ Slack használatához a telepítő automatikusan végigvezet, de manuálisan is 
    SLACK_CHANNEL_ID=C01234ABCDE
    ```
 8. A Slack channel plugin automatikusan települ: `slack@jeremylongshore/claude-code-slack-channel`
+
+
+#### Discord (alternatív)
+
+A telepítő végigvezet (Linuxon és macOS-en is a 3. opció), de manuálisan is beállíthatod:
+
+1. Hozz létre egy alkalmazást a [Discord Developer Portalon](https://discord.com/developers/applications)
+2. A Bot fülön add hozzá a botot és másold ki a tokent
+3. Privileged Gateway Intents: kapcsold be a MESSAGE CONTENT INTENT-et
+4. OAuth2 > URL Generator: bot scope, majd hívd meg a botot a szerveredre
+5. Developer Mode-dal másold ki a csatorna ID-t és a saját (operátor) user ID-det
+6. A `.env` fájlban állítsd be:
+   ```
+   CHANNEL_PROVIDER=discord
+   DISCORD_BOT_TOKEN=...
+   DISCORD_CHANNEL_ID=...
+   OPERATOR_DISCORD_USER_ID=...
+   ```
+7. A Discord channel plugin automatikusan települ: `discord@claude-plugins-official`
+
+Részletek (managed-settings allowlist, párosítás): [docs/channels.md](docs/channels.md).
 
 A csatorna váltáshoz futtasd újra a `./install.sh`-t vagy szerkeszd a `.env` fájlt manuálisan.
 
@@ -224,6 +264,10 @@ ssh macmini "/opt/homebrew/bin/tmux kill-session -t monitor" && \
 ```
 
 A script automatikusan felderíti a futó `agent-*` és `marveen-channels` session-öket. A monitor session törlése nem érinti az ágens session-öket -- csak a linked-window referenciákat szünteti meg.
+
+### Ügynökönkénti költségkeret
+
+A CostOps-konfigurációban (`costops-config.json`) ügynökönként havi keret adható (`budgets`, `scope: "agent"`), az árakat a `token_prices` adja; ár nélküli modellt a rendszer nem becsül, árazatlannak jelöl. A `warning` és a `hard` szint havonta egyszer riaszt. A `hard` szint is csak riaszt: nem állítja le és nem lassítja az ügynököt. Ha egy hónapban árazatlan tokenek is vannak, arról külön, havonta egy riasztás megy, mert azok nincsenek benne a keret százalékában.
 
 ### Remote access key enrollment
 

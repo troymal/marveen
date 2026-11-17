@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest'
+import { paneShowsContextSaturation, paneShowsContextSaturationHardError } from '../pane-state.js'
+import { detectsUsageLimit } from '../model-fallback.js'
 import {
   normalizeContextGuardConfig,
   contextLimitForModel,
@@ -10,7 +12,18 @@ import {
   INITIAL_GUARD_STATE,
   READY_TIMEOUT_MS,
   SATURATION_CONFIRM_SWEEPS,
+  SATURATION_CREDIBLE_MIN_PCT,
+  saturationBannerCredible,
+  MAX_STALE_REFRESHES,
   STALE_REFRESH_REASON_PREFIX,
+  IDLE_FLUSH_REASON_PREFIX,
+  DAILY_HANDOFF_REASON_PREFIX,
+  USAGE_LIMIT_REASON_PREFIX,
+  usageLimitEvidenceFromTranscript,
+  usageLimitVerdict,
+  isUsageLimitRefusal,
+  USAGE_LIMIT_MAX_PARK_MS,
+  HANDOFF_RESEND_REASON_PREFIX,
   type ContextGuardConfig,
   type GuardInputs,
   type GuardState,
@@ -28,14 +41,25 @@ function inputs(overrides: Partial<GuardInputs> = {}): GuardInputs {
     running: true,
     paneIdle: true,
     paneBusy: false,
+    paneBackgroundWork: false,
     sessionReady: false,
     handoffMtime: null,
     paneSaturated: false,
+    // The daily tier defaults to not-due for the same reason the idle probes
+    // default to unmeasurable: every pre-existing case below must keep
+    // describing an agent this tier cannot act on.
+    dailyHandoffDue: false,
+    periodicHandoffDue: false,
+    taskCloseHandoffDue: false,
     // Idle-flush probes default to unmeasurable, so every pre-existing case
     // below describes an agent the idle tier cannot act on. That keeps this
     // helper's change from silently arming a new tier under the old tests.
     contextTokens: null,
     idleMs: null,
+    // Not usage-limited by default: every pre-existing case describes a
+    // session that can run a turn.
+    usageLimited: false,
+    pendingResumeExpiresAtMs: null,
     ...overrides,
   }
 }
@@ -74,6 +98,14 @@ describe('contextLimitForModel / calibrateLimit', () => {
     // 985k-999k, opus-5 979k live) -- the blanket-200k guess restarted
     // working agents at ~21% real usage.
     expect(contextLimitForModel('claude-fable-5')).toBe(1_000_000)
+    // Fable 5.2 (FABLE52SELECTOR1109): Claude Code 2.1.319 does not know the id and reports a
+    // 200000 window for it (5.1 on the same CLI: 1000000), so the guard reads it at 200k;
+    // the explicit [1m] opt-in still wins, and 5.1 / a 5-20 lookalike keep the 1M family rule.
+    expect(contextLimitForModel('claude-fable-5-2')).toBe(200_000)
+    expect(contextLimitForModel('anthropic.claude-fable-5-2')).toBe(200_000)
+    expect(contextLimitForModel('claude-fable-5-2[1m]')).toBe(1_000_000)
+    expect(contextLimitForModel('claude-fable-5-1')).toBe(1_000_000)
+    expect(contextLimitForModel('claude-fable-5-20')).toBe(1_000_000)
     expect(contextLimitForModel('fable-5')).toBe(1_000_000)
     expect(contextLimitForModel('claude-mythos-5')).toBe(1_000_000)
     expect(contextLimitForModel('claude-opus-4-8')).toBe(1_000_000)
@@ -83,10 +115,38 @@ describe('contextLimitForModel / calibrateLimit', () => {
     // Sonnet stays 200k: never observed above 198k on this host. Haiku 200k
     // by spec; unknown models stay conservative (calibration steps them up).
     expect(contextLimitForModel('claude-sonnet-5')).toBe(200_000)
+    // Sonnet 5.5 runs a 1M window (status bar 216k/1M, 2026-10-12): the 200k
+    // guess restarted it at ~20% real usage.
+    expect(contextLimitForModel('claude-sonnet-5-5')).toBe(1_000_000)
+    // Non-bare forms (Bedrock IDs), so the pattern cannot narrow to the bare id unnoticed.
+    expect(contextLimitForModel('anthropic.claude-sonnet-5-5')).toBe(1_000_000)
+    expect(contextLimitForModel('anthropic.claude-sonnet-5-5-v1:0')).toBe(1_000_000)
+    // The generic [1m] branch for a model outside the 1M families.
+    expect(contextLimitForModel('claude-sonnet-4-6[1m]')).toBe(1_000_000)
     expect(contextLimitForModel('claude-haiku-4-5')).toBe(200_000)
     expect(contextLimitForModel('claude-opus-4-5')).toBe(200_000)
     expect(contextLimitForModel('deepseek-v4-pro')).toBe(200_000)
+    // OpenRouter DeepSeek V4: 1M, paired with the CLAUDE_CODE_MAX_CONTEXT_TOKENS
+    // export in agent-process.ts (status bar was 165k/200k without it).
+    expect(contextLimitForModel('deepseek/deepseek-v4.1-flash')).toBe(1_000_000)
+    expect(contextLimitForModel('qwen/qwen3-coder')).toBe(200_000)
     expect(contextLimitForModel(null)).toBe(200_000)
+  })
+
+  it('trusts minimax-m3 for the real 1M window -- but ONLY because agent-process.ts forces CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000 to work around a vendor-side compat-layer bug', () => {
+    // MiniMax's own /anthropic compat endpoint misreports 200K in its model
+    // metadata instead of M3's real 1M (MiniMax-AI/MiniMax-M2.7#46). Measured
+    // live 2026-08-19 BEFORE the workaround, on two independently running
+    // fleet agents (mag 108992/54%=201.8k, rendezo 62810/31%=202.6k) -- both
+    // converged on ~200k, matching the vendor bug exactly. AFTER
+    // resolveProviderEnv started forcing CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000,
+    // a live restart confirmed the CLI itself now reports a ~1M window (pane
+    // showed "999k left" / "937k left" post-restart, up from "199k left" /
+    // "137k left"). This constant and that env var override are a PAIR: if the
+    // override in agent-process.ts is ever removed, this must revert to
+    // 200_000 (like deepseek-v4-pro above), or the guard will under-restart
+    // against a window the CLI no longer actually has.
+    expect(contextLimitForModel('minimax-m3')).toBe(1_000_000)
   })
 
   it('defaults the handoff timeout to 20 minutes (6 was shorter than a working turn)', () => {
@@ -178,11 +238,11 @@ describe('decideGuard: idle', () => {
     expect(d.nextState.deadlineMs).toBe(NOW + CFG.handoffTimeoutMinutes * 60_000)
   })
 
-  it('defers the idle-phase hard-tier restart while the agent is mid-turn', () => {
+  it('asks a mid-turn agent past hardPct for a handoff and never restarts it', () => {
     const d = decideGuard(INITIAL_GUARD_STATE, inputs({ pct: 0.99, paneBusy: true, paneIdle: false }), CFG)
-    expect(d.action).toBe('none')
-    expect(d.reason).toContain('deferring')
-    expect(d.nextState.phase).toBe('idle')
+    expect(d.action).toBe('request-handoff')
+    expect(d.reason).toContain('mid-turn')
+    expect(d.nextState.phase).toBe('await-handoff')
   })
 
   it('skips straight to restart at hardPct', () => {
@@ -193,7 +253,7 @@ describe('decideGuard: idle', () => {
 
   it('resets to initial state when fully disarmed (guard + net off)', () => {
     const disarmed = { ...CFG, enabled: false, saturationRestart: false }
-    const stale: GuardState = { phase: 'await-handoff', handoffMtimeAtRequest: 1, deadlineMs: 2, cooldownUntilMs: 0, saturatedStreak: 0, handoffStaleMinutes: null }
+    const stale: GuardState = { phase: 'await-handoff', handoffMtimeAtRequest: 1, deadlineMs: 2, cooldownUntilMs: 0, saturatedStreak: 0, staleRefreshCount: 0, handoffStaleMinutes: null }
     const d = decideGuard(stale, inputs({ pct: 0.99, paneSaturated: true }), disarmed)
     expect(d.action).toBe('none')
     expect(d.nextState).toEqual(INITIAL_GUARD_STATE)
@@ -201,7 +261,7 @@ describe('decideGuard: idle', () => {
 
   it('stands down a stale await-handoff into cooldown when the guard is disabled mid-sequence', () => {
     const netOnly = { ...CFG, enabled: false }
-    const stale: GuardState = { phase: 'await-handoff', handoffMtimeAtRequest: 1, deadlineMs: 2, cooldownUntilMs: 0, saturatedStreak: 0, handoffStaleMinutes: null }
+    const stale: GuardState = { phase: 'await-handoff', handoffMtimeAtRequest: 1, deadlineMs: 2, cooldownUntilMs: 0, saturatedStreak: 0, staleRefreshCount: 0, handoffStaleMinutes: null }
     const d = decideGuard(stale, inputs({ pct: 0.99 }), netOnly)
     expect(d.action).toBe('none')
     expect(d.nextState.phase).toBe('cooldown')
@@ -255,6 +315,7 @@ describe('saturation net (samu 2026-07-18 stall)', () => {
       deadlineMs: NOW + 60_000,
       cooldownUntilMs: 0,
       saturatedStreak: 0,
+      staleRefreshCount: 0,
       handoffStaleMinutes: null,
     }
     const d = decideGuard(awaiting, inputs({ paneSaturated: true, paneIdle: false }), CFG)
@@ -275,6 +336,7 @@ describe('saturation net (samu 2026-07-18 stall)', () => {
       deadlineMs: 0,
       cooldownUntilMs: NOW + 60_000,
       saturatedStreak: 0,
+      staleRefreshCount: 0,
       handoffStaleMinutes: null,
     }
     const d = decideGuard(cooling, inputs({ paneSaturated: true }), netOnly)
@@ -296,6 +358,7 @@ describe('decideGuard: await-handoff', () => {
     deadlineMs: NOW + 60_000,
     cooldownUntilMs: 0,
     saturatedStreak: 0,
+    staleRefreshCount: 0,
     handoffStaleMinutes: null,
   }
 
@@ -374,6 +437,46 @@ describe('decideGuard: await-handoff', () => {
   })
 })
 
+// The runner sweeps every 5 minutes (INTERVAL_MS = 300_000 in
+// src/web/context-guard-runner.ts), and with a 5-minute ready deadline the
+// fresh session got exactly ONE readiness check. Measured 2026-09-28: 3 of 13
+// restarts lost the resume ("ready timeout") because the new session was busy
+// at that single sweep. The deadline must leave several sweeps of room.
+describe('decideGuard: await-ready survives busy sweeps', () => {
+  const TICK = 5 * 60_000 // the runner's sweep interval
+  const t0 = NOW
+  const busy = { running: true, sessionReady: false, paneIdle: false, paneBusy: true }
+
+  it('busy at t0+5 and t0+10, ready at t0+15 -> the resume is injected', () => {
+    const awaiting: GuardState = {
+      ...INITIAL_GUARD_STATE,
+      phase: 'await-handoff',
+      handoffMtimeAtRequest: 100,
+      deadlineMs: t0 + 60_000,
+    }
+    // The restart itself, through the real decision path.
+    const restart = decideGuard(awaiting, inputs({ nowMs: t0, handoffMtime: 200, paneIdle: true }), CFG)
+    expect(restart.action).toBe('restart')
+    expect(restart.nextState.phase).toBe('await-ready')
+
+    const tick1 = decideGuard(restart.nextState, inputs({ nowMs: t0 + TICK, ...busy }), CFG)
+    expect(tick1.action).toBe('none')
+    expect(tick1.nextState.phase).toBe('await-ready')
+
+    const tick2 = decideGuard(tick1.nextState, inputs({ nowMs: t0 + 2 * TICK, ...busy }), CFG)
+    expect(tick2.action).toBe('none')
+    expect(tick2.nextState.phase).toBe('await-ready')
+
+    const tick3 = decideGuard(tick2.nextState, inputs({ nowMs: t0 + 3 * TICK, sessionReady: true }), CFG)
+    expect(tick3.action).toBe('inject-resume')
+    expect(tick3.reason).not.toMatch(/ready timeout/)
+  })
+
+  it('the ready window spans more than one sweep', () => {
+    expect(READY_TIMEOUT_MS).toBeGreaterThanOrEqual(3 * TICK)
+  })
+})
+
 // 2026-08-17 (GUARDSTALEHO817): the guard restarted samu with reason "handoff
 // written" while HANDOFF.md was 20 minutes old and covered NOTHING of the work
 // done since -- including a merge-gate verdict on a payment PR. The agent wrote
@@ -388,6 +491,7 @@ describe('stale handoff (GUARDSTALEHO817)', () => {
     deadlineMs: NOW + 5 * 60_000,
     cooldownUntilMs: 0,
     saturatedStreak: 0,
+    staleRefreshCount: 0,
     handoffStaleMinutes: null,
   }
   // Handoff written 20 minutes ago (after the request), last transcript
@@ -416,6 +520,22 @@ describe('stale handoff (GUARDSTALEHO817)', () => {
     expect(d.nextState.handoffStaleMinutes).toBe('unknown')
   })
 
+  it('the idle-flush origin of a sequence survives a stale-refresh request', () => {
+    // A refresh overwrites handoffRequestReason, so the restart notice cannot
+    // read the origin from there. The marker rides along via ...state.
+    const idleSeq: GuardState = {
+      ...awaiting,
+      handoffRequestReason: `${IDLE_FLUSH_REASON_PREFIX} (600k tokens)`,
+      idleFlushSequence: true,
+    }
+    const refresh = decideGuard(idleSeq, inputs(staleWritten), CFG)
+    expect(refresh.reason).toContain(STALE_REFRESH_REASON_PREFIX)
+    expect(refresh.nextState.handoffRequestReason).toContain(STALE_REFRESH_REASON_PREFIX)
+    expect(refresh.nextState.idleFlushSequence).toBe(true)
+    // ...and a sequence that did not start as an idle-flush never gains it.
+    expect(decideGuard(awaiting, inputs(staleWritten), CFG).nextState.idleFlushSequence).toBeFalsy()
+  })
+
   it('asks for a refresh instead of restarting when the written handoff is stale and there is budget', () => {
     const d = decideGuard(awaiting, inputs(staleWritten), CFG)
     expect(d.action).toBe('request-handoff')
@@ -436,6 +556,67 @@ describe('stale handoff (GUARDSTALEHO817)', () => {
     expect(d.action).toBe('restart')
     expect(d.reason).toBe('handoff written')
     expect(d.nextState.handoffStaleMinutes).toBe(null)
+  })
+
+  it('caps stale refreshes: an agent that invalidates every handoff it writes restarts BEFORE the deadline', () => {
+    // Measured 2026-09-20 (cortex-ugypasztor): the agent's own 5-minute
+    // scheduled task fires between every pair of guard sweeps, so the handoff
+    // it has just written is ~4m stale on the next sweep -- above the 3m slack
+    // -- EVERY time. Staleness measures when the last activity was, not what it
+    // was, so an empty poll counts the same as real work. Before the cap this
+    // looped to handoffTimeoutMinutes: 4 requests, 20 minutes, 90% -> 94%.
+    const DEADLINE_MS = NOW + 20 * 60_000
+    const SWEEP_MS = 5 * 60_000
+    let state: GuardState = {
+      phase: 'await-handoff',
+      handoffMtimeAtRequest: NOW - 30 * 60_000,
+      deadlineMs: DEADLINE_MS,
+      cooldownUntilMs: 0,
+      saturatedStreak: 0,
+      staleRefreshCount: 0,
+      handoffStaleMinutes: null,
+    }
+    const actions: string[] = []
+    let restartAtMs: number | null = null
+    let lastReason = ''
+    for (let sweep = 0; sweep < 6; sweep++) {
+      const atMs = NOW + sweep * SWEEP_MS
+      const d = decideGuard(state, inputs({
+        nowMs: atMs,
+        pct: 0.91,
+        paneIdle: true,
+        idleMs: 30_000,
+        // answered the request, then its own poll woke it again: the fresh
+        // write lands ~4 minutes before the last activity, every round.
+        handoffMtime: atMs - 30_000 - 4 * 60_000,
+      }), CFG)
+      actions.push(d.action)
+      lastReason = d.reason
+      state = d.nextState
+      if (d.action === 'restart') { restartAtMs = atMs; break }
+    }
+
+    expect(actions.filter((a) => a === 'request-handoff')).toHaveLength(MAX_STALE_REFRESHES)
+    expect(actions[actions.length - 1]).toBe('restart')
+    // the loop terminates on its own, strictly before the timeout it used to reach
+    expect(restartAtMs).not.toBeNull()
+    expect(restartAtMs as number).toBeLessThan(DEADLINE_MS)
+    // and it says WHY it stopped asking -- "spent the budget" and "never
+    // answered" used to look identical in the log, which is the opposite diagnosis
+    expect(lastReason).toContain('accepting as-is')
+    // the handoff still ships with its staleness attached, so inject-resume can say so
+    expect(state.phase).toBe('await-ready')
+    expect(state.handoffStaleMinutes).toBe(4)
+  })
+
+  it('gives every NEW await-handoff sequence a fresh refresh budget', () => {
+    // Without this, only the first sequence after a dashboard start would ever
+    // get its refresh, and the 2026-08-17 case (real work landing after the
+    // write) would silently stop being covered from the second round on.
+    const d = decideGuard(INITIAL_GUARD_STATE, inputs({ pct: 0.95 }), CFG)
+    expect(d.action).toBe('request-handoff')
+    expect(d.nextState.phase).toBe('await-handoff')
+    expect(d.nextState.staleRefreshCount).toBe(0)
   })
 
   it('past the deadline a stale handoff restarts anyway, with the staleness said out loud', () => {
@@ -485,6 +666,7 @@ describe('decideGuard: await-ready', () => {
     deadlineMs: NOW + 60_000,
     cooldownUntilMs: 0,
     saturatedStreak: 0,
+    staleRefreshCount: 0,
     handoffStaleMinutes: null,
   }
 
@@ -515,6 +697,7 @@ describe('decideGuard: cooldown', () => {
     deadlineMs: 0,
     cooldownUntilMs: NOW + 60_000,
     saturatedStreak: 0,
+    staleRefreshCount: 0,
     handoffStaleMinutes: null,
   }
 
@@ -563,6 +746,7 @@ describe('decideGuard -- idle-flush tier', () => {
   it('requests a handoff when heavy, quiet and idle', () => {
     const d = decideGuard(INITIAL_GUARD_STATE, inputs({ contextTokens: HEAVY, idleMs: QUIET, paneIdle: true }), IDLE_CFG)
     expect(d.action).toBe('request-handoff')
+    expect(d.nextState.idleFlushSequence).toBe(true)
     expect(d.nextState.phase).toBe('await-handoff')
     // The reason has to carry both measurements: an operator reading the log
     // needs to see WHY this session was picked, not just that it was.
@@ -665,6 +849,7 @@ describe('decideGuard -- idle-flush tier', () => {
       deadlineMs: NOW + 60_000,
       cooldownUntilMs: 0,
       saturatedStreak: 0,
+      staleRefreshCount: 0,
       handoffStaleMinutes: null,
     }
     const d = decideGuard(awaiting, inputs({ handoffMtime: NOW, paneIdle: true }), IDLE_CFG)
@@ -708,5 +893,634 @@ describe('normalizeContextGuardConfig -- idle-flush fields', () => {
     expect(normalizeContextGuardConfig({ idleMinutes: 0 }).idleMinutes).toBe(20)
     expect(normalizeContextGuardConfig({ idleMinutes: -5 }).idleMinutes).toBe(20)
     expect(normalizeContextGuardConfig({ idleMinutes: 45 }).idleMinutes).toBe(45)
+  })
+})
+
+// The pane banner and the transcript measurement are two claims about the same
+// fact, and on 2026-09-15 (isapp06) they disagreed for nine days: 318 numeric
+// "pane saturated" hard restarts across four agents, measured context 18-43%,
+// never once above 90%. Cause: a model id that reaches the CLI WITHOUT the
+// `[1m]` marker makes the CLI size its status line to 200k and print
+// "100% context used" at ~179k, while the session keeps working to ~1M.
+// saturationBannerCredible is the referee -- a real measurement may overrule a
+// real PERCENTAGE claim, and nothing else may be overruled at all.
+describe('saturationBannerCredible', () => {
+  it('rejects a percentage banner at the measured false-positive percentages (the 318 kills)', () => {
+    // min / median / max of the production incident, pinned as numbers.
+    expect(saturationBannerCredible(true, false, 0.18)).toBe(false)
+    expect(saturationBannerCredible(true, false, 0.19)).toBe(false)
+    expect(saturationBannerCredible(true, false, 0.43)).toBe(false)
+  })
+
+  it('NEVER overrules an ERROR-shaped banner, at any measurement', () => {
+    // "Context limit reached", "context ... full" and "auto-compact required"
+    // are painted only after a turn ACTUALLY failed at the real limit (CLI
+    // 2.1.205 renders "Context limit reached" in color:"error" off the API's
+    // own "input length and max_tokens exceed context limit"), so no
+    // denominator is involved and no measurement may second-guess them.
+    //
+    // This is the load-bearing case. A turn that dies on a context-limit error
+    // leaves the transcript's last recorded usage at the value BEFORE the
+    // failed turn, which can easily be under 0.5 -- so treating these like a
+    // percentage claim would stand the net down on a genuinely wedged pane AND
+    // open the dispatch gate to it, turning today's ~10 minute rescue into
+    // hours of silent message loss.
+    for (const pct of [0, 0.01, 0.18, 0.19, 0.43, 0.49]) {
+      expect(saturationBannerCredible(true, true, pct)).toBe(true)
+    }
+    expect(saturationBannerCredible(true, true, null)).toBe(true)
+  })
+
+  it('TRUSTS the banner when the context is unmeasurable (the net\'s original purpose)', () => {
+    // 129 of the observed events had pct null. This is the samu 2026-07-18
+    // case the net was built for: an unreadable transcript is not evidence
+    // against the banner, so behaviour there must stay byte-identical.
+    expect(saturationBannerCredible(true, false, null)).toBe(true)
+  })
+
+  it('pins the credibility threshold exactly', () => {
+    expect(saturationBannerCredible(true, false, SATURATION_CREDIBLE_MIN_PCT)).toBe(true)
+    expect(saturationBannerCredible(true, false, 0.5)).toBe(true)
+    expect(saturationBannerCredible(true, false, 0.49)).toBe(false)
+  })
+
+  it('trusts the banner across the measured range of GENUINELY full sessions', () => {
+    // The band recorded in the CALIBRATION_OVERSHOOT_TOLERANCE note: 11 sessions
+    // the CLI itself marked "100% context used" measured 0.89-1.07. If anyone
+    // raises the threshold far enough to reach this band, this fails.
+    expect(saturationBannerCredible(true, false, 0.89)).toBe(true)
+    expect(saturationBannerCredible(true, false, 0.93)).toBe(true)
+    expect(saturationBannerCredible(true, false, 1.07)).toBe(true)
+    expect(SATURATION_CREDIBLE_MIN_PCT).toBeLessThan(0.89)
+    expect(SATURATION_CREDIBLE_MIN_PCT).toBeGreaterThan(0.43)
+  })
+
+  it('never invents a banner that is not there', () => {
+    expect(saturationBannerCredible(false, false, 0.99)).toBe(false)
+    expect(saturationBannerCredible(false, false, null)).toBe(false)
+    // Not even the hard-error flag may manufacture a banner: the caller reads
+    // both predicates off the same capture, so "hard error but not saturated"
+    // is unreachable -- and if it ever became reachable it must stay inert.
+    expect(saturationBannerCredible(false, true, null)).toBe(false)
+  })
+})
+
+// decideGuard is UNCHANGED by this fix; these cases prove what the corrected
+// INPUT buys us: with the banner overruled, neither the net nor the
+// await-handoff trapdoor can fire on a session that is 19% full.
+describe('decideGuard with a corrected saturation input (no kill, no handoff)', () => {
+  it('idle: a 19%-full agent with the banner overruled does nothing at all', () => {
+    const d = decideGuard(
+      INITIAL_GUARD_STATE,
+      inputs({ paneSaturated: false, pct: 0.19, paneIdle: true }),
+      CFG,
+    )
+    expect(d.action).toBe('none')
+    expect(d.reason).toBe('below threshold')
+    expect(d.nextState.phase).toBe('idle')
+    // No streak accumulates, so no confirmation sweep can ever complete.
+    expect(d.nextState.saturatedStreak).toBe(0)
+  })
+
+  it('await-handoff: the debounce-free saturation trapdoor cannot spring', () => {
+    // This is the branch that had NO confirmation sweep: one corrected input is
+    // the whole difference between "keep waiting" and an immediate restart.
+    const awaiting: GuardState = {
+      phase: 'await-handoff',
+      handoffMtimeAtRequest: 100,
+      deadlineMs: NOW + 60_000,
+      cooldownUntilMs: 0,
+      saturatedStreak: 0,
+      staleRefreshCount: 0,
+      handoffStaleMinutes: null,
+    }
+    const d = decideGuard(awaiting, inputs({ paneSaturated: false, pct: 0.19 }), CFG)
+    expect(d.action).toBe('none')
+    expect(d.reason).toBe('waiting for handoff')
+  })
+})
+
+// Usage limit: a session blocked by a plan usage limit must be left alone by
+// every tier except the saturation net. Measured 2026-09-27 ~21:00 on three
+// live agent panes: the footer read "Usage limit reached", the prompt was empty
+// and the agent idle -- to the idle-flush tier "heavy and quiet". Measured the
+// same evening: that banner outlives the limit (agents worked for hours under
+// it), so "limited" is decided from the transcript, never from the banner.
+describe('decideGuard: usage-limited session', () => {
+  // Shape of the measured pane bottom (content lines are filler, the last four
+  // lines are the live footer as captured).
+  const limitedPane = (banner: string) => [
+    '  The export from yesterday is the newest one; nothing to flag yet.',
+    '',
+    '✻ Cooked for 3m 49s · done 8:35 PM',
+    '',
+    '─'.repeat(40),
+    '❯ ',
+    '─'.repeat(40),
+    `  ${banner}`,
+    '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents',
+  ].join('\n')
+  const MEASURED_BANNER = '⚠ Usage limit reached · continuing automatically at 6am · esc to cancel'
+
+  const iso = (ms: number) => new Date(ms).toISOString()
+  const RESETS_AT_S = Math.floor((NOW + 9 * 60 * 60_000) / 1000)
+  // The measured refusal (CLI 2.1.280, a worksource agent, 2026-09-27T06:30:11Z),
+  // with the identifying fields dropped.
+  const refusal = (ms: number, o: Record<string, unknown> = {}) => JSON.stringify({
+    parentUuid: 'p', isSidechain: false, type: 'assistant', timestamp: iso(ms),
+    message: {
+      id: 'x', model: '<synthetic>', role: 'assistant', stop_reason: 'stop_sequence', type: 'message',
+      usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      content: [{ type: 'text', text: "You've hit your weekly limit · resets 6am (Europe/Budapest)" }],
+    },
+    quotaLimits: { status: 'rejected', resetsAt: RESETS_AT_S, unifiedRateLimitFallbackAvailable: false, rateLimitType: 'seven_day' },
+    error: 'rate_limit', isApiErrorMessage: true, apiErrorStatus: 429, version: '2.1.280',
+    ...o,
+  })
+  // The older CLI 2.1.110 shape: same error/status, no quotaLimits.
+  const refusalOld = (ms: number) => JSON.stringify({
+    type: 'assistant', timestamp: iso(ms), isApiErrorMessage: true, error: 'rate_limit', apiErrorStatus: 429,
+    message: { model: '<synthetic>', role: 'assistant', content: [{ type: 'text', text: "You're out of extra usage · resets 6am (Europe/Budapest)" }] },
+  })
+  const okTurn = (ms: number) => JSON.stringify({
+    type: 'assistant', timestamp: iso(ms),
+    message: { model: 'claude-opus-5-5', role: 'assistant', content: [{ type: 'text', text: 'Done.' }], usage: { input_tokens: 10 } },
+  })
+  const userTurn = (ms: number) => JSON.stringify({ type: 'user', timestamp: iso(ms), message: { role: 'user', content: 'hi' } })
+  const systemRow = (ms: number) => JSON.stringify({ type: 'system', subtype: 'turn_duration', timestamp: iso(ms) })
+  const jsonl = (...rows: string[]) => rows.join('\n') + '\n'
+  /** What the runner feeds decideGuard, from a transcript tail. */
+  const limitedFrom = (tail: string, nowMs = NOW) =>
+    usageLimitVerdict(usageLimitEvidenceFromTranscript(tail), nowMs).limited
+
+  const IDLE_ONLY: ContextGuardConfig = {
+    ...DEFAULT_CONTEXT_GUARD,
+    enabled: false,
+    idleFlushEnabled: true,
+  }
+  // Heavy and quiet enough for the idle tier, pane idle: the measured case.
+  const heavyQuiet = (o: Partial<GuardInputs> = {}) => inputs({
+    contextTokens: 600_000,
+    idleMs: 45 * 60_000,
+    paneIdle: true,
+    ...o,
+  })
+  const awaiting = (o: Partial<GuardState> = {}): GuardState => ({
+    phase: 'await-handoff',
+    handoffMtimeAtRequest: null,
+    deadlineMs: NOW - 1,
+    cooldownUntilMs: 0,
+    saturatedStreak: 0,
+    staleRefreshCount: 0,
+    handoffStaleMinutes: null,
+    ...o,
+  })
+
+  describe('isUsageLimitRefusal: the transcript shape', () => {
+    it('recognises the measured 2.1.280 refusal and the 2.1.110 one', () => {
+      expect(isUsageLimitRefusal(JSON.parse(refusal(NOW)))).toBe(true)
+      expect(isUsageLimitRefusal(JSON.parse(refusalOld(NOW)))).toBe(true)
+    })
+
+    it('rejects a successful turn, other API errors, and a bare transient 429', () => {
+      expect(isUsageLimitRefusal(JSON.parse(okTurn(NOW)))).toBe(false)
+      // The context-window refusal is NOT a usage limit.
+      expect(isUsageLimitRefusal({
+        type: 'assistant', isApiErrorMessage: true, error: 'invalid_request', apiErrorStatus: 400,
+        message: { content: [{ type: 'text', text: 'Prompt is too long' }] },
+      })).toBe(false)
+      expect(isUsageLimitRefusal({
+        type: 'assistant', isApiErrorMessage: true, error: 'server_error', apiErrorStatus: 529,
+        message: { content: [{ type: 'text', text: 'API Error: 529 {"type":"error","error":{"type":"overloaded_error"}}' }] },
+      })).toBe(false)
+      // A 429 without any quota marker frees itself on the next request.
+      expect(isUsageLimitRefusal({
+        type: 'assistant', isApiErrorMessage: true, error: 'rate_limit', apiErrorStatus: 429,
+        message: { content: [{ type: 'text', text: 'API Error: 429 {"type":"error","error":{"type":"rate_limit_error"}}' }] },
+      })).toBe(false)
+      // A user quoting the wording is not a refusal.
+      expect(isUsageLimitRefusal({ type: 'user', message: { content: "You've hit your weekly limit" } })).toBe(false)
+    })
+
+    // The CLI 2.1.280 transient subscriber 429, as built in the installed
+    // binary (read-only byte search, 2026-09-27): Ro({content: `API Error:
+    // ${"Server is temporarily limiting requests (not your usage limit)"} ·
+    // ${serverMessage || fallback}`, error: "rate_limit", apiErrorIsTransient: M}).
+    // No quotaLimits. The server-message tail varies; "Rate limited" is a stand-in.
+    const TRANSIENT_TEXT = 'API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited'
+    const transient429 = (o: Record<string, unknown> = {}) => ({
+      type: 'assistant', timestamp: iso(NOW), isApiErrorMessage: true,
+      error: 'rate_limit', apiErrorStatus: 429, apiErrorIsTransient: true,
+      message: { model: '<synthetic>', role: 'assistant', content: [{ type: 'text', text: TRANSIENT_TEXT }] },
+      ...o,
+    })
+
+    it('the CLI transient subscriber 429 is never a usage limit', () => {
+      expect(isUsageLimitRefusal(transient429())).toBe(false)
+      // Not even if the transient flag were missing: the wording is a negation.
+      expect(isUsageLimitRefusal(transient429({ apiErrorIsTransient: undefined }))).toBe(false)
+      // And the flag wins over everything else.
+      expect(isUsageLimitRefusal(transient429({ quotaLimits: { status: 'rejected' } }))).toBe(false)
+      // The non-subscriber variant of the same branch (M false).
+      expect(isUsageLimitRefusal(transient429({
+        apiErrorIsTransient: false,
+        message: { content: [{ type: 'text', text: 'API Error: Request rejected (429) · this may be a temporary capacity issue.' }] },
+      }))).toBe(false)
+    })
+
+    it('a transient 429 as the newest entry does not park the idle tier', () => {
+      const tail = jsonl(refusal(NOW - 60 * 60_000), okTurn(NOW - 50 * 60_000), JSON.stringify(transient429()))
+      expect(usageLimitEvidenceFromTranscript(tail)).toBeNull()
+      const d = decideGuard(INITIAL_GUARD_STATE, heavyQuiet({ usageLimited: limitedFrom(tail) }), IDLE_ONLY)
+      expect(d.action).toBe('request-handoff')
+    })
+
+    it('quotaLimits present: decided ONLY by status === "rejected"', () => {
+      const withQuota = (status: unknown) => ({ ...JSON.parse(refusal(NOW)), quotaLimits: { status } })
+      expect(isUsageLimitRefusal(withQuota('rejected'))).toBe(true)
+      // The refusal wording alone does not override a non-rejected status.
+      expect(isUsageLimitRefusal(withQuota('allowed'))).toBe(false)
+      expect(isUsageLimitRefusal(withQuota('allowed_warning'))).toBe(false)
+      expect(isUsageLimitRefusal(withQuota(undefined))).toBe(false)
+    })
+
+    // Every distinct rate_limit/429 text in the transcripts on one install
+    // (535 jsonl files under agents/*/.claude-config, .channels-config and
+    // ~/.claude, read-only survey 2026-09-27): 2838 records, four texts, none
+    // transient. Each is a real refusal and must classify as one, with the
+    // fields it was recorded with.
+    it.each([
+      [2609, "You're out of extra usage · resets 6am (Europe/Budapest)", null, '2.1.110'],
+      [189, "You're out of extra usage · resets Sep 21, 6am (Europe/Budapest)", null, '2.1.110'],
+      [37, "You've hit your weekly limit · resets 6am (Europe/Budapest)", 'rejected', '2.1.280'],
+      [3, "You've hit your weekly limit · resets Sep 28, 6am (Europe/Budapest)", 'rejected', '2.1.280'],
+    ])('observed shape (%i records): %s -> refusal', (_count, text, quotaStatus, version) => {
+      const entry: Record<string, unknown> = {
+        type: 'assistant', timestamp: iso(NOW), isApiErrorMessage: true, error: 'rate_limit', apiErrorStatus: 429, version,
+        message: { model: '<synthetic>', role: 'assistant', content: [{ type: 'text', text }] },
+      }
+      if (quotaStatus !== null) entry.quotaLimits = { status: quotaStatus, resetsAt: RESETS_AT_S }
+      expect(isUsageLimitRefusal(entry)).toBe(true)
+    })
+
+    it('without quotaLimits only the observed positive wordings count', () => {
+      const bare = (text: string) => ({
+        type: 'assistant', isApiErrorMessage: true, error: 'rate_limit', apiErrorStatus: 429,
+        message: { content: [{ type: 'text', text }] },
+      })
+      expect(isUsageLimitRefusal(bare('Claude usage limit reached'))).toBe(false)
+      expect(isUsageLimitRefusal(bare('Your usage limit resets soon'))).toBe(false)
+      expect(isUsageLimitRefusal(bare('Something failed; not your usage limit'))).toBe(false)
+      expect(isUsageLimitRefusal(bare("You've hit your limit · resets 6am"))).toBe(true)
+      expect(isUsageLimitRefusal(bare("You’re out of extra usage"))).toBe(true)
+    })
+  })
+
+  describe('usageLimitEvidenceFromTranscript / usageLimitVerdict', () => {
+    it('refusal as the newest assistant entry -> limited', () => {
+      const tail = jsonl(okTurn(NOW - 60 * 60_000), userTurn(NOW - 10 * 60_000), refusal(NOW - 10 * 60_000), systemRow(NOW - 10 * 60_000))
+      const ev = usageLimitEvidenceFromTranscript(tail)
+      expect(ev).not.toBeNull()
+      expect(ev!.sinceMs).toBe(NOW - 10 * 60_000)
+      expect(ev!.resetsAtMs).toBe(RESETS_AT_S * 1000)
+      expect(limitedFrom(tail)).toBe(true)
+    })
+
+    it('stale banner case: a successful turn after the refusal -> NOT limited', () => {
+      // One agent, measured: refusals at 06:30Z, normal turns from 18:32Z, the
+      // pane banner still up at 21:02 local.
+      const tail = jsonl(refusal(NOW - 5 * 60 * 60_000), systemRow(NOW - 5 * 60 * 60_000), userTurn(NOW - 60_000), okTurn(NOW - 50_000))
+      expect(usageLimitEvidenceFromTranscript(tail)).toBeNull()
+      expect(limitedFrom(tail)).toBe(false)
+    })
+
+    it('the episode starts at the first refusal after the last successful turn', () => {
+      const tail = jsonl(
+        refusal(NOW - 20 * 60 * 60_000), okTurn(NOW - 10 * 60 * 60_000),
+        refusalOld(NOW - 3 * 60 * 60_000), userTurn(NOW - 60 * 60_000), refusal(NOW - 60 * 60_000),
+      )
+      const ev = usageLimitEvidenceFromTranscript(tail)
+      expect(ev!.sinceMs).toBe(NOW - 3 * 60 * 60_000)
+      expect(ev!.lastErrorMs).toBe(NOW - 60 * 60_000)
+    })
+
+    it('another API error as the newest entry is not a usage limit', () => {
+      const overloaded = JSON.stringify({ type: 'assistant', timestamp: iso(NOW), isApiErrorMessage: true, error: 'server_error', apiErrorStatus: 529, message: { content: [{ type: 'text', text: 'API Error: 529' }] } })
+      expect(usageLimitEvidenceFromTranscript(jsonl(refusal(NOW - 60_000), overloaded))).toBeNull()
+    })
+
+    it('skips a cut first line, sidechain entries and empty input', () => {
+      // The tail read may start mid-entry; a cut successful turn must not
+      // count as one.
+      const cut = okTurn(NOW - 120_000).slice(20)
+      expect(usageLimitEvidenceFromTranscript(jsonl(cut, refusal(NOW - 60_000)))).not.toBeNull()
+      const side = JSON.stringify({ ...JSON.parse(okTurn(NOW)), isSidechain: true })
+      expect(usageLimitEvidenceFromTranscript(jsonl(refusal(NOW - 60_000), side))).not.toBeNull()
+      expect(usageLimitEvidenceFromTranscript('')).toBeNull()
+    })
+
+    it('a passed resetsAt ends the episode by the CLI\'s own word', () => {
+      const tail = jsonl(refusal(NOW - 60_000))
+      const v = usageLimitVerdict(usageLimitEvidenceFromTranscript(tail), RESETS_AT_S * 1000)
+      expect(v.limited).toBe(false)
+      expect(!v.limited && v.reason).toBe('reset-passed')
+    })
+
+    it('time bound: parked up to USAGE_LIMIT_MAX_PARK_MS, then falls back to normal', () => {
+      // No resetsAt (old CLI), so only the bound can end it.
+      const since = NOW - USAGE_LIMIT_MAX_PARK_MS
+      const tail = jsonl(refusalOld(since), refusalOld(NOW - 60_000))
+      expect(limitedFrom(tail, NOW - 1)).toBe(true)
+      const v = usageLimitVerdict(usageLimitEvidenceFromTranscript(tail), NOW)
+      expect(v.limited).toBe(false)
+      expect(!v.limited && v.reason).toBe('park-expired')
+      expect(USAGE_LIMIT_MAX_PARK_MS).toBe(12 * 60 * 60_000)
+    })
+
+    it('await-ready: a refusal from BEFORE the restart belongs to the replaced session, only a newer one counts', () => {
+      // Until the fresh session writes its own jsonl, the newest file is the
+      // dead session's, where no successful turn can ever end the episode.
+      const restartedAt = NOW - 30_000
+      const old = jsonl(refusal(NOW - 60_000))
+      const v = usageLimitVerdict(usageLimitEvidenceFromTranscript(old), NOW, restartedAt)
+      expect(v.limited).toBe(false)
+      expect(!v.limited && v.reason).toBe('before-restart')
+      // Without a session start (every other phase) the same tail is limited.
+      expect(usageLimitVerdict(usageLimitEvidenceFromTranscript(old), NOW).limited).toBe(true)
+      // The new session's own refusal parks its resume.
+      const fresh = jsonl(refusal(NOW - 60_000), refusal(NOW - 10_000))
+      expect(usageLimitVerdict(usageLimitEvidenceFromTranscript(fresh), NOW, restartedAt).limited).toBe(true)
+    })
+  })
+
+  describe('banner vs transcript (the measured stale-banner case)', () => {
+    it('the pane shows the banner, the transcript shows a later successful turn -> idle-flush acts', () => {
+      // The banner is still on screen...
+      expect(detectsUsageLimit(limitedPane(MEASURED_BANNER))).toBe(true)
+      // ...but the newest assistant turn succeeded, so the session is not blocked.
+      const tail = jsonl(refusal(NOW - 5 * 60 * 60_000), userTurn(NOW - 46 * 60_000), okTurn(NOW - 45 * 60_000))
+      const d = decideGuard(INITIAL_GUARD_STATE, heavyQuiet({ usageLimited: limitedFrom(tail) }), IDLE_ONLY)
+      expect(d.action).toBe('request-handoff')
+      expect(d.reason.startsWith(IDLE_FLUSH_REASON_PREFIX)).toBe(true)
+    })
+
+    it('refusal as the newest assistant entry -> the idle tier parks', () => {
+      const tail = jsonl(okTurn(NOW - 60 * 60_000), userTurn(NOW - 45 * 60_000), refusal(NOW - 45 * 60_000))
+      const d = decideGuard(INITIAL_GUARD_STATE, heavyQuiet({ usageLimited: limitedFrom(tail) }), IDLE_ONLY)
+      expect(d.action).toBe('none')
+      expect(d.reason.startsWith(USAGE_LIMIT_REASON_PREFIX)).toBe(true)
+    })
+
+    it('past the time bound the idle tier acts again', () => {
+      const tail = jsonl(refusalOld(NOW - USAGE_LIMIT_MAX_PARK_MS - 60_000))
+      const d = decideGuard(INITIAL_GUARD_STATE, heavyQuiet({ usageLimited: limitedFrom(tail) }), IDLE_ONLY)
+      expect(d.action).toBe('request-handoff')
+    })
+
+    it('"Context limit reached" is the saturation net\'s banner, not a usage limit', () => {
+      const ctx = limitedPane('Context limit reached · use /compact or /clear to continue')
+      expect(paneShowsContextSaturation(ctx)).toBe(true)
+      expect(paneShowsContextSaturationHardError(ctx)).toBe(true)
+      expect(detectsUsageLimit(ctx)).toBe(false)
+      // And the other way round: the usage banner is not a saturation banner.
+      expect(paneShowsContextSaturation(limitedPane(MEASURED_BANNER))).toBe(false)
+    })
+  })
+
+  describe('idle phase: no tier acts while limited', () => {
+    it('idle-flush: heavy + quiet + idle but limited -> no handoff request', () => {
+      const d = decideGuard(INITIAL_GUARD_STATE, heavyQuiet({ usageLimited: true }), IDLE_ONLY)
+      expect(d.action).toBe('none')
+      expect(d.reason.startsWith(USAGE_LIMIT_REASON_PREFIX)).toBe(true)
+      expect(d.nextState.phase).toBe('idle')
+    })
+
+    it('idle-flush: the same session, not limited, acts exactly as before', () => {
+      const d = decideGuard(INITIAL_GUARD_STATE, heavyQuiet({ usageLimited: false }), IDLE_ONLY)
+      expect(d.action).toBe('request-handoff')
+      expect(d.reason.startsWith(IDLE_FLUSH_REASON_PREFIX)).toBe(true)
+      expect(d.nextState.phase).toBe('await-handoff')
+      expect(d.nextState.deadlineMs).toBe(NOW + IDLE_ONLY.handoffTimeoutMinutes * 60_000)
+    })
+
+    it('act tier: no handoff request while limited', () => {
+      const d = decideGuard(INITIAL_GUARD_STATE, inputs({ pct: 0.92, usageLimited: true }), CFG)
+      expect(d.action).toBe('none')
+      expect(d.nextState.phase).toBe('idle')
+      // Control: unlimited, the same input requests the handoff.
+      expect(decideGuard(INITIAL_GUARD_STATE, inputs({ pct: 0.92 }), CFG).action).toBe('request-handoff')
+    })
+
+    it('hard tier: no restart while limited', () => {
+      const d = decideGuard(INITIAL_GUARD_STATE, inputs({ pct: 0.99, usageLimited: true }), CFG)
+      expect(d.action).toBe('none')
+      expect(d.nextState.phase).toBe('idle')
+      expect(decideGuard(INITIAL_GUARD_STATE, inputs({ pct: 0.99 }), CFG).action).toBe('restart')
+    })
+
+    it('daily tier: a due slot is not fired (nor consumed) while limited', () => {
+      const daily: ContextGuardConfig = {
+        ...DEFAULT_CONTEXT_GUARD, dailyHandoffEnabled: true, dailyHandoffTime: '04:00',
+      }
+      const d = decideGuard(INITIAL_GUARD_STATE, inputs({ dailyHandoffDue: true, usageLimited: true }), daily)
+      expect(d.action).toBe('none')
+      // The runner marks the slot served only on a daily-prefixed reason.
+      expect(d.reason.startsWith(DAILY_HANDOFF_REASON_PREFIX)).toBe(false)
+      const after = decideGuard(INITIAL_GUARD_STATE, inputs({ dailyHandoffDue: true }), daily)
+      expect(after.action).toBe('request-handoff')
+      expect(after.reason.startsWith(DAILY_HANDOFF_REASON_PREFIX)).toBe(true)
+    })
+  })
+
+  describe('await-handoff: the timeout is parked, not fired', () => {
+    it('past the deadline and limited -> no force-restart, deadline pushed out', () => {
+      const d = decideGuard(awaiting(), heavyQuiet({ usageLimited: true }), IDLE_ONLY)
+      expect(d.action).toBe('none')
+      expect(d.nextState.phase).toBe('await-handoff')
+      expect(d.nextState.deadlineMs).toBe(NOW + IDLE_ONLY.handoffTimeoutMinutes * 60_000)
+      // Control: not limited, the old timeout path fires.
+      expect(decideGuard(awaiting(), heavyQuiet(), IDLE_ONLY).action).toBe('restart')
+    })
+
+    it('a later deadline is never pulled earlier by parking', () => {
+      const far = NOW + 3 * 60 * 60_000
+      const d = decideGuard(awaiting({ deadlineMs: far }), inputs({ usageLimited: true }), IDLE_ONLY)
+      expect(d.nextState.deadlineMs).toBe(far)
+    })
+
+    it('hard threshold during await-handoff while limited -> no restart', () => {
+      const d = decideGuard(awaiting({ deadlineMs: NOW + 60_000 }), inputs({ pct: 0.99, usageLimited: true }), CFG)
+      expect(d.action).toBe('none')
+      expect(d.nextState.phase).toBe('await-handoff')
+    })
+
+    it('handoff on disk is shipped only once the limit lifts', () => {
+      const st = awaiting({ deadlineMs: NOW + 60_000, handoffMtimeAtRequest: 100 })
+      const written = { handoffMtime: NOW - 1000, idleMs: 0, paneIdle: true }
+      expect(decideGuard(st, inputs({ ...written, usageLimited: true }), CFG).action).toBe('none')
+      expect(decideGuard(st, inputs(written), CFG).action).toBe('restart')
+    })
+  })
+
+  describe('await-ready: the resume prompt waits for the limit', () => {
+    const ready: GuardState = { ...INITIAL_GUARD_STATE, phase: 'await-ready', deadlineMs: NOW + 1000 }
+    // The persisted obligation's TTL edge (restartedAtMs + PENDING_RESUME_TTL_MS),
+    // as the runner computes it; here 20 minutes ahead.
+    const EDGE = NOW + 20 * 60_000
+
+    it('ready but limited, within the TTL -> no injection, obligation and deadline kept alive', () => {
+      const d = decideGuard(ready, inputs({ sessionReady: true, usageLimited: true, pendingResumeExpiresAtMs: EDGE }), CFG)
+      expect(d.action).toBe('none')
+      expect(d.reason.startsWith(USAGE_LIMIT_REASON_PREFIX)).toBe(true)
+      expect(d.nextState.phase).toBe('await-ready')
+      expect(d.nextState.deadlineMs).toBe(NOW + READY_TIMEOUT_MS)
+    })
+
+    it('limited past the ready deadline but within the TTL -> still waiting, not given up', () => {
+      const late = { ...ready, deadlineMs: NOW - 1 }
+      const d = decideGuard(late, inputs({ sessionReady: false, usageLimited: true, pendingResumeExpiresAtMs: EDGE }), CFG)
+      expect(d.action).toBe('none')
+      expect(d.nextState.phase).toBe('await-ready')
+    })
+
+    it('the parked deadline never passes the persisted TTL edge', () => {
+      const nearEdge = NOW + 60_000 // closer than READY_TIMEOUT_MS
+      const d = decideGuard(ready, inputs({ sessionReady: true, usageLimited: true, pendingResumeExpiresAtMs: nearEdge }), CFG)
+      expect(d.action).toBe('none')
+      expect(d.nextState.deadlineMs).toBe(nearEdge)
+    })
+
+    it('past the TTL edge -> the park ends and the resume is injected (the old behaviour)', () => {
+      for (const edge of [NOW, NOW - 60_000]) {
+        const d = decideGuard(ready, inputs({ sessionReady: true, usageLimited: true, pendingResumeExpiresAtMs: edge }), CFG)
+        expect(d.action).toBe('inject-resume')
+      }
+    })
+
+    it('past the TTL edge and never ready -> gives up at the ready deadline (the old behaviour)', () => {
+      const late = { ...ready, deadlineMs: NOW - 1 }
+      const d = decideGuard(late, inputs({ sessionReady: false, usageLimited: true, pendingResumeExpiresAtMs: NOW - 1 }), CFG)
+      expect(d.action).toBe('none')
+      expect(d.nextState.phase).toBe('cooldown')
+    })
+
+    it('no obligation on record -> no park, the old behaviour', () => {
+      const d = decideGuard(ready, inputs({ sessionReady: true, usageLimited: true, pendingResumeExpiresAtMs: null }), CFG)
+      expect(d.action).toBe('inject-resume')
+    })
+
+    it('limit lifted -> the pending resume is delivered', () => {
+      const d = decideGuard(ready, inputs({ sessionReady: true, pendingResumeExpiresAtMs: EDGE }), CFG)
+      expect(d.action).toBe('inject-resume')
+    })
+  })
+
+  // The request the limit refused is re-sent once the limit
+  // lifts. CONTROL: without the re-send the first and third cases fail (no re-send; the
+  // timeout fires at the PARKED deadline, 5 minutes before the fresh window ends).
+  describe('await-handoff: the refused handoff request is re-sent once after the limit', () => {
+    const MIN = 60_000
+    const at = (min: number, o: Partial<GuardInputs> = {}) => heavyQuiet({ nowMs: NOW + min * MIN, ...o })
+    /** Request the idle-flush handoff at NOW, then feed the given sweeps. */
+    const run = (sweeps: Array<[number, Partial<GuardInputs>]>) => {
+      const first = decideGuard(INITIAL_GUARD_STATE, at(0), IDLE_ONLY)
+      expect(first.action).toBe('request-handoff')
+      let st = first.nextState
+      const decisions = sweeps.map(([min, o]) => {
+        const d = decideGuard(st, at(min, o), IDLE_ONLY)
+        st = d.nextState
+        return d
+      })
+      return { first, decisions, last: st }
+    }
+
+    it('re-sends exactly once on the first unlimited sweep, worded by the original reason', () => {
+      const { first, decisions } = run([
+        [5, { usageLimited: true }],
+        [10, { usageLimited: true }],
+        [15, {}],
+        [20, {}],
+        [25, {}],
+      ])
+      const resends = decisions.filter((d) => d.action === 'request-handoff')
+      expect(resends).toHaveLength(1)
+      expect(decisions[2].action).toBe('request-handoff')
+      expect(decisions[2].reason.startsWith(HANDOFF_RESEND_REASON_PREFIX)).toBe(true)
+      // The runner picks the prompt from the ORIGINAL reason, which rides along.
+      expect(decisions[2].nextState.handoffRequestReason).toBe(first.reason)
+      expect(first.reason.startsWith(IDLE_FLUSH_REASON_PREFIX)).toBe(true)
+      expect(decisions[2].nextState.handoffParkedByLimit).toBe(false)
+      expect(decisions[3].action).toBe('none')
+      expect(decisions[4].action).toBe('none')
+    })
+
+    it('no re-send when there was no limited episode', () => {
+      const { decisions } = run([[5, {}], [10, {}], [15, {}]])
+      expect(decisions.every((d) => d.action === 'none')).toBe(true)
+      expect(decisions.every((d) => !d.reason.startsWith(HANDOFF_RESEND_REASON_PREFIX))).toBe(true)
+    })
+
+    it('the timeout runs from the re-send: not at the parked deadline, but after the fresh window', () => {
+      const T = IDLE_ONLY.handoffTimeoutMinutes
+      // Last parked sweep at +5 parks the deadline at +5+T; the re-send at +10
+      // restarts the window, so the deadline becomes +10+T.
+      const { decisions } = run([
+        [5, { usageLimited: true }],
+        [10, {}],
+        [5 + T + 1, {}],
+        [10 + T, {}],
+      ])
+      expect(decisions[2].action).toBe('none')
+      expect(decisions[3].action).toBe('restart')
+      expect(decisions[3].reason).toBe('handoff timeout -- force restart')
+      expect(decisions[1].reason.startsWith(HANDOFF_RESEND_REASON_PREFIX)).toBe(true)
+      expect(decisions[1].nextState.deadlineMs).toBe(NOW + (10 + T) * MIN)
+    })
+
+    it('once per episode: a second limit episode earns a second re-send', () => {
+      const { decisions } = run([
+        [5, { usageLimited: true }],
+        [10, {}],
+        [15, { usageLimited: true }],
+        [20, {}],
+        [25, {}],
+      ])
+      expect(decisions.map((d) => d.action)).toEqual(['none', 'request-handoff', 'none', 'request-handoff', 'none'])
+    })
+
+    it('a handoff written by the time the limit lifts is shipped, not asked for again', () => {
+      const { decisions } = run([
+        [5, { usageLimited: true }],
+        [10, { handoffMtime: NOW + 9 * MIN, idleMs: 0 }],
+      ])
+      expect(decisions[1].action).toBe('restart')
+      expect(decisions[1].reason).toBe('handoff written')
+    })
+
+    it('at the hard threshold the lift restarts instead of re-asking', () => {
+      let st = decideGuard(INITIAL_GUARD_STATE, inputs({ pct: 0.92 }), CFG).nextState
+      st = decideGuard(st, inputs({ pct: 0.92, usageLimited: true }), CFG).nextState
+      const d = decideGuard(st, inputs({ pct: 0.99 }), CFG)
+      expect(d.action).toBe('restart')
+      expect(d.reason).toBe('hard threshold during await-handoff')
+    })
+  })
+
+  describe('the saturation net is NOT parked', () => {
+    it('idle: a saturated pane is still restarted after the confirm sweeps, limit or not', () => {
+      let st: GuardState = INITIAL_GUARD_STATE
+      let d = decideGuard(st, inputs({ paneSaturated: true, usageLimited: true }), DEFAULT_CONTEXT_GUARD)
+      for (let i = 1; i < SATURATION_CONFIRM_SWEEPS; i++) {
+        expect(d.action).toBe('none')
+        st = d.nextState
+        d = decideGuard(st, inputs({ paneSaturated: true, usageLimited: true }), DEFAULT_CONTEXT_GUARD)
+      }
+      expect(d.action).toBe('restart')
+    })
+
+    it('await-handoff: saturation still restarts immediately, limit or not', () => {
+      const d = decideGuard(awaiting({ deadlineMs: NOW + 60_000 }), inputs({ paneSaturated: true, usageLimited: true }), CFG)
+      expect(d.action).toBe('restart')
+    })
   })
 })

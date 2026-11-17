@@ -71,16 +71,24 @@ describe('wiring: the owner alert goes through the gate, recovery does not', () 
   it('checkLocalSession exists and its alert is gated by shouldAlertParkedGiveUp', () => {
     expect(start).toBeGreaterThanOrEqual(0)
     expect(fnBody).toMatch(/shouldAlertParkedGiveUp\(/)
-    // The sendAlert call must be INSIDE the gated branch: no sendAlert may
+    // The alert (sendAlert / createAgentMessage) must be INSIDE the gated branch: none may
     // appear in the body before the gate call.
     const gateIdx = fnBody.indexOf('shouldAlertParkedGiveUp(')
-    const alertIdx = fnBody.indexOf('sendAlert(')
+    const alertIdx = Math.min(...['sendAlert(', 'createAgentMessage('].map(n => fnBody.indexOf(n)).filter(i => i >= 0))
     expect(alertIdx).toBeGreaterThan(gateIdx)
   })
 
   it('the pane state is read fresh at alert time (capturePane + detectPaneState)', () => {
-    expect(fnBody).toMatch(/capturePane\(session\)/)
+    expect(fnBody).toMatch(/capturePaneAsync\(session\)/)
     expect(fnBody).toMatch(/detectPaneState\(pane\)/)
+  })
+
+  it('the busy verdict is box-height-proof (paneTurnInFlight before detectPaneState)', () => {
+    // A tall parked box pushes the live spinner out of detectPaneState's
+    // window; without this a working pane reads 'typing' and alerts.
+    const proofIdx = fnBody.indexOf('paneTurnInFlight(pane)')
+    expect(proofIdx).toBeGreaterThanOrEqual(0)
+    expect(fnBody.indexOf('detectPaneState(pane)')).toBeGreaterThan(proofIdx)
   })
 
   it('a spell that ends clears the one-alert-per-spell marker', () => {

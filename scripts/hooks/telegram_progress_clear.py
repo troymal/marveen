@@ -26,7 +26,26 @@ once; `stop_hook_active` is also honored. Silent on stdout EXCEPT the single
 decision JSON when blocking. Token/state dir resolution mirrors the plugin
 (TELEGRAM_STATE_DIR else default).
 """
-import sys, os, json, glob, urllib.request
+import sys, os, json, glob, time, urllib.request
+
+# #2269: the CLI writes its OWN lines into the transcript as assistant messages (the session-limit
+# wall "You've hit your session limit · resets 12am (UTC)", the usage limit, an API error); the guaranteed fallback below
+# must never send such a line as the agent's answer (the progress watchdog did, before #2269). The
+# markers are the watchdog's: isApiErrorMessage, the model "<synthetic>", or a known prefix. Instead the placeholder says
+# the answer is late (OUTAGE_TEXT) and stays; no ledger row, so the open question stays open for the next session.
+# #2269: only a limit or error line is an outage; another CLI-written line ("No response
+# requested.") means the turn has no answer, and it takes the no-answer path: the placeholder goes, nothing is sent.
+SYNTHETIC_MODEL = "<synthetic>"
+SYNTHETIC_PREFIXES = (
+    "you've hit your session limit", "you've hit your usage limit", "you've hit your weekly limit",
+    "usage limit reached", "claude ai usage limit reached", "api error", "credit balance is too low",
+    "invalid api key", "please run /login",
+)
+OUTAGE_TEXT = "⏳ A válasz egy átmeneti kiesés miatt késik."
+# #2269: a real fallback send goes into the conversation ledger (direction out), marked in the TEXT like the other
+# machine rows, not in the source column (ledger_lib.source_for() reads the newest source in any direction, and the reply
+# guard names the reply tool from it).
+LEDGER_PREFIX = "[telegram-progress-clear, fallback]"
 
 INSTRUCTION = (
     "KÖTELEZŐ: erre a Telegram-üzenetre még NEM küldtél választ a Telegram "
@@ -38,9 +57,15 @@ INSTRUCTION = (
 
 
 def state_dir():
+    # #915: env override, then the install-scoped dir once it holds the .env,
+    # then the legacy shared path (unmigrated installs only).
     d = os.environ.get("TELEGRAM_STATE_DIR")
     if d:
         return d
+    _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    _inst = os.path.join(_root, ".claude", "channels", "telegram")
+    if os.path.isfile(os.path.join(_inst, ".env")):
+        return _inst
     return os.path.expanduser("~/.claude/channels/telegram")
 
 
@@ -76,12 +101,41 @@ def api(tok, method, payload):
         return json.loads(r.read().decode())
 
 
+def topic_of(entry):
+    """The topic the placeholder was posted into (TELEGRAM_TOPICS_ENABLED), as
+    sendMessage parameters; empty for a plain chat, so the payload stays as is."""
+    t = entry.get("message_thread_id")
+    return {"message_thread_id": t} if isinstance(t, int) and t > 0 else {}
+
+
+def _synthetic_kind(ev, text):
+    """What an assistant text is (#2269): "" the agent's own; "outage" a CLI limit or error line
+    (isApiErrorMessage, or a known prefix on an event that names no model or the model "<synthetic>"); "none" any other
+    CLI-written line, i.e. no answer. A real answer carries its model id and may itself begin with "API error"."""
+    msg = ev.get("message") or {}
+    model = msg.get("model")
+    if ev.get("isApiErrorMessage") is True:
+        return "outage"
+    if model and model != SYNTHETIC_MODEL:
+        return ""
+    if (text or "").strip().lower().startswith(SYNTHETIC_PREFIXES):
+        return "outage"
+    return "none" if model == SYNTHETIC_MODEL else ""
+
+
 def last_assistant_text(transcript_path):
     """Return the last non-empty assistant text message from the JSONL transcript
     (the agent's final user-facing answer). Empty string if none / unreadable."""
+    return last_assistant(transcript_path)[0]
+
+
+def last_assistant(transcript_path):
+    """(text, synthetic): the last non-empty assistant text, and whether it is a CLI limit or error line (#2269); any
+    other CLI-written last line comes back as ("", False): the turn has no answer (#2269)."""
     text = ""
+    kind = ""
     if not transcript_path:
-        return text
+        return text, False
     try:
         for line in open(transcript_path, encoding="utf-8"):
             line = line.strip()
@@ -105,9 +159,56 @@ def last_assistant_text(transcript_path):
                 t = "\n".join(p for p in parts if p).strip()
                 if t:
                     text = t  # keep the LAST non-empty one
+                    kind = _synthetic_kind(ev, t)
     except Exception:
         pass
-    return text
+    if kind == "none":
+        return "", False
+    return text, kind == "outage"
+
+
+def _ledger_lib():
+    """#2269: the install's ledger_lib, loaded by file path: next to this file (the repo copy, beside
+    ledger-outbound.py), else under MARVEEN_ROOT, CLAUDE_PROJECT_DIR or ~/marveen (the legacy ~/.claude/hooks copy has
+    none of its own). Its own location fixes the install, so db_path() is that install's ledger. None when not found."""
+    import importlib.util
+    dirs = [os.path.dirname(os.path.abspath(__file__))]
+    for root in (os.environ.get("MARVEEN_ROOT"), os.environ.get("CLAUDE_PROJECT_DIR"), os.path.expanduser("~/marveen")):
+        if root:
+            dirs.append(os.path.join(root, "scripts", "hooks"))
+    for d in dirs:
+        p = os.path.join(d, "ledger_lib.py")
+        if os.path.isfile(p):
+            spec = importlib.util.spec_from_file_location("ledger_lib", p)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    return None
+
+
+def ledger_log_out(sd, ev, chat_id, text, result):
+    """#2269: one conversation_log row (direction out) for a fallback message that really went out, through ledger_lib,
+    under the session identity the reply tool's own row gets (agent_id_from_payload: the transcript path, not the mutable
+    cwd, LEDGERCWD828). Writes only into an EXISTING ledger. Called only after the pending state is removed, and it
+    swallows EVERYTHING, SystemExit included: a ledger step that ended this hook before the cleanup (an exit, or the
+    15 s hook limit spent waiting on a locked ledger) would leave the pending state for the next Stop to send again
+    (#2269)."""
+    try:
+        lib = _ledger_lib()
+        if lib is None:
+            log(sd, "[enforce] ledger: no ledger_lib found, fallback send not logged")
+            return False
+        db = lib.db_path()
+        if not os.path.isfile(db):
+            log(sd, f"[enforce] ledger: no database at {db}, fallback send not logged")
+            return False
+        res = result.get("result") if isinstance(result, dict) else None
+        mid = res.get("message_id") if isinstance(res, dict) else None
+        lib.log_outbound(lib.agent_id_from_payload(ev), chat_id, LEDGER_PREFIX + " " + text, mid)
+        return True
+    except BaseException as e:
+        log(sd, f"[enforce] ledger write failed: {type(e).__name__}: {e}")
+        return False
 
 
 def main():
@@ -130,6 +231,23 @@ def main():
         except Exception:
             pass
 
+    def claim_send(mid):
+        """Win-once guard so a Stop hook registered under two python paths can't
+        deliver the fallback twice. Both copies can run at once; only the one
+        that atomically creates this marker sends, so the answer goes out exactly
+        ONCE. Shared with the watchdog (same marker name), which back-stops the
+        very same turn from another process. Keyed by the unique placeholder
+        message_id, so a leftover marker never suppresses a later turn."""
+        try:
+            fd = os.open(os.path.join(pdir, f"fbsent-{sid}-{mid}.marker"),
+                         os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            return True
+        except FileExistsError:
+            return False
+        except Exception:
+            return True  # guard unavailable, prefer delivering over silence
+
     path = os.path.join(pdir, f"{sid}.json")
     try:
         pend = json.load(open(path))
@@ -143,18 +261,59 @@ def main():
             os.remove(guard)
         except Exception:
             pass
+        # Opportunistic housekeeping of spent send-claim markers (safe here: no
+        # fallback is in flight this turn, and they are keyed by message_id).
+        for m in glob.glob(os.path.join(pdir, f"fbsent-{sid}-*.marker")):
+            try:
+                os.remove(m)
+            except Exception:
+                pass
         return
 
     # A Telegram turn whose reply was NOT sent for the listed chat(s).
-    blocked_before = os.path.exists(guard)
-    if not stop_active and not blocked_before:
+    #
+    # "First stop" vs "already nudged" must be decided ATOMICALLY, because this
+    # hook can run as two concurrent copies: the installer used to key its
+    # idempotency on the resolved interpreter path, so a python3 upgrade added a
+    # SECOND registration of the same script (2026-08-12 incident: every Stop ran
+    # /usr/bin/python3 and /usr/local/bin/python3 side by side).
+    #
+    # With the old exists()-then-create the twins split down two different
+    # branches: copy A saw no marker, wrote it and BLOCKED (nudging the agent to
+    # reply through its tool), while copy B saw the marker A had just written,
+    # concluded "already nudged" and delivered the raw transcript text. The agent
+    # then replied properly, so the user got the same answer twice. That is the
+    # duplicate-reply bug, and it hit every un-replied Telegram turn.
+    #
+    # O_EXCL makes exactly one copy the nudger. The loser must NOT fall through
+    # to delivery: a nudge is already in flight. A marker younger than
+    # TWIN_WINDOW_SEC can only belong to a twin in this same Stop (a genuine
+    # post-nudge Stop is a whole agent turn later), so that is the discriminator
+    # when the harness does not set stop_hook_active.
+    TWIN_WINDOW_SEC = 5
+    nudged = False
+    if not stop_active:
+        try:
+            fd = os.open(guard, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(fd)
+            nudged = True
+        except FileExistsError:
+            try:
+                age = time.time() - os.path.getmtime(guard)
+            except Exception:
+                age = TWIN_WINDOW_SEC  # unreadable, treat as a real post-nudge
+            if age < TWIN_WINDOW_SEC:
+                # A twin copy owns the nudge for THIS stop. Stay silent; the
+                # agent is about to reply with its own tool.
+                log(sd, f"[enforce] twin stop hook, nudge already in flight sid={sid}")
+                return
+        except Exception:
+            nudged = True  # marker unavailable, prefer nudging over silence
+
+    if nudged:
         # First Stop with an un-replied Telegram turn -> nudge the agent to reply
         # properly via its own tool. Keep the placeholder so the re-entry path
         # (PostToolUse) clears it when the reply finally goes out.
-        try:
-            open(guard, "w").close()
-        except Exception:
-            pass
         chats = ", ".join(sorted({str(p.get("chat_id")) for p in pend}))
         log(sd, f"[enforce] blocking stop, no reply sent sid={sid} chats={chats}")
         print(json.dumps({"decision": "block", "reason": INSTRUCTION % chats}))
@@ -162,14 +321,38 @@ def main():
 
     # Already nudged once (or loop guard tripped) and STILL no reply -> guaranteed
     # fallback: deliver the agent's final answer to the chat, then clear.
-    answer = last_assistant_text(transcript)
+    answer, synthetic = last_assistant(transcript)
     tok = token(sd)
+    sent = []
     if tok:
+        # One pending entry per inbound MESSAGE, not per chat: a batched delivery
+        # (several messages from one chat in one turn) leaves several entries for
+        # the same chat. The answer goes to each chat (and topic) ONCE; every
+        # placeholder is still deleted (FALLBACKEGYSZER1019). A failed send does
+        # not count as sent, so the next entry of that chat retries it.
+        # The `sent_to` set is IN-PROCESS only, so claim_send adds the half it
+        # cannot cover: two copies of this hook can run at once, so the marker is
+        # what makes the send win-once ACROSS processes (and against the
+        # watchdog, which uses the same marker name).
+        sent_to = set()
         for p in pend:
             cid, mid = p.get("chat_id"), p.get("message_id")
-            if answer:
+            topic = topic_of(p)
+            dest = (str(cid), topic.get("message_thread_id"))
+            if answer and synthetic:
+                # #2269: the turn ended on a CLI line, not an answer: the placeholder says the answer is late and stays.
+                # No claim_send here: the outage edit sends nothing, so it must
+                # not consume the win-once marker of a later genuine delivery.
                 try:
-                    api(tok, "sendMessage", {"chat_id": cid, "text": answer[:4000]})
+                    api(tok, "editMessageText", {"chat_id": cid, "message_id": mid, "text": OUTAGE_TEXT})
+                except Exception as e:
+                    log(sd, f"[enforce] outage edit failed: {e}")
+                continue
+            if answer and dest not in sent_to and claim_send(str(mid)):
+                try:
+                    res = api(tok, "sendMessage", {"chat_id": cid, "text": answer[:4000], **topic})
+                    sent_to.add(dest)
+                    sent.append((cid, answer[:4000], res))
                 except Exception as e:
                     log(sd, f"[enforce] fallback send failed: {e}")
             try:
@@ -181,8 +364,11 @@ def main():
             os.remove(f)
         except Exception:
             pass
-    log(sd, f"[enforce] fallback-delivered={bool(answer)} cleared {len(pend)} "
-            f"placeholder(s) sid={sid}")
+    log(sd, f"[enforce] fallback-delivered={bool(answer) and not synthetic} synthetic={synthetic} "
+            f"cleared {len(pend)} placeholder(s) sid={sid}")
+    # #2269: the ledger rows only now, with the pending state gone (see ledger_log_out).
+    for cid, text, res in sent:
+        ledger_log_out(sd, ev, cid, text, res)
 
 
 if __name__ == "__main__":

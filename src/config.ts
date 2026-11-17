@@ -1,11 +1,14 @@
 import { CronExpressionParser } from 'cron-parser'
-import { hostname } from 'node:os'
-import { existsSync, readFileSync } from 'node:fs'
+import { hostname, homedir } from 'node:os'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { readEnvFile } from './env.js'
-import { DISTRIBUTION_DEFAULT_AGENT_MODEL } from './config-registry.js'
-import { getProviderType, getChannelToken, getChannelChatId, type ChannelProviderType } from './channel-provider.js'
+import { parseLabelPalette } from './css-color.js'
+import { resolveFleetVenvDir } from './fleet-venv.js'
+import { DISTRIBUTION_DEFAULT_AGENT_MODEL, getSettingDefinition, isOverridesOnly } from './config-registry.js'
+import { FIXED_RESERVED_AGENT_IDS, MESSAGE_LAYER_RESERVED_AGENT_IDS } from './web/sanitize.js'
+import { getProviderType, getMainChannelToken, getChannelChatId, type ChannelProviderType } from './channel-provider.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -36,7 +39,12 @@ function readConfigOverrides(): Record<string, unknown> {
 const overrides = readConfigOverrides()
 // Effective raw value for a registry-backed key consumed at boot:
 // config-overrides.json wins, then .env. Callers apply their own default.
-function cfg(key: string): string | undefined {
+export function cfg(key: string): string | undefined {
+  // ENVRELAXGATE1104 step 2: cfg() has its own override > .env order, so an overrides-only (security) key read here
+  // would let a loosening .env line count. Such a key goes through the settings store; refusing here keeps a future
+  // boot-time reader from bypassing the rule.
+  const def = getSettingDefinition(key)
+  if (def && isOverridesOnly(def)) throw new Error(`cfg(): ${key} is overrides-only; read it through the settings store`)
   const ov = overrides[key]
   if (ov !== undefined && ov !== null && String(ov).length > 0) return String(ov)
   return env[key]
@@ -82,12 +90,41 @@ function isUsableCronTz(tz: string): boolean {
   }
 }
 
+// APP_TZ has a SECOND consumer: every display path formats with
+// Intl.DateTimeFormat / toLocaleString({ timeZone: APP_TZ }), and one of them
+// (heartbeat-header-stamp.ts) builds its formatter at MODULE LOAD, on the
+// dashboard's static import chain. So the probe is both consumers, each asked
+// its own question, never one standing in for the other. They do disagree:
+// under TZ='' Node 22 reports the host zone as "Etc/Unknown", which
+// cron-parser schedules against without complaint and Intl rejects with a
+// RangeError -- and a RangeError at import time means the dashboard does not
+// start at all (ISSUE1895 review).
+function isUsableAppTz(tz: string): boolean {
+  if (!isUsableCronTz(tz)) return false
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: tz })
+    return true
+  } catch {
+    return false
+  }
+}
+
+// The host zone as APP_TZ may use it: the process zone when both consumers
+// accept it, otherwise UTC (the zone Intl itself falls back to with no TZ).
+// Never a value either consumer throws on.
+export function usableHostTz(
+  raw: string = Intl.DateTimeFormat().resolvedOptions().timeZone,
+): string {
+  return isUsableAppTz(raw) ? raw : 'UTC'
+}
+
 export function resolveAppTz(
   configured: string | undefined,
   systemTz: string = Intl.DateTimeFormat().resolvedOptions().timeZone,
 ): { tz: string; configured?: string; invalid?: string } {
-  if (!configured) return { tz: systemTz }
-  if (!isUsableCronTz(configured)) return { tz: systemTz, invalid: configured }
+  const host = usableHostTz(systemTz)
+  if (!configured) return { tz: host }
+  if (!isUsableAppTz(configured)) return { tz: host, invalid: configured }
   return { tz: configured, configured }
 }
 
@@ -112,6 +149,17 @@ export const APP_TZ_INVALID = appTz.invalid
 // reconfigures a running fleet.
 export const DEFAULT_AGENT_MODEL =
   cfg('DEFAULT_AGENT_MODEL') || DISTRIBUTION_DEFAULT_AGENT_MODEL
+// DEFAULTCLIGUARD927: true when no operator configured DEFAULT_AGENT_MODEL, so
+// the value above is the SHIPPED default. Only then may a launch swap it for
+// the previous tier on a CLI that cannot run it (default-model-guard.ts); a
+// configured value is the operator's choice and is never replaced.
+export const DEFAULT_AGENT_MODEL_IS_DISTRIBUTION = !cfg('DEFAULT_AGENT_MODEL')
+
+// WORKERMODELFAST1109: the FAST worker session's model. Empty means the same chain
+// as the slow worker, so nothing changes until it is set. A separate key because the
+// fast session only gets short conversational jobs (under 300 characters, no
+// analysis keyword -- classifyPriority), for which the strongest model is overkill.
+export const WORKER_MODEL_FAST = cfg('MARVEEN_WORKER_MODEL_FAST') || ''
 
 export const TELEGRAM_BOT_TOKEN = env['TELEGRAM_BOT_TOKEN'] ?? ''
 export const ALLOWED_CHAT_ID = env['ALLOWED_CHAT_ID'] ?? ''
@@ -129,8 +177,9 @@ export const OWNER_NAME_PLACEHOLDER = 'Owner'
 export const OWNER_NAME = env['OWNER_NAME'] ?? OWNER_NAME_PLACEHOLDER
 // Shared Google Drive folder ID the fleet writes deliverables into. Empty by
 // default (distribution-safe: no owner-specific folder is baked into a fresh
-// install's generated agent CLAUDE.md); set OWNER_DRIVE_FOLDER in .env to wire
-// the default shared drive for this install.
+// install's generated agent CLAUDE.md). The generator reads the setting through
+// the settings store (agent-scaffold.ts), where it is overrides-only: set it on
+// the Settings page, a .env line no longer counts (ENVRELAXGATE1104).
 export const OWNER_DRIVE_FOLDER = env['OWNER_DRIVE_FOLDER'] ?? ''
 export const BOT_NAME = env['BOT_NAME'] ?? 'Marveen'
 
@@ -161,6 +210,16 @@ export const BRAND_NAME = env['BRAND_NAME'] ?? BOT_NAME
 // not change that; the token remains the actual boundary.
 export const SYSTEM_SENDER_IDS = env['SYSTEM_SENDER_IDS'] ?? ''
 
+// Card 795d1f48 (a): the enrolled device keys that may send an URGENT row over POST /api/messages (a row the router
+// types into a BUSY pane), by their numeric ids (GET /api/auth/device-keys lists them). Install-specific, so .env, and
+// empty by default: with no id, no HTTP caller may set urgent; the in-process writers are not affected. A device key
+// alone is not enough because the shared dashboard token can mint one; and the list is deliberately not in the
+// settings registry, so the dashboard's settings page does not edit it. Device key ids are AUTOINCREMENT: a revoked
+// key's id is never handed out again. Comma-separated:
+//   MESSAGE_URGENT_DEVICE_IDS=7
+// Read at module load -- a change needs a dashboard restart.
+export const MESSAGE_URGENT_DEVICE_IDS = env['MESSAGE_URGENT_DEVICE_IDS'] ?? ''
+
 // Pure parse rule for SYSTEM_SENDER_IDS, so the default (unset => empty set) is
 // provable without a live .env. Entries are normalized with the SAME function
 // the route matches on, keeping this guard symmetric with the coordinator and
@@ -172,6 +231,18 @@ export function parseSystemSenderIds(raw: string | undefined, normalize: (s: str
       .split(',')
       .map(s => normalize(s.trim()))
       .filter(Boolean)
+  )
+}
+
+// Pure parse rule for MESSAGE_URGENT_DEVICE_IDS: positive integers only. Anything else is dropped, never read
+// generously: a typo or an empty value means nobody.
+export function parseDeviceKeyIds(raw: string | undefined): Set<number> {
+  return new Set(
+    (raw ?? '')
+      .split(',')
+      .map(s => s.trim())
+      .filter(s => /^[1-9][0-9]{0,14}$/.test(s))
+      .map(Number)
   )
 }
 
@@ -200,6 +271,16 @@ export function currentBrandName(): string {
 export function currentOwnerName(): string {
   const o = (readEnvFile(['OWNER_NAME'])['OWNER_NAME'] ?? '').trim()
   return o || OWNER_NAME
+}
+
+// MAIN_AGENT_RECIPIENT_LEDGER=1 in .env: the verified-recipient ledger applies
+// to the main agent too -- its approval gate and the project's own senders
+// check every recipient against store/verified-recipients.json. Off by default.
+// Read per call from .env only (never process.env), the way the Python side
+// reads it, so the generated CLAUDE.md text and the gate cannot disagree.
+export function mainAgentRecipientLedgerEnabled(): boolean {
+  const v = (readEnvFile(['MAIN_AGENT_RECIPIENT_LEDGER'])['MAIN_AGENT_RECIPIENT_LEDGER'] ?? '').trim().toLowerCase()
+  return ['1', 'true', 'yes', 'on'].includes(v)
 }
 
 // Pure derivation of the OS service id from a brand slug and the agent id:
@@ -235,6 +316,79 @@ export const MAIN_AGENT_ID = env['MAIN_AGENT_ID'] ?? 'marveen'
 // heartbeat-agent-scaffold) so agent-scaffold can key gates on it without an
 // import cycle: heartbeat-agent-scaffold already imports agent-scaffold.
 export const HEARTBEAT_AGENT_ID = 'heartbeat'
+
+// The voice channel's sender id (VOICECHANNELID1022): the external voice relay
+// posts the owner's dictation under it (HANGCSATORNA918). Unset keeps 'hanna'.
+// It must be a canonical agent id (lowercase a-z, 0-9, single inner dashes, at
+// most 50 characters), because the route compares the sanitized sender to it
+// exactly, and it must not name another sender (a system id, a SYSTEM_SENDER_IDS
+// entry, the main agent, a sub-agent directory, the owner's sanitized name):
+// that sender's messages would be framed as the voice channel. A rejected value
+// falls back to 'hanna', which goes through the same checks; if 'hanna' collides
+// too, the voice lane is off (null). routes/messages.ts logs
+// VOICE_CHANNEL_ID_INVALID and VOICE_CHANNEL_DISABLED_BY.
+export const DEFAULT_VOICE_CHANNEL_ID = 'hanna'
+const VOICE_CHANNEL_ID_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
+export interface VoiceChannelTakenIds {
+  mainAgentId: string
+  ownerName: string
+  /** SYSTEM_SENDER_IDS as configured (comma-separated). */
+  systemSenderIds: string
+  isSubAgent: (id: string) => boolean
+}
+export interface VoiceChannelResolution {
+  /** The voice channel id in effect; null when the voice lane is off. */
+  id: string | null
+  /** A configured value that was rejected. */
+  invalid?: string
+  /** Why the default could not be used either (the lane is then off). */
+  disabledBy?: string
+}
+export function resolveVoiceChannelId(raw: string | undefined, taken: VoiceChannelTakenIds): VoiceChannelResolution {
+  // Owner and system sender ids as routes/messages.ts compares them
+  // (sanitizeAgentIdent, inlined: config.ts keeps its imports to leaf modules).
+  const ident = (s: string) => s.replace(/[^a-zA-Z0-9_-]/g, '')
+  const systemSenders = parseSystemSenderIds(taken.systemSenderIds, ident)
+  const collision = (id: string): string | undefined => {
+    // The message layer's ids only, NOT the route names (AGENTROUTERESERVED1114): the voice channel id names a
+    // sender and has no /api/agents/<id> address, and widening this check would switch an install that already
+    // runs its voice lane under such an id back to the default on upgrade.
+    if (MESSAGE_LAYER_RESERVED_AGENT_IDS.includes(id)) return 'a system id'
+    if (systemSenders.has(id)) return 'a SYSTEM_SENDER_IDS entry'
+    if (id === taken.mainAgentId) return 'the main agent id'
+    if (id === ident(taken.ownerName)) return "the owner's name"
+    if (taken.isSubAgent(id)) return 'a sub-agent'
+    return undefined
+  }
+  const v = (raw ?? '').trim()
+  let invalid: string | undefined
+  if (v) {
+    if (v.length <= 50 && VOICE_CHANNEL_ID_RE.test(v) && !collision(v)) return { id: v }
+    invalid = v
+  }
+  const disabledBy = collision(DEFAULT_VOICE_CHANNEL_ID)
+  if (disabledBy) return { id: null, invalid, disabledBy }
+  return invalid === undefined ? { id: DEFAULT_VOICE_CHANNEL_ID } : { id: DEFAULT_VOICE_CHANNEL_ID, invalid }
+}
+const voiceChannel = resolveVoiceChannelId(env['VOICE_CHANNEL_ID'], {
+  mainAgentId: MAIN_AGENT_ID,
+  ownerName: OWNER_NAME,
+  systemSenderIds: SYSTEM_SENDER_IDS,
+  // A DIRECTORY, like the agent listing: a stray file under agents/ is not a sub-agent.
+  isSubAgent: (id) => {
+    try { return statSync(join(PROJECT_ROOT, 'agents', id)).isDirectory() } catch { return false }
+  },
+})
+export const VOICE_CHANNEL_ID: string | null = voiceChannel.id
+export const VOICE_CHANNEL_ID_INVALID = voiceChannel.invalid
+export const VOICE_CHANNEL_DISABLED_BY = voiceChannel.disabledBy
+
+// The full reserved-id list (FLEETRESERVEDNAME1021): the fixed ids from
+// web/sanitize.ts (the message layer's ids and the agents API's fixed route
+// names, AGENTROUTERESERVED1114) plus the voice channel id in effect (none when
+// the lane is off). No main agent or sub-agent may take one of these.
+export const RESERVED_AGENT_IDS: readonly string[] =
+  VOICE_CHANNEL_ID === null ? FIXED_RESERVED_AGENT_IDS : [...FIXED_RESERVED_AGENT_IDS, VOICE_CHANNEL_ID]
 
 // Identifier the OS service manager uses for the main agent's units (launchd
 // label com.<id>.channels / com.<id>.dashboard, systemd <id>-channels, etc.).
@@ -297,6 +451,25 @@ export const WEB_HOST = env['WEB_HOST'] ?? '127.0.0.1'
 // Must start with "/" and have no trailing slash when non-empty (e.g. "/dashboard").
 export const DASHBOARD_PREFIX = (env['DASHBOARD_PREFIX'] ?? '').replace(/\/+$/, '')
 
+// How long a fired scheduled task may stay busy before the watchdog calls it
+// stuck (default 45 minutes; `stuckAfterMinutes` still overrides it per task).
+//
+// A key rather than a literal for the same reason as DEFAULT_AGENT_MODEL: this
+// number is an OPERATOR judgement, not an engineering constant. Whether "still
+// running after N minutes" means trouble depends on what the install's tasks
+// do, and an install that raises it has to keep raising it after every update
+// if the only way to say so is patching src/. That is not hypothetical -- one
+// install set 10 minutes because 5 produced false "possible hang" alerts, and
+// lost the setting to an update, silently: alerts simply got eager again.
+// .env survives updates, src/ does not.
+export const TASK_STALL_TIMEOUT_MS = (() => {
+  const parsed = parseInt(env['TASK_STALL_TIMEOUT_MS'] ?? '', 10)
+  // A malformed or absurd value must not disable the watchdog outright, so an
+  // out-of-range setting falls back to the default instead of being clamped
+  // into silence.
+  return Number.isFinite(parsed) && parsed >= 60_000 ? parsed : 2_700_000
+})()
+
 // Kanban card aging visual thresholds (hours since last update) and colours.
 // Override per-install via .env; defaults match the design spec (24/72/168h).
 export const KANBAN_AGING_WARN_H = parseInt(env['KANBAN_AGING_WARN_H'] ?? '24', 10)
@@ -328,6 +501,29 @@ export const KANBAN_WIP_OVER_COLOR = env['KANBAN_WIP_OVER_COLOR'] ?? '#c53030'
 // requiresRestart registry keys: read through the override layer so a value
 // saved on the Settings page takes effect on the next restart.
 export const DASHBOARD_PUBLIC_URL = cfg('DASHBOARD_PUBLIC_URL') ?? ''
+// Where the AGENTS reach the dashboard API from wherever they run. This is a
+// DIFFERENT question from DASHBOARD_PUBLIC_URL, which answers "where does the
+// BROWSER reach the dashboard" and feeds the CORS allowlist. On a single-host
+// install the two answers differ: measured 2026-09-03, the public name resolves
+// but its 443 is unreachable from the host itself (hairpin NAT), so every
+// generated curl example pointed at a dead address -- `curl exit 7`, i.e. the
+// agent gets nothing, not an error it could report. Deriving one answer from
+// the other cannot be correct for both deployment shapes, so it is its own key.
+// Empty preserves the previous behaviour exactly (public URL, else localhost).
+export const AGENT_API_ORIGIN = cfg('AGENT_API_ORIGIN') ?? ''
+
+// FLEETVENV923: the fleet's shared Python virtualenv. When `<dir>/bin` exists it
+// is prepended to every agent launch PATH (sub-agents via startAgentProcess,
+// the main session via channels.sh and the recovery relaunch in
+// channel-monitor.ts), so a skill's plain `python3` and the venv's own CLIs
+// (markitdown, ...) resolve to the venv without per-skill interpreter paths.
+// Measured 2026-09-23 on the Mac mini: the Homebrew python3 carried zero
+// packages, so every skill `python3` call import-failed while a venv with the
+// packages sat next to it. A `~` prefix means the home directory; the default
+// is EMPTY (off), and a nonexistent directory disables the prefix too.
+// Resolved by fleet-venv.ts, the same function channels.sh reaches through
+// scripts/fleet-venv-prefix.mjs, so the two launch paths cannot disagree.
+export const FLEET_PYTHON_VENV = resolveFleetVenvDir(PROJECT_ROOT, homedir(), process.env.CLAUDECLAW_ENV_DIR ?? PROJECT_ROOT)
 // Extra browser origins allowed to make state-changing dashboard requests
 // (CORS + CSRF allowlist), comma-separated, e.g. for VPN/LAN addresses that
 // aren't covered by WEB_HOST or DASHBOARD_PUBLIC_URL. Empty by default so
@@ -335,6 +531,9 @@ export const DASHBOARD_PUBLIC_URL = cfg('DASHBOARD_PUBLIC_URL') ?? ''
 // key, so it stays a plain env read (not routed through the override layer).
 export const DASHBOARD_ALLOWED_ORIGINS = env['DASHBOARD_ALLOWED_ORIGINS'] ?? ''
 export const OLLAMA_URL = cfg('OLLAMA_URL') ?? 'http://localhost:11434'
+// Ollama model that tiers memories during /api/memories/import. Empty = off:
+// every chunk goes to warm with no model call, instead of guessing a model.
+export const MEMORY_IMPORT_CATEGORIZE_MODEL = (cfg('MEMORY_IMPORT_CATEGORIZE_MODEL') ?? '').trim()
 
 // Kanban swimlanes: which field the board groups by on first load. Invalid
 // values silently fall back to 'none' (flat board) rather than breaking the
@@ -350,15 +549,29 @@ export const KANBAN_SWIMLANE_SEPARATOR_COLOR = env['KANBAN_SWIMLANE_SEPARATOR_CO
 // offers these as swatches instead of a free-text colour input, so every
 // label's colour traces back to this single configurable list rather than
 // a hardcoded per-label mapping in the frontend.
-const rawKanbanLabelColors = (env['KANBAN_LABEL_COLORS'] ?? '#3b82f6,#0ea5e9,#10b981,#14b8a6,#8b5cf6,#64748b')
-  .split(',')
-  .map((c) => c.trim())
-  .filter(Boolean)
-export const KANBAN_LABEL_COLORS = rawKanbanLabelColors.length > 0 ? rawKanbanLabelColors : ['#64748b']
+// Each entry is normalized (parseLabelPalette: hex and var(--token) kept, a
+// colour name or a numeric rgb()/hsl() becomes hex): the palette reaches CSS backgrounds on the
+// dashboard, where url(...) would be an active resource. Entries that are not
+// colours are dropped and exported in KANBAN_LABEL_COLORS_REJECTED, colours
+// past the palette size bound are counted in KANBAN_LABEL_COLORS_OVERFLOW;
+// config.ts cannot own a logger (see APP_TZ_INVALID), so routes/kanban.ts
+// reports both.
+const kanbanLabelPalette = parseLabelPalette(env['KANBAN_LABEL_COLORS'] ?? '#3b82f6,#0ea5e9,#10b981,#14b8a6,#8b5cf6,#64748b')
+export const KANBAN_LABEL_COLORS = kanbanLabelPalette.colors
+export const KANBAN_LABEL_COLORS_REJECTED = kanbanLabelPalette.rejected
+export const KANBAN_LABEL_COLORS_OVERFLOW = kanbanLabelPalette.overflow
 
 export const CHANNEL_PROVIDER: ChannelProviderType = getProviderType(env['CHANNEL_PROVIDER'])
-export const CHANNEL_TOKEN = getChannelToken(CHANNEL_PROVIDER, env)
+export const CHANNEL_TOKEN = getMainChannelToken(CHANNEL_PROVIDER, env)
 export const CHANNEL_CHAT_ID = getChannelChatId(CHANNEL_PROVIDER, env)
+// Where OPERATIONAL alerts go (watchdog respawns, stuck sessions, restart
+// notices). Empty = the owner chat; set it when the person who runs the
+// system is not the owner, so the owner is not flooded with plumbing noise.
+// Owner-facing content (heartbeat digest, security events) ignores it.
+export function resolveAlertChatIdSetting(e: Record<string, string | undefined>): string {
+  return (e['MARVEEN_ALERT_CHAT_ID'] || e['ALERT_CHAT_ID'] || '').trim()
+}
+export const ALERT_CHAT_ID = resolveAlertChatIdSetting(env)
 
 // Respawn / keep-alive gate.
 // The in-process channel-plugin monitor (main-agent respawn + sub-agent
@@ -393,6 +606,29 @@ export const HEARTBEAT_START_HOUR = parseInt(env['HEARTBEAT_START_HOUR'] ?? '9',
 export const HEARTBEAT_AGENT_ENABLED =
   ['1', 'true', 'yes', 'on'].includes((cfg('HEARTBEAT_AGENT_ENABLED') ?? '').trim().toLowerCase())
 
+// When the monitor messages the owner about an unanswered tool-permission
+// prompt: a comma-separated list of ages ("10m,30m,1h,1d"; s/m/h/d, a bare
+// number is minutes). The last value is also the repeat period. Empty = the
+// shipped default; parsed (and a malformed value rejected whole) in
+// web/permission-prompt-alert.ts. PERMFLOOD1012.
+export const PERMISSION_ALERT_MARKS = (cfg('PERMISSION_ALERT_MARKS') ?? '').trim()
+
+// Routine (self-healing) recovery alerts on the owner's channel (DEFAULT ON).
+// web/routine-alert.ts reports the fleet's own recoveries -- "the main session
+// got stuck, I restarted it", "the session disappeared, respawning". They exist
+// because a SILENT wedge cost a morning (2026-07-30), but they are also the
+// fleet's normal operating noise, and an install may want them off the channel
+// without losing the record. The default must stay ON: an install that never
+// touches this key keeps the exact behaviour it had before the switch existed.
+// Only an explicit off value silences them, and even then the occurrence is
+// still logged (dashboard.log) -- this gate turns a message into a log line, it
+// never drops the fact. The REAL failure alerts are a different function
+// (sendAlert in web/channel-monitor.ts, e.g. "the automatic restart did NOT
+// succeed") and always go out, whatever this is set to.
+// Boot-time const (like SUBAGENT_INBOX_TEE): takes effect on dashboard restart.
+export const NOTIFY_ROUTINE_ALERTS =
+  !['0', 'false', 'no', 'off'].includes((cfg('NOTIFY_ROUTINE_ALERTS') ?? '1').trim().toLowerCase())
+
 // Sub-agent Telegram inbox delivery-path tee (opt-in, DEFAULT OFF).
 // When enabled, a telegram sub-agent loads the channel plugin via a per-agent
 // mcp.json wrapped in the inbound-tee (scripts/channel-inbound-tee.mjs), which
@@ -404,6 +640,18 @@ export const HEARTBEAT_AGENT_ENABLED =
 // SUBAGENT_TELEGRAM_WAKE_ENABLED to have an inbox to wake on).
 export const SUBAGENT_INBOX_TEE =
   ['1', 'true', 'yes', 'on'].includes((cfg('SUBAGENT_INBOX_TEE') ?? '').trim().toLowerCase())
+
+// Strict command-syntax group for the memory content filter (opt-in, DEFAULT OFF).
+// The filter in src/web/routes/memories.ts is injection-only by default: the six
+// command-syntax patterns (curl http(s), bash -c, eval(, exec(, import
+// subprocess, rm -rf) were removed because, measured over the fleet's real
+// items, they only ever rejected documentation. An install that reads stored
+// memories back into an agent which does NOT run the destructive gate may still
+// want them as a second line; MEMORY_CONTENT_FILTER_STRICT_COMMANDS=1 re-enables
+// exactly that group, as a 400 like the injection group. Unset keeps the
+// upstream injection-only filter unchanged.
+export const MEMORY_CONTENT_FILTER_STRICT_COMMANDS =
+  ['1', 'true', 'yes', 'on'].includes((cfg('MEMORY_CONTENT_FILTER_STRICT_COMMANDS') ?? '').trim().toLowerCase())
 
 // Sub-agent Telegram inbox wake-nudge (opt-in, DEFAULT OFF).
 // The message-router can nudge an idle sub-agent whose derived Telegram inbox
@@ -417,6 +665,26 @@ export const SUBAGENT_INBOX_TEE =
 export const SUBAGENT_TELEGRAM_WAKE_ENABLED =
   ['1', 'true', 'yes', 'on'].includes((cfg('SUBAGENT_TELEGRAM_WAKE_ENABLED') ?? '').trim().toLowerCase())
 
+// Single designated Claude Code auto-updater (opt-in, DEFAULT OFF).
+// Every launched claude gets DISABLE_AUTOUPDATER=1 so no two sessions race to
+// rewrite the one shared install. With WORKER_AUTOUPDATE=1 exactly ONE session
+// -- the slow worker -- is launched without it and keeps a NATIVE install
+// current; every other session (fast worker, channels, sub-agents) stays
+// pinned. Ignored on an npm-global install, where the boot-time claude_ensure
+// in channels.sh is the updater. Read at boot: takes effect after a dashboard
+// restart and the slow worker's next launch.
+export const WORKER_AUTOUPDATE =
+  ['1', 'true', 'yes', 'on'].includes((cfg('WORKER_AUTOUPDATE') ?? '').trim().toLowerCase())
+
+// Install-wide default for router-side speech-to-text on inbound voice notes
+// (opt-in, DEFAULT OFF). Agents in responseMode 'voice'/'auto' are always
+// transcribed; this only decides what happens for text-mode agents that do not
+// set voice.transcribeInbound in their agent-config.json. Enable with
+// VOICE_TRANSCRIBE_INBOUND=1 to run faster-whisper on every inbound voice note
+// for every such agent. Read at boot: takes effect after a dashboard restart.
+export const VOICE_TRANSCRIBE_INBOUND =
+  ['1', 'true', 'yes', 'on'].includes((cfg('VOICE_TRANSCRIBE_INBOUND') ?? '').trim().toLowerCase())
+
 // Google Calendar account the heartbeat summarises (next 2h). Empty (the
 // default) means the agent uses whatever calendar its MCP server is
 // authenticated as, so no personal address is baked into the shipped
@@ -427,3 +695,30 @@ export const SUBAGENT_TELEGRAM_WAKE_ENABLED =
 export const HEARTBEAT_CALENDAR_ACCOUNT = (cfg('HEARTBEAT_CALENDAR_ACCOUNT') ?? '').trim()
 export const HEARTBEAT_END_HOUR = parseInt(env['HEARTBEAT_END_HOUR'] ?? '23', 10)
 export const HEARTBEAT_CALENDAR_ID = (cfg('HEARTBEAT_CALENDAR_ID') ?? '').trim()
+
+// The embedding model is deliberately NOT tied to OLLAMA_URL or to the chat
+// model. agent-process.ts feeds OLLAMA_URL into ANTHROPIC_BASE_URL for
+// ollama-backed agents, and memories/connectors/migrate all call the NATIVE
+// ollama API on it -- five consumers in total -- so repointing that one key to
+// change the embedding endpoint drags four unrelated callers along with it.
+//
+// EMBED_DIMS implements Matryoshka truncation: slicing the native vector and
+// letting cosine renormalise. Measured on a 1073-memory corpus, vector-only
+// retrieval, 2026-08-12: 1024 dims held hit@5 at 83% while cutting the stored
+// vector text from 94 MB to ~24 MB and the per-search parse from 291 ms to
+// ~73 ms.
+//
+// Empty EMBED_URL = use OLLAMA_URL and EMBED_DIMS 0 = no truncation, so an
+// install that sets nothing keeps exactly the previous behaviour.
+export const EMBED_URL = cfg('EMBED_URL') || OLLAMA_URL
+export const EMBED_MODEL = cfg('EMBED_MODEL') ?? 'nomic-embed-text'
+const rawEmbedDims = parseInt(cfg('EMBED_DIMS') ?? '0', 10)
+export const EMBED_DIMS = Number.isFinite(rawEmbedDims) && rawEmbedDims > 0 ? rawEmbedDims : 0
+
+// The base URL an OLLAMA-CLASSED agent talks to is not the same thing as the
+// ollama API this install uses elsewhere. agent-process.ts only needs an
+// ANTHROPIC-compatible /v1/messages endpoint; the other four OLLAMA_URL
+// callers need the native ollama API (/api/tags, /api/generate), which an
+// Anthropic-compatible proxy does not serve at all. Empty = fall back to
+// OLLAMA_URL, so an install whose local agent really is ollama is unaffected.
+export const AGENT_LOCAL_BASE_URL = cfg('AGENT_LOCAL_BASE_URL') || OLLAMA_URL

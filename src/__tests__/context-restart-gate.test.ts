@@ -8,8 +8,10 @@ import {
   isNonWorkHelperProcess,
   parseEtimeSeconds,
   commBasename,
+  openQuestionBlocks,
   TASKSTATE_FRESH_WINDOW_MS,
 } from '../web/context-restart-gate-runner.js'
+import { MAIN_AGENT_ID } from '../config.js'
 import {
   decideGate,
   decideWake,
@@ -751,17 +753,62 @@ describe('decideWake', () => {
 })
 
 describe('gateWakePrompt', () => {
-  // The nudge exists to produce a turn AND a visible sign of life; a nudge that
-  // only said "you restarted" would leave the owner staring at silence again.
-  it('asks the agent to continue and to report on its channel', () => {
-    const p = gateWakePrompt()
-    expect(p).toContain('[CONTEXT-RESTART-GATE]')
-    expect(p.toLowerCase()).toContain('folytasd')
-    expect(p.toLowerCase()).toContain('csatorna')
+  // The nudge exists to produce a turn. Owner request 2026-10-21: it must NOT
+  // ask for a channel notice about the fresh context (several agents' channel is
+  // the owner's Telegram); only a faulty restart is reported, by a sub-agent to
+  // the main agent over the inter-agent queue.
+  it('asks the agent to continue without a channel notice', () => {
+    for (const name of [MAIN_AGENT_ID, 'samu']) {
+      const p = gateWakePrompt(name)
+      expect(p).toContain('[CONTEXT-RESTART-GATE]')
+      expect(p.toLowerCase()).toContain('folytasd')
+      expect(p).toContain('A friss kontextusrol a csatornadra NE kuldj uzenetet.')
+      expect(p).not.toContain('Rovid jelzest kuldj a sajat csatornadon')
+      expect(p).toContain('a gazdanak ne')
+    }
+  })
+
+  it('routes a faulty restart: sub-agent to the main agent, main agent to its transcript', () => {
+    expect(gateWakePrompt('samu')).toContain(`inter-agent uzenetben a fo ugynoknek (${MAIN_AGENT_ID})`)
+    const main = gateWakePrompt(MAIN_AGENT_ID)
+    expect(main).toContain('a transzkriptben rogzitsd')
+    expect(main).not.toContain('inter-agent uzenetben a fo ugynoknek')
   })
 
   // Guard against the nudge itself becoming a source of invented work.
   it('tells the agent that "nothing in flight" is a complete state', () => {
-    expect(gateWakePrompt()).toContain('ne talalj ki magadnak feladatot')
+    expect(gateWakePrompt('samu')).toContain('ne talalj ki magadnak feladatot')
   })
 })
+
+// LEDGERACK905: an unanswered inbound holds the gate only until the drain has
+// actually put it in front of the agent. Laszlo's bare "ok" on 2026-09-04
+// 22:24 held it for eight hours at 630% of the threshold, and the only escape
+// would have been a midnight reply nobody needed. His call: block until
+// surfaced, not on a timer.
+describe('openQuestionBlocks', () => {
+  it('does not block when nothing is open', () => {
+    expect(openQuestionBlocks(null, null)).toBe(false)
+    expect(openQuestionBlocks(null, '8246')).toBe(false)
+  })
+
+  it('blocks an open question the drain has not surfaced yet', () => {
+    expect(openQuestionBlocks('8246', null)).toBe(true)
+  })
+
+  it('stops blocking once the drain surfaced THAT message', () => {
+    expect(openQuestionBlocks('8246', '8246')).toBe(false)
+  })
+
+  it('still blocks when the drain last surfaced a DIFFERENT message', () => {
+    expect(openQuestionBlocks('8250', '8246')).toBe(true)
+  })
+
+  it('holds when the open question carries no identifiable message id', () => {
+    // Unknown id cannot be matched against a marker, and "unknown" must read
+    // as "the agent has not seen it".
+    expect(openQuestionBlocks('', '8246')).toBe(true)
+    expect(openQuestionBlocks('', null)).toBe(true)
+  })
+})
+

@@ -23,8 +23,8 @@
 
 import { readFileSync } from 'node:fs'
 import { execFile } from 'node:child_process'
-import { homedir, hostname, userInfo, networkInterfaces } from 'node:os'
-import { join } from 'node:path'
+import { hostname, userInfo, networkInterfaces } from 'node:os'
+import { resolveSshDir as resolveSshDirShared, sshDirOverride } from '../ssh-dir.js'
 import { logger } from '../logger.js'
 import { WEB_PORT } from '../config.js'
 import {
@@ -36,7 +36,7 @@ import {
   RemoteEnrollError,
 } from '../remote-enroll-core.js'
 import { enrollAuthorizedKey, removeEnrolledKey, type EnrollResult } from '../remote-enroll-fs.js'
-import { createDeviceKey, findDeviceKeyByInstallId, revokeDeviceKey } from './auth-device-keys.js'
+import { mintBridgeDeviceKey } from './auth-device-keys.js'
 
 export { RemoteEnrollError }
 
@@ -75,23 +75,21 @@ export interface BridgeEnrollOutcome {
   bundle: string
 }
 
-/** MARVEEN_SSH_DIR is a test seam for isolated e2e instances (a scratch
- * server must never write the real ~/.ssh). It lives in a production code
- * path, so if it ever leaks into a real environment (inherited env, copied
- * .env, launchd plist) enrollment would silently write elsewhere and pairing
- * would "succeed but not work". Every use is therefore loudly logged and
- * flagged into the audit row (see sshDirOverride() callers). */
-export function sshDirOverride(): string | null {
-  return process.env.MARVEEN_SSH_DIR || null
-}
+// The seam and the resolution rule now live in ONE module (src/ssh-dir.ts,
+// ENROLL813). This file used to own the canonical copy -- which
+// bridge-service-ports.ts had duplicated byte-for-byte and the CLI had not.
+// Re-exported here so the three existing importers (security.ts,
+// bridge-service-ports.ts, auth.ts) keep reading the seam where they always did.
+export { sshDirOverride }
 
+/** Shared resolver plus this module's own loud notice. Under a test runner with
+ * no MARVEEN_SSH_DIR this THROWS instead of returning the real ~/.ssh: the
+ * enroll route calls bridgeEnroll() WITHOUT deps, so a silent fallback here is
+ * exactly how a green test enrolled real keys for weeks (ENROLL813). */
 function resolveSshDir(): string {
-  const override = sshDirOverride()
-  if (override) {
-    logger.warn({ sshDir: override }, 'MARVEEN_SSH_DIR override active -- authorized_keys writes are redirected (test seam; must be unset in production)')
-    return override
-  }
-  return join(homedir(), '.ssh')
+  return resolveSshDirShared((sshDir) => {
+    logger.warn({ sshDir }, 'MARVEEN_SSH_DIR override active -- authorized_keys writes are redirected (test seam; must be unset in production)')
+  })
 }
 
 export function defaultBridgeEnrollDeps(): BridgeEnrollDeps {
@@ -125,14 +123,26 @@ export function isTailnetIPv4(addr: string): boolean {
   return second >= 64 && second <= 127
 }
 
+/** True for a ZeroTier virtual interface name. Unlike Tailscale, ZeroTier has
+ * no fixed, dedicated IP range -- its auto-assign pool is an ordinary RFC1918
+ * /24 (eg the elvis-marveen network measured 2026-11-03: 10.76.163.0/24),
+ * indistinguishable by address alone from a real LAN, so address shape can't
+ * identify it. The interface name can: the ZeroTier driver always names the
+ * device "zt" + a lowercase alphanumeric id (Linux eg "ztdiyqolon"), a
+ * pattern no real LAN NIC or other VPN interface uses. */
+export function isZeroTierIfaceName(name: string): boolean {
+  return /^zt[0-9a-z]{6,}$/i.test(name)
+}
+
 /** Pick the default enroll host from an interface map. The Bridge exists for
  * REMOTE access, so a LAN address is a structurally wrong default: the first
  * non-loopback IPv4 in interface order used to win (BRIDGEHOST1: en0's
  * 192.168.x beat utun4's tailnet address, and the bundle died the moment the
  * laptop left the home network). Prefer the first tailnet (CGNAT) address
- * when one exists; otherwise keep the pre-existing first-IPv4 behavior so
- * hosts without Tailscale see no change. Pure over the interface map so the
- * order-sensitive cases are unit-testable. */
+ * when one exists, in any interface; else the first IPv4 on a ZeroTier
+ * interface; else the pre-existing first-IPv4 behavior, so hosts without
+ * either VPN see no change. Pure over
+ * the interface map so the order-sensitive cases are unit-testable. */
 export interface EnrollIfaceInfo {
   address: string
   family: string | number
@@ -142,21 +152,30 @@ export interface EnrollIfaceInfo {
 export function selectEnrollHost(
   ifaces: Record<string, EnrollIfaceInfo[] | undefined>,
 ): string | null {
+  // Three tiers, each the first match in interface order: tailnet, then
+  // ZeroTier, then any IPv4. The tailnet MUST win over ZeroTier regardless of
+  // order: interface order follows device creation and can flip between
+  // reboots, and a Bridge device on the tailnet but not on that ZeroTier
+  // network would get an unreachable bundle (the BRIDGEHOST1 failure). So a
+  // host with Tailscale sees exactly the pre-ZeroTier behavior.
+  let zerotierAddr: string | null = null
   let first: string | null = null
   for (const name of Object.keys(ifaces)) {
+    const zerotier = isZeroTierIfaceName(name)
     for (const info of ifaces[name] ?? []) {
       const family = info.family as string | number
       if ((family === 'IPv4' || family === 4) && !info.internal) {
         if (isTailnetIPv4(info.address)) return info.address
+        if (zerotier && zerotierAddr === null) zerotierAddr = info.address
         if (first === null) first = info.address
       }
     }
   }
-  return first
+  return zerotierAddr ?? first
 }
 
-/** Best-effort default host of this machine: tailnet-preferred, else the
- * first non-loopback IPv4. */
+/** Best-effort default host of this machine: tailnet/ZeroTier-preferred,
+ * else the first non-loopback IPv4. */
 function primaryIPv4(): string | null {
   return selectEnrollHost(networkInterfaces())
 }
@@ -178,6 +197,7 @@ export async function bridgeEnroll(
   if (resolved === null) {
     throw new RemoteEnrollError(
       "could not obtain this machine's ssh-ed25519 host key; ensure the SSH server is running (macOS: System Settings > General > Sharing > Remote Login)",
+      'host_key_missing',
     )
   }
 
@@ -191,9 +211,7 @@ export async function bridgeEnroll(
 
   // Replace-by-id on the device-key side too: a re-paired device must not
   // keep its previous (possibly lost) key alive.
-  const prior = findDeviceKeyByInstallId(parsed.installId)
-  if (prior) revokeDeviceKey(prior.id)
-  const minted = createDeviceKey(input.name, { installId: parsed.installId })
+  const { minted, replaced } = mintBridgeDeviceKey(input.name, parsed.installId)
 
   const host = input.host ?? primaryIPv4() ?? hostname()
   const bundle = encodeBundle(
@@ -214,7 +232,7 @@ export async function bridgeEnroll(
     warnings: enrollResult.warnings,
     installId: parsed.installId,
     deviceKeyId: minted.id,
-    replacedDeviceKey: prior !== null,
+    replacedDeviceKey: replaced,
     host,
     hostKeySource: resolved.source,
     bundle,

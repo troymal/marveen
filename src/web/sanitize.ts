@@ -3,8 +3,13 @@ import { resolve, sep } from 'node:path'
 // NFD + combining-mark strip so Hungarian input like "etrendiro" decays
 // to "etrendiro" instead of silently losing every accented character
 // and producing "trendr".
+// Whitespace becomes a hyphen, like sanitizeScheduleName: "Lean Writer" used
+// to decay to "leanwriter", a name nobody typed. Every lookup resolves an
+// existing directory name, which never contains whitespace, so this changes
+// only what a NEW name becomes.
 export function sanitizeAgentName(raw: string): string {
   return raw.trim().toLowerCase()
+    .replace(/\s+/g, '-')
     .normalize('NFD')
     .replace(/[̀-ͯ]/g, '')
     .replace(/[^a-z0-9-]/g, '')
@@ -12,6 +17,36 @@ export function sanitizeAgentName(raw: string): string {
     .replace(/^-|-$/g, '')
     .slice(0, 50)
 }
+
+// Ids the message layer already owns, so a main agent must never take one
+// (FLEETRESERVEDNAME1021). 'system' is the in-process directive sender and is
+// 403'd on every POST lane; 'telegram-coordinator' is 403'd too; 'heartbeat'
+// and 'channel-coordinator' are hidden as chat threads. A main agent with one
+// of these ids could not send, or would speak as something it is not.
+export const MESSAGE_LAYER_RESERVED_AGENT_IDS: readonly string[] =
+  ['system', 'heartbeat', 'telegram-coordinator', 'channel-coordinator']
+
+// First path segments the agents API serves itself (AGENTROUTERESERVED1114):
+// GET /api/agents/activity, GET /api/agents/status, POST /api/agents/model-suggest,
+// GET /api/agents/export-all, POST /api/agents/import. They are matched before the
+// generic /api/agents/:name routes, so an agent with one of these names would have
+// its own address answered by the fixed handler. THE one list of them: a new fixed
+// route under /api/agents/ gets its segment added HERE, and
+// src/__tests__/agent-route-reserved-names.test.ts scans the source and goes red
+// until it is. The scan reads the prefix written out, as a string or in a regex;
+// a path put together from a prefix constant and a segment kept elsewhere is
+// invisible to it (and to any source scan), so write the full path at the route.
+export const AGENT_ROUTE_RESERVED_IDS: readonly string[] =
+  ['activity', 'status', 'model-suggest', 'export-all', 'import']
+
+// The fixed reserved ids: no main agent and no sub-agent may take one.
+// Literals, not imports: the shell migration script keeps the same two lists, and
+// a test pins both to the source constants. This is only the FIXED part: the
+// voice channel id is configurable (VOICECHANNELID1022), so the full list,
+// RESERVED_AGENT_IDS, is built in config.ts. Kept here so this module stays a
+// leaf with no load-time .env read.
+export const FIXED_RESERVED_AGENT_IDS: readonly string[] =
+  [...MESSAGE_LAYER_RESERVED_AGENT_IDS, ...AGENT_ROUTE_RESERVED_IDS]
 
 // Same rules as sanitizeAgentName -- used for skill names to prevent path traversal.
 export function sanitizeSkillName(raw: string): string {
@@ -38,4 +73,13 @@ export function safeJoin(base: string, ...parts: string[]): string {
 
 export function shellEscape(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'"
+}
+
+// A path as ONE shell word for a recipe line: as it is when it holds only letters, combining marks (a
+// decomposed accent), digits (any script) and characters the shell leaves alone (a tilde inside a path
+// is not expanded, but a leading one is, so that stays quoted). Then the line stays byte for byte
+// what it was, and a profile allow-list prefix still matches. Single-quoted otherwise: a space in
+// PROJECT_ROOT split the helper path in two.
+export function shellWord(s: string): string {
+  return /^(?!~)[\p{L}\p{M}\p{N}_@%+=:,./~-]+$/u.test(s) ? s : shellEscape(s)
 }

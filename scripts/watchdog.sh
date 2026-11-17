@@ -65,9 +65,24 @@ agent_launch_env() {
   fi
 }
 
+# BASHSANDBOX1022: an agent on the owner's BASH_SANDBOX_AGENTS list runs its Bash in Claude
+# Code's sandbox, from a --settings file the dashboard writes on every start of it (and removes
+# for an agent the switch does not list). A restart from here must carry the same file, or the
+# first auto-recovery would bring the agent back unsandboxed. The file's presence decides: this
+# script cannot read the dashboard's settings, and a stale file errs on the restrictive side.
+agent_sandbox_flag() {
+  local F="$INSTALL_DIR/store/bash-sandbox/$1.settings.json"
+  if [ -f "$F" ]; then printf " --settings '%s'" "$F"; fi
+}
+
 # Self-test hook, mirroring --resolve-provider: print the launch-env prefix
 # for one agent dir and exit, so the isolation contract is testable from
 # fixtures (scripts/__tests__/watchdog-config-isolation.test.sh).
+if [ "${1:-}" = "--sandbox-flag" ]; then
+  [ -n "${2:-}" ] || { echo "usage: watchdog.sh --sandbox-flag <agent-id>" >&2; exit 2; }
+  echo "flag=$(agent_sandbox_flag "$2")"
+  exit 0
+fi
 if [ "${1:-}" = "--launch-env" ]; then
   [ -n "${2:-}" ] || { echo "usage: watchdog.sh --launch-env <agent-dir>" >&2; exit 2; }
   ENV_PREFIX="$(agent_launch_env "$2")"
@@ -97,46 +112,61 @@ if [ "${1:-}" = "--check-scaffolded" ]; then
 fi
 
 
-export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+# NATIVECLAUDEFIRST1011 (#1896): $HOME/.local/bin first, as in channels.sh -- the
+# sub-agent restart below resolves claude by name (CLAUDE_BIN) under this PATH.
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+. "$INSTALL_DIR/scripts/fleet-venv-prefix.sh" 2>/dev/null || fleet_venv_prefix() { :; }
 
 TOKEN=""
 if [ -f "$INSTALL_DIR/store/.dashboard-token" ]; then
   TOKEN=$(cat "$INSTALL_DIR/store/.dashboard-token")
 fi
+# VOICETOKENLEAK1101 round 3: never in a child's environment (an exported TOKEN the caller had keeps its export
+# attribute through the assignment), and never on curl's argv (the redelivery request below passes it by process
+# substitution).
+export -n TOKEN
 
-# Replays delivered-but-not-completed messages from the last 2 hours into
-# a freshly restarted agent session. Called after a confirmed restart.
-replay_unfinished_messages() {
+# REPLAYNOENVELOPE1114: after a confirmed restart, ask the dashboard to put this agent's delivered, not closed
+# messages back in its queue (POST /api/agents/<id>/redeliver-open). The message router then delivers them again
+# through its normal path: envelope with sender and msg_id, a note that it is a redelivery, the pane mapping, the
+# chunker, the delivery trace, the seen sweep. This script types NOTHING into the pane any more (the Python replay
+# it used to call typed raw content with no envelope), and the call carries only the agent name: the server
+# chooses the rows (never a system directive, each row at most once). No token, no dashboard or a non-200 answer
+# means no redelivery, and each of those is a line in $LOG, never silent.
+request_open_redelivery() {
   local AGENT_ID="$1"
-  local SESSION_NAME="$2"
+  local RESPONSE HTTP_CODE BODY COUNT
 
-  [ -z "$TOKEN" ] && return
+  if [ -z "$TOKEN" ]; then
+    echo "$(timestamp) [watchdog] $AGENT_ID: nincs dashboard token, ujrakezbesites kihagyva" >> "$LOG"
+    return
+  fi
 
-  local NOW CUTOFF RESPONSE TMPDATA
-  NOW=$(date +%s)
-  CUTOFF=$(( NOW - 7200 ))
-
-  RESPONSE=$(curl -s -m 5 \
-    -H "Authorization: Bearer $TOKEN" \
-    "http://localhost:${WEB_PORT}/api/messages?to=${AGENT_ID}&limit=200" 2>/dev/null) || return
-
-  [ -z "$RESPONSE" ] || [ "$RESPONSE" = "[]" ] && return
-
-  TMPDATA=$(mktemp)
-  echo "$RESPONSE" > "$TMPDATA"
-
-  # Replay logic extracted to its own file (testable) + MSGSZIVARGAS826: every
-  # injected message writes a dated marker into the dashboard log -- this used
-  # to be a fully record-less injection path, invisible to every detector.
-  # stderr goes to the watchdog log, NOT /dev/null (NOTIFYVAKSWEEP826 zaro
-  # kor, Marveen msg 16091): the replay python is honest about a failed
-  # marker write, but the old 2>/dev/null buried exactly that line -- the
-  # instrument built against silence would have gone blind silently.
-  python3 "$INSTALL_DIR/scripts/watchdog-replay.py" \
-    "$SESSION_NAME" "$AGENT_ID" "$CUTOFF" "$TMPDATA" \
-    "$INSTALL_DIR/store/dashboard.log" 2>>"$LOG"
-
-  rm -f "$TMPDATA"
+  # The token goes in a header read from a process substitution (printf is a builtin): never on curl's argv, never
+  # exported. -w appends the HTTP code on its own last line; without -f curl exits 0 on a 4xx/5xx too, so the code
+  # is what tells success. An empty -X POST sends no body, which is the only body the endpoint accepts.
+  if ! RESPONSE=$(curl -s -m 5 -X POST \
+    -H @<(printf 'Authorization: Bearer %s\n' "$TOKEN") \
+    -w '\n%{http_code}' \
+    "http://localhost:${WEB_PORT}/api/agents/${AGENT_ID}/redeliver-open" 2>/dev/null); then
+    echo "$(timestamp) [watchdog] $AGENT_ID: dashboard nem erheto el, ujrakezbesites kihagyva" >> "$LOG"
+    return
+  fi
+  HTTP_CODE=$(printf '%s' "$RESPONSE" | tail -n1)
+  BODY=$(printf '%s' "$RESPONSE" | sed '$d')
+  if [ "$HTTP_CODE" != "200" ]; then
+    echo "$(timestamp) [watchdog] $AGENT_ID: redeliver-open HTTP $HTTP_CODE, ujrakezbesites kihagyva" >> "$LOG"
+    return
+  fi
+  COUNT=$(printf '%s' "$BODY" | sed -n 's/.*"requeued":\([0-9][0-9]*\).*/\1/p' | head -n1)
+  if [ -z "$COUNT" ]; then
+    echo "$(timestamp) [watchdog] $AGENT_ID: redeliver-open HTTP 200, de a valaszban nincs requeued szam" >> "$LOG"
+    return
+  fi
+  # Quiet on zero: a restart with nothing to put back is the normal case.
+  if [ "$COUNT" -gt 0 ]; then
+    echo "$(timestamp) [watchdog] $AGENT_ID: $COUNT uzenet visszateve ujrakezbesitesre (redeliver-open)" >> "$LOG"
+  fi
 }
 
 # ── Dashboard ──────────────────────────────────────────────────────────────
@@ -154,14 +184,30 @@ MAIN_AGENT_ID="$(grep -E '^MAIN_AGENT_ID=' "$INSTALL_DIR/.env" 2>/dev/null | hea
 MAIN_AGENT_ID="${MAIN_AGENT_ID:-marveen}"
 MAIN_SESSION="${MAIN_AGENT_ID}-channels"
 
-if ! tmux has-session -t "$MAIN_SESSION" 2>/dev/null; then
-  echo "$(timestamp) [watchdog] $MAIN_SESSION missing, restarting..." >> "$LOG"
-  nohup "$INSTALL_DIR/scripts/channels.sh" >> "$INSTALL_DIR/logs/marveen-channels.log" 2>&1 &
-  sleep 5
-  if tmux has-session -t "$MAIN_SESSION" 2>/dev/null; then
-    echo "$(timestamp) [watchdog] $MAIN_SESSION restarted OK" >> "$LOG"
+if ! tmux has-session -t "=$MAIN_SESSION:" 2>/dev/null; then
+  # Mutual-exclusion gate, mirroring channel-watchdog.sh's gate 4. The dashboard
+  # channel-monitor, channel-watchdog.sh, systemd (Restart=always) and this cron
+  # loop can all recreate the main channels session; they coordinate through the
+  # shared respawn stamp (store/.channel-last-respawn, written by channels.sh).
+  # Without this gate this loop spawned a competing channels.sh every 5 min while
+  # another actor was mid-respawn -> two claude processes contending for the same
+  # bot token (409) and rapid-exit (root-caused 2026-08-06, ~4.5h outage). Defer
+  # while a respawn is inside the grace window (same 15 min as channel-watchdog.sh);
+  # only act as the last-resort backstop once every other actor has stopped trying.
+  MAIN_RESPAWN_STAMP="$INSTALL_DIR/store/.channel-last-respawn"
+  _mlast=0
+  [ -f "$MAIN_RESPAWN_STAMP" ] && _mlast="$(stat -c %Y "$MAIN_RESPAWN_STAMP" 2>/dev/null || echo 0)"
+  if [ "$(( $(date +%s) - _mlast ))" -lt 900 ]; then
+    echo "$(timestamp) [watchdog] $MAIN_SESSION missing but a respawn is within the 900s grace -- deferring (systemd/channels.sh/channel-watchdog cover it)" >> "$LOG"
   else
-    echo "$(timestamp) [watchdog] $MAIN_SESSION restart FAILED" >> "$LOG"
+    echo "$(timestamp) [watchdog] $MAIN_SESSION missing, restarting..." >> "$LOG"
+    nohup "$INSTALL_DIR/scripts/channels.sh" >> "$INSTALL_DIR/logs/marveen-channels.log" 2>&1 &
+    sleep 5
+    if tmux has-session -t "=$MAIN_SESSION:" 2>/dev/null; then
+      echo "$(timestamp) [watchdog] $MAIN_SESSION restarted OK" >> "$LOG"
+    else
+      echo "$(timestamp) [watchdog] $MAIN_SESSION restart FAILED" >> "$LOG"
+    fi
   fi
 fi
 
@@ -176,7 +222,7 @@ for AGENT_DIR in "$INSTALL_DIR/agents"/*/; do
   AGENT_ID=$(basename "$AGENT_DIR")
   SESSION_NAME="agent-${AGENT_ID}"
 
-  if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+  if tmux has-session -t "=$SESSION_NAME:" 2>/dev/null; then
     continue
   fi
 
@@ -201,16 +247,18 @@ for AGENT_DIR in "$INSTALL_DIR/agents"/*/; do
   fi
 
   ISO_ENV="$(agent_launch_env "$AGENT_DIR")"
+  # FLEETVENV923: the fleet venv's bin/ first, as in startAgentProcess -- a
+  # watchdog restart must not hand the agent a different python3 (#1626 review).
+  FLEET_VENV_PREFIX="$(fleet_venv_prefix "$INSTALL_DIR" "$LOG")"
 
-  CMD="${ISO_ENV}export PATH=\"/opt/homebrew/bin:\$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:\$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:\$PATH\" && unset TELEGRAM_BOT_TOKEN SLACK_BOT_TOKEN SLACK_APP_TOKEN DISCORD_BOT_TOKEN && export ${STATE_ENV_VAR}=\"$CHAN_DIR\" && cd \"$AGENT_DIR\" && ${CLAUDE_BIN} --dangerously-skip-permissions --model '$MODEL' --channels plugin:${AGENT_PROVIDER}@claude-plugins-official"
+  CMD="${ISO_ENV}export PATH=\"${FLEET_VENV_PREFIX}\$HOME/.local/bin:/opt/homebrew/bin:\$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:\$PATH\" && unset TELEGRAM_BOT_TOKEN SLACK_BOT_TOKEN SLACK_APP_TOKEN DISCORD_BOT_TOKEN && export CLAUDE_CODE_DISABLE_AGENT_VIEW=1 && { [ \"\$(id -u)\" != 0 ] || export IS_SANDBOX=1; } && export ${STATE_ENV_VAR}=\"$CHAN_DIR\" && cd \"$AGENT_DIR\" && ${CLAUDE_BIN} --dangerously-skip-permissions --model '$MODEL' --channels plugin:${AGENT_PROVIDER}@claude-plugins-official$(agent_sandbox_flag "$AGENT_ID")"
 
   tmux new-session -d -s "$SESSION_NAME" "$CMD" 2>/dev/null
   sleep 2
 
-  if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+  if tmux has-session -t "=$SESSION_NAME:" 2>/dev/null; then
     echo "$(timestamp) [watchdog] $AGENT_ID restarted OK" >> "$LOG"
-    REPLAY_OUT=$(replay_unfinished_messages "$AGENT_ID" "$SESSION_NAME" 2>&1)
-    [ -n "$REPLAY_OUT" ] && echo "$(timestamp) $REPLAY_OUT" >> "$LOG"
+    request_open_redelivery "$AGENT_ID"
   else
     echo "$(timestamp) [watchdog] $AGENT_ID restart FAILED" >> "$LOG"
   fi

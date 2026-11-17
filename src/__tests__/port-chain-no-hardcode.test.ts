@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { execFileSync } from 'node:child_process'
 import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, rmSync, cpSync } from 'node:fs'
 import { join } from 'node:path'
+import { importsValueBinding } from './setup/source-imports.js'
 import { tmpdir } from 'node:os'
 import { substituteTemplatePlaceholders } from '../web/agent-scaffold.js'
 
@@ -104,15 +105,20 @@ describe('PORTCHAIN1: the port chain follows WEB_PORT on a NON-default port', ()
       ownerName: 'Owner', webPort: Number(PORT),
     })
     expect(rendered).not.toContain('3420')
-    expect(rendered).toContain(`localhost:${PORT}/api/memories`)
-    expect(rendered).toContain(`localhost:${PORT}/api/daily-log`)
-    expect(rendered).toContain(`localhost:${PORT}/api/agent-taskstate`)
+    // #2338: the PreCompact saves go through scripts/marveen-api.sh, which takes the port
+    // from MARVEEN_WEB_PORT / WEB_PORT / the install's .env itself, so no port is baked in.
+    expect(rendered).not.toMatch(/localhost:\d+\/api\//)
+    expect(rendered).toContain('/opt/install/scripts/marveen-api.sh memory-save ')
+    expect(rendered).toContain('/opt/install/scripts/marveen-api.sh daily-log ')
+    expect(rendered).toContain('/opt/install/scripts/marveen-api.sh taskstate-save ')
     expect(() => JSON.parse(rendered)).not.toThrow()
   })
 
   it('channel-monitor builds its agent instruction from WEB_PORT', () => {
     const src = readFileSync(join(ROOT, 'src/web/channel-monitor.ts'), 'utf-8')
-    expect(src).toContain("import { WEB_PORT } from '../config.js'")
+    // TESZTIMPORTUTIL922: verbatim line comparison replaced -- a co-import from
+    // config.js must not turn this red while WEB_PORT is still imported.
+    expect(importsValueBinding(src, 'WEB_PORT', '../config.js')).toBe(true)
     expect(src).toMatch(/localhost:\$\{WEB_PORT\}\/api\/memories/)
     expect(src).not.toMatch(/localhost:3420/)
   })

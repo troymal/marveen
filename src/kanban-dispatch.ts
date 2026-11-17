@@ -14,6 +14,8 @@
 //     (a non-running sub-agent is a silent no-op; the card just stays in
 //      in_progress rather than queuing a message for a session that isn't up)
 //   - the mover IS the assignee (self-move) -> null (no echo)
+//   - the assignee is on the opt-in skip list (KANBAN_DISPATCH_SKIP_AGENTS,
+//     empty by default) -> null (never woken by a card move)
 //
 // The self-move rule exists because an agent that picks up its own card does
 // not need to be told to start what it just started: the dispatch would arrive
@@ -30,6 +32,15 @@ export interface DispatchResolveOpts {
   isRunning: (name: string) => boolean
   /** Who moved the card (kanban_card_events.actor). Omitted -> no self-move check. */
   actor?: string | null
+  /** Agents a card move must never wake (KANBAN_DISPATCH_SKIP_AGENTS). Omitted or empty -> no skip. */
+  skipAgents?: string[]
+}
+
+/** Split the KANBAN_DISPATCH_SKIP_AGENTS value into names: comma separated,
+ *  trimmed, empty entries dropped. Any non-string yields an empty list. */
+export function parseDispatchSkipAgents(value: unknown): string[] {
+  if (typeof value !== 'string') return []
+  return value.split(',').map((s) => s.trim()).filter((s) => s !== '')
 }
 
 // Map any human-typed reference (display name, canonical id, any casing) onto
@@ -50,19 +61,52 @@ function canonicalAgentId(
   return opts.agentNames.find((n) => n.toLowerCase() === lower) ?? null
 }
 
+/** Why no message went out -- the caller must tell 'nobody to wake' apart from
+ *  'somebody to wake, unreachable'. Only 'session-down' is a fault: the card is
+ *  in_progress for a real fleet agent that was never told. */
+export type DispatchSkipReason = 'not-dispatchable' | 'self-move' | 'skip-listed' | 'session-down'
+
+export interface DispatchDecision {
+  /** Who to wake, or null when no message goes out. */
+  target: string | null
+  /** Set exactly when target is null. */
+  reason?: DispatchSkipReason
+  /** The resolved agent id when the session is down -- for the alert text. */
+  unreachable?: string
+}
+
+export function resolveKanbanDispatch(
+  assignee: string | null | undefined,
+  opts: DispatchResolveOpts,
+): DispatchDecision {
+  const target = canonicalAgentId(assignee, opts)
+  // Empty, unknown, or the human owner: nobody is expected to be woken.
+  if (!target) return { target: null, reason: 'not-dispatchable' }
+
+  // Self-move: the agent that moved the card is the one we would wake.
+  const mover = canonicalAgentId(opts.actor, opts)
+  if (mover && mover === target) return { target: null, reason: 'self-move' }
+
+  // Opt-in skip list: names are matched the way an assignee is (display name,
+  // canonical id, any casing). A name that resolves to no dispatchable agent
+  // never matches. This sits BEFORE the session check, so a listed agent whose
+  // session is down is a deliberate silence, not an "undelivered" alert.
+  for (const name of opts.skipAgents ?? []) {
+    if (canonicalAgentId(name, opts) === target) return { target: null, reason: 'skip-listed' }
+  }
+
+  // The main agent always has a session; a sub-agent is dispatched only if its
+  // session is running. A down session used to be a SILENT no-op -- the card
+  // sat in in_progress with nobody working it and nothing said so.
+  if (target === opts.mainAgentId) return { target }
+  if (opts.isRunning(target)) return { target }
+  return { target: null, reason: 'session-down', unreachable: target }
+}
+
+/** Target-only view, kept for callers that only need "who, if anyone". */
 export function resolveKanbanDispatchTarget(
   assignee: string | null | undefined,
   opts: DispatchResolveOpts,
 ): string | null {
-  const target = canonicalAgentId(assignee, opts)
-  if (!target) return null
-
-  // Self-move: the agent that moved the card is the one we would wake.
-  const mover = canonicalAgentId(opts.actor, opts)
-  if (mover && mover === target) return null
-
-  // The main agent always has a session; a sub-agent is dispatched only if its
-  // session is running (otherwise the card just stays in in_progress).
-  if (target === opts.mainAgentId) return target
-  return opts.isRunning(target) ? target : null
+  return resolveKanbanDispatch(assignee, opts).target
 }

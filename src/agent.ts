@@ -6,6 +6,8 @@ import { PROJECT_ROOT } from './config.js'
 
 const TYPING_REFRESH_MS = 4000
 import { logger } from './logger.js'
+import { isFleetFrozen } from './web/fleet-freeze.js'
+import { neutralizeAtMentions } from './web/pane-text.js'
 
 const AGENT_TIMEOUT_MS = Number(process.env.MARVEEN_AGENT_TIMEOUT_MS) || 20 * 60 * 1000
 
@@ -141,7 +143,24 @@ export async function runAgent(
   env?: Record<string, string | undefined>,
   opts: RunAgentOpts = {},
 ): Promise<{ text: string | null; newSessionId?: string; error?: string }> {
+  // KILLSWITCH1022: every dashboard-side Claude call (the daily digest, the
+  // schedule-expansion routes, capability summaries...) goes through here, on a
+  // session that runs tools. A frozen fleet starts none of them.
+  if (isFleetFrozen()) {
+    logger.warn({ caller: new Error().stack?.split('\n')[2]?.trim() }, 'runAgent refused: fleet frozen (KILLSWITCH1022)')
+    return { text: null, error: 'fleet frozen (KILLSWITCH1022)' }
+  }
   const timeoutMs = opts.timeoutMs ?? AGENT_TIMEOUT_MS
+  // TYPINGPATHS1114: Claude Code turns an at-sign at the start of a prompt or
+  // after whitespace into a file attachment, with no tool call (see
+  // web/pane-text.ts, ENVATLEAK1114). The worker path types its prompt through
+  // the common sender, which applies the mapping; the SDK path below hands the
+  // prompt to the CLI directly and applied nothing. Whether the SDK prompt
+  // attaches was NOT measured when this went in: the mapping is cheap, and the
+  // fallback path must not differ from the main one. It runs ONCE here, for both
+  // paths; it is idempotent, so the common sender's second pass changes nothing.
+  // Only the at-sign step: the SDK takes a multi-line prompt, line breaks stay.
+  const prompt = neutralizeAtMentions(message)
   if (agentBackend() === 'worker') {
     // The interactive worker is a single shared session with its own fixed,
     // isolated, NEUTRAL cwd/config -- so the SDK-era per-call cwd/env isolation
@@ -151,7 +170,7 @@ export async function runAgent(
     // and avoids any load-order coupling.
     if (sessionId) logger.warn('runAgent(worker): resume/sessionId not supported on worker backend, ignoring')
     const { runViaWorker } = await import('./web/agent-worker.js')
-    const { text, error, authFailed } = await runViaWorker(message, timeoutMs)
+    const { text, error, authFailed } = await runViaWorker(prompt, timeoutMs)
     // authFailed = the worker could not recover its subscription auth even after
     // a reseed + clear-keychain + restart + retry. Fall through to the SDK path
     // so the call still completes (API billing) instead of dying silently (the
@@ -175,7 +194,7 @@ export async function runAgent(
 
   try {
     const events = query({
-      prompt: message,
+      prompt,
       options: {
         abortController,
         cwd,

@@ -15,18 +15,47 @@
 // string) and claims no more. Our sub-agents are not adversaries; if that
 // assumption ever changes, this gate is the wrong tool.
 //
-// Why a hook and not a permissions deny-list: permissive security profiles
-// launch Claude Code with --dangerously-skip-permissions, which BYPASSES the
-// settings.json allow/deny list. A PreToolUse hook runs regardless of
-// permission mode, so it is the only reliable mode-independent gate.
+// Why a hook and not a permissions deny-list: the hook is version- and
+// mode-independent, and it can analyze command CONTENT (the Bash send-shape
+// heuristics below), which a name/prefix deny rule cannot express.
+// CORRECTION (SKIPDENY910, measured 2026-09-10): this comment used to claim
+// that --dangerously-skip-permissions BYPASSES the settings.json deny list.
+// That is false on every CLI version we measured (2.1.63, 2.1.110, 2.1.267;
+// marker-file ground truth, deny arm vs no-deny control, -p AND interactive
+// TUI): the deny list IS enforced under the flag, and a tool-name deny is
+// enforced by removing the tool from the session entirely. The hook remains
+// the primary gate anyway -- future CLI behavior is not a contract, and the
+// deny list stays a second, independent layer, not the load-bearing one.
 //
 // This file is wired into every sub-agent's .claude/settings.json by
 // writeAgentSettingsFromProfile() (agent-scaffold.ts), guarded by
 // name !== MAIN_AGENT_ID, and re-applied on every spawn (respawn-safe).
 
-import { readFileSync, realpathSync } from 'node:fs'
+import { closeSync, lstatSync, openSync, readdirSync, readFileSync, readSync, realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join, normalize, resolve } from 'node:path'
+import { homedir } from 'node:os'
+
+// HOOKDEPLOAD1008: the ledger module is a DYNAMIC import. As a static import, a
+// broken recipient-ledger.mjs (a syntax error, a conflicted merge, a missing
+// export) failed the module link before any line of this file ran: node exited
+// 1, which PreToolUse treats as NON-blocking, so EVERY call went through
+// unchecked -- the send_email deny included, which never needs the ledger.
+// Now the failure is kept, only a decision that needs the ledger hits it, and
+// that one fails closed at the entrypoint (exit 2, the reason on stderr).
+let loadLedger, isVerifiedIn, splitAddresses, parseAddresses, SOURCE_HELP
+let LEDGER_LOAD_ERROR = null
+try {
+  ({ loadLedger, isVerifiedIn, splitAddresses, parseAddresses, SOURCE_HELP } = await import('./recipient-ledger.mjs'))
+  const missing = Object.entries({ loadLedger, isVerifiedIn, splitAddresses, parseAddresses })
+    .filter(([, fn]) => typeof fn !== 'function').map(([name]) => name)
+  if (missing.length) throw new Error(`missing export: ${missing.join(', ')}`)
+} catch (err) {
+  LEDGER_LOAD_ERROR = err
+  const unavailable = () => { throw new Error(`recipient-ledger.mjs did not load: ${err?.message ?? err}`) }
+  loadLedger = isVerifiedIn = splitAddresses = parseAddresses = unavailable
+  SOURCE_HELP = '(a ledger modul nem toltheto be)'
+}
 
 // Bash command patterns that send mail. SUBGATEPOZ822 (2026-08-22): these are
 // no longer the primary trigger -- they matched CONTENT anywhere in the
@@ -75,21 +104,283 @@ const SEND_PATTERNS = [
 // would have lost a heredoc-fed real sender (FN).
 const HEREDOC_RE = /(<<-?\s*'?(\w+)'?[^\n]*)\n[\s\S]*?\n\2(?=\s|$)/g
 const ENV_ASSIGN = /^[A-Za-z_][A-Za-z_0-9]*=/
+// KWSPLIT924: shell reserved words that put the NEXT word in command position.
+// Stripped only at the head of a segment, never used as separators -- see the
+// full rationale at _CMD_POSITION_KEYWORDS in outgoing-copy-gate.py (the python
+// twin); the shared send-invocation-cases.json binds the two copies.
+const CMD_POSITION_KEYWORDS = new Set(['if', 'then', 'else', 'elif', 'do', 'while', 'until', '{', '!'])
 const SENDER_PROG = /^(sendmail|msmtp|swaks)$/i
+// MAILGATEAPIB1027: mail / mailx / s-nail send when given an address, a subject, a cc/bcc/from/attach option or
+// any operand (a recipient); with none of these (`mail`, `mail -f mbox`, `mail -u user`) they read mail.
+// Mirrors _MAIL_PROG / _mail_prog_sends in hooks/outgoing-copy-gate.py.
+const MAIL_PROG = /^(mail|mailx|s-nail)$/i
+const MAIL_SEND_OPT = /^-[A-Za-z]*[sbcrtaAq]/
+const CURL_SMTP = /^(?:smtps?:\/\/|--mail-(?:rcpt|from)(?:=|$))/i
+function mailProgSends(rest) {
+  let skip = false
+  for (const t of rest) {
+    if (skip) { skip = false; continue }
+    if (t.includes('@')) return true
+    if (t === '-f' || t === '-u') { skip = true; continue }
+    if (t.startsWith('-')) {
+      if (MAIL_SEND_OPT.test(t)) return true
+      continue
+    }
+    return true
+  }
+  return false
+}
 const SENDPY = /^send\.py$/i
-const PYTHON = /^python3?$/i
+// SUBAGENTMAILGATE1016: a version-suffixed interpreter (python3.12, python3.13, and
+// the free-threaded python3.13t) is the same python; the old /^python3?$/ let it
+// through as "not an interpreter".
+const PYTHON = /^python(3(\.\d+t?)?)?$/i
 const NODEISH = /^(node|tsx|ts-node|deno|bun|npx)$/i
 const GRAPHMAIL = /^graph-mail(\.ts|\.js)?$/i
 const WRAPPER_SHELL = /^(sh|bash|zsh|dash)$/i
 const CURLISH = /^(curl|wget|http)$/i
 const RESEND_TARGET = /^(https?:\/\/)?([^/@\s]*\.)?api\.resend\.com(\/|$)/i
+// RESENDGETTWIN1010: port of the python twin's method verdict (RESENDGATE826,
+// outgoing-copy-gate.py :: _curl_resend_verdict). Until now this copy was
+// method-blind and denied a read-only GET /domains the python copy passed.
+// Strict direction kept: the method must be RECOGNIZED (explicit -X/--request/
+// --method, or an implicit POST from a body flag); an undecidable method
+// (variable, truncated flag, config file) stays a send. httpie (`http`) takes
+// its method positionally and its body as `key=value` items, none of which this
+// flag scan reads, so it is undecidable too and stays a send in both twins.
+const HTTPIE = /^http$/i
+const CURL_BODY_OPTS = new Set([
+  '-d', '--data', '--data-raw', '--data-binary', '--data-urlencode',
+  '--data-ascii', '-F', '--form', '--form-string', '--json',
+  '-T', '--upload-file',
+  // wget body flags
+  '--post-data', '--post-file', '--body-data', '--body-file',
+])
+const SAFE_METHODS = new Set(['GET', 'HEAD'])
+const ALPHA = /^\p{L}+$/u // python str.isalpha()
+
+// 'read' | 'send' | 'unknown' -- the caller treats unknown as a send.
+function curlResendVerdict(prog, rest) {
+  if (HTTPIE.test(prog)) return 'unknown'
+  let method = null
+  let hasBody = false
+  let getForced = false
+  const n = rest.length
+  for (let i = 0; i < n; i++) {
+    const t = rest[i]
+    if (t === '-X' || t === '--request' || t === '--method') {
+      if (i + 1 >= n || !ALPHA.test(rest[i + 1])) return 'unknown'
+      method = rest[i + 1].toUpperCase()
+      i++
+      continue
+    }
+    if (t.startsWith('--request=') || t.startsWith('--method=')) {
+      const m = t.split('=').slice(1).join('=')
+      if (!ALPHA.test(m)) return 'unknown'
+      method = m.toUpperCase()
+      continue
+    }
+    if (t === '-G' || t === '--get') { getForced = true; continue }
+    if (t === '-K' || t === '--config') return 'unknown' // a config file can carry a hidden method or body
+    if (CURL_BODY_OPTS.has(t) ||
+        [...CURL_BODY_OPTS].some((o) => o.startsWith('--') && t.startsWith(o + '='))) {
+      hasBody = true
+      continue
+    }
+    if (t.startsWith('-') && !t.startsWith('--') && t.length > 1) {
+      // single-dash cluster (-sS, -sX POST, -sd '{}'): the letters are bundled
+      const letters = t.slice(1)
+      if (letters.includes('X')) {
+        const after = letters.slice(letters.indexOf('X') + 1)
+        if (after) {
+          if (!ALPHA.test(after)) return 'unknown'
+          method = after.toUpperCase()
+        } else {
+          if (i + 1 >= n || !ALPHA.test(rest[i + 1])) return 'unknown'
+          method = rest[i + 1].toUpperCase()
+          i++
+        }
+      } else if (letters.includes('d') || letters.includes('F') || letters.includes('T')) {
+        hasBody = true
+      } else if (letters.includes('G')) {
+        getForced = true
+      } else if (letters.includes('K')) {
+        return 'unknown'
+      }
+    }
+  }
+  if (method !== null && !SAFE_METHODS.has(method)) return 'send'
+  // implicit POST (the default of curl -d/-F/--json/-T), or a suspicious
+  // "GET with a body" -- both are treated as a send
+  if (hasBody && !getForced) return 'send'
+  return 'read'
+}
 const CODE_SEND = /\bsmtplib\b|SMTP\s*\(|\bsendMail\s*\(|\bsendEmail\b|\bmail\.send\b/i
 // Naive-shape exec heuristic (msg 14298): process-spawn AND a known mailer
 // name together in one interpreter code string. Covers the accidental shapes;
 // see the STATED LIMIT in the header for what it deliberately does not claim.
 const CODE_EXECISH = /\bsubprocess\b|os\.system|\bpopen\b|child_process|\bexec[A-Za-z]*\s*\(|\bspawn[A-Za-z]*\s*\(/i
 const CODE_SENDER_LIT = /sendmail|msmtp|swaks|send\.py/i
-const codeStringSends = (code) => CODE_SEND.test(code) || (CODE_EXECISH.test(code) && CODE_SENDER_LIT.test(code))
+// Issue #1853 (stylnet): the support-mail sender LOADED AS A MODULE (`import send`,
+// `from send import main`, runpy, __import__/import_module, a spec built from send.py).
+// Case-sensitive on purpose; `send` must be the whole module name. Mirrors
+// _CODE_SEND_MODULE in hooks/outgoing-copy-gate.py; send-invocation-cases.json binds them.
+const CODE_SEND_MODULE = new RegExp(
+  String.raw`\bimport\s+(?:[\w.]+\s*,\s*)*send\b(?![\w.])` +
+  String.raw`|\bfrom\s+send\s+import\b` +
+  String.raw`|\brunpy\b[^\n]*\bsend\b` +
+  String.raw`|\b(?:__import__|import_module)\s*\(\s*['"]send['"]` +
+  String.raw`|\bspec_from_file_location\b[^\n]*\bsend\.py\b` +
+  // The same class on the Graph sender (export sendMail): renamed on import, or a string key.
+  String.raw`|\bsendMail\s+as\b|\[\s*['"]sendMail['"]\s*\]`,
+)
+// MAILGATESCRIPT1027: a Microsoft Graph send endpoint (sendMail, or send/reply/replyAll/forward of a message)
+// MAILGATESCRIPT1027 R1: a send needs the endpoint shape AND Graph evidence in the same text (an application
+// route of the same shape is no send); `\/` is normalised to `/` first (JSON-escaped URLs).
+const GRAPH_SEND = /\/(?:me|users\/[^\n]{1,120}?)\/(?:sendMail(?![A-Za-z0-9_-]|[^\x00-\x7f])|messages\/[^\n]{1,160}?\/(?:send|reply|replyAll|forward)(?![A-Za-z0-9_-]|[^\x00-\x7f]))/i
+const GRAPH_EVIDENCE = /graph\.microsoft\.com|microsoft-graph-client|msgraph|\.api\s*\(/i
+const graphSends = (text) => {
+  const t = text.replaceAll('\\/', '/')
+  return GRAPH_SEND.test(t) && GRAPH_EVIDENCE.test(t)
+}
+// MAILGATEHTTPAPI1027: an HTTP mail API reached from a script (a Gmail REST send from urllib went past
+// the main agent's approval gate). Each provider needs its own evidence AND a send shape in the same
+// text, so a Gmail read or a text that only names the provider is no send. The evidence is a literal API
+// host or a client call or package name, never the bare provider word: after the `\/` normalisation a
+// gate's own regex source carries the shapes, and a gate file must not count as a sender. Mirrors
+// _MAIL_API_RULES in hooks/outgoing-copy-gate.py; hooks/mail-api-send-cases.json binds the two twins.
+const ACTION_END = String.raw`(?![A-Za-z0-9_-]|[^\x00-\x7f])`
+const MAIL_API_RULES = [
+  // Gmail: the REST host (also an assembled URL) or the client; the messages or drafts send call.
+  [/gmail\.googleapis\.com|[/]gmail[/]v1[/]|\bbuild\s*\(\s*['"]gmail['"]|\bgoogle\.gmail\s*\(|['"]@googleapis\/gmail['"]/i,
+    new RegExp(String.raw`\/(?:messages|drafts)\/send` + ACTION_END + String.raw`|\.(?:messages|drafts)\s*(?:\(\s*\))?\s*\.send\s*\(`, 'i')],
+  // Resend: the emails endpoint on the API host (and its batch), or the SDK's emails.send( on a client
+  // of any name (Samu 50950 A1: `const client = new Resend(k)`), the package being the evidence.
+  [/api\.resend\.com|['"]resend['"]|\bimport\s+resend\b/i,
+    new RegExp(String.raw`api\.resend\.com\/emails(?:\/batch)?` + ACTION_END + String.raw`|\.emails\.send\s*\(`, 'i')],
+  // SendGrid: v3 mail send on the API host, or the mail client.
+  [/api\.sendgrid\.com|['"]@sendgrid\/mail['"]|\bSendGridAPIClient\s*\(/i,
+    new RegExp(String.raw`api\.sendgrid\.com\/v3\/mail\/send` + ACTION_END + String.raw`|['"]@sendgrid\/mail['"]|\bSendGridAPIClient\s*\(`, 'i')],
+  // Mailgun: the API host with a v3 domain messages path (an assembled URL too), or the client's
+  // messages.create( next to the package name. A bare "/messages" is no evidence: the dashboard's own
+  // /api/messages is one.
+  [/mailgun\.net|['"]mailgun(?:\.js)?['"]/i,
+    new RegExp(String.raw`\/v3\/[^\n]{1,200}?\/messages(?:\.mime)?` + ACTION_END + String.raw`|\.messages\.create\s*\(`, 'i')],
+  // Postmark: the email endpoints on the API host (single, batch, with a template), or the SDKs (MAILGATEAPIB1027):
+  // the node client's sendEmail family, python postmarker's emails.send family.
+  [/api\.postmarkapp\.com|['"]postmark['"]|\bpostmarker\b/i,
+    new RegExp(String.raw`api\.postmarkapp\.com\/email(?:\/batch|\/withTemplate)?` + ACTION_END +
+      String.raw`|\.sendEmail(?:Batch|WithTemplate|BatchWithTemplates)?\s*\(|\.emails\.send(?:_batch|_with_template)?\s*\(`, 'i')],
+]
+const mailApiSends = (text) => {
+  const t = text.replaceAll('\\/', '/')
+  return MAIL_API_RULES.some(([evidence, send]) => evidence.test(t) && send.test(t))
+}
+// A Microsoft Graph send or an HTTP mail API send in a code string or a script file.
+const webMailSends = (text) => graphSends(text) || mailApiSends(text)
+// MAILGATEHEREDOCFP1027: a send marker that only sits in DATA is no send. The interpreter's code is read with its
+// prose blanked: a string literal whose text holds whitespace and every comment become spaces (length and line
+// breaks kept); a literal without whitespace (a URL, a package name, a 'sendmail' argv item) stays, and so do the
+// interpolations of a template literal or an f-string. An unterminated literal is left raw to the end of where the
+// scan stopped. Mirrors _mask_prose_literals in hooks/outgoing-copy-gate.py (see the rationale there);
+// hooks/prose-literal-cases.json binds the two.
+const PY_STR_PREFIX = /^(?:rb|br|fr|rf|r|b|u|f)$/i
+const isAlpha = (ch) => /^\p{L}$/u.test(ch)
+const isWordish = (ch) => /^[\p{L}\p{N}_]$/u.test(ch)
+const blankText = (s) => Array.from(s, (ch) => (ch === '\n' ? '\n' : ' ')).join('')
+export function maskProseLiterals(text, lang) {
+  if (lang !== 'py' && lang !== 'js') return text
+  const chars = Array.from(text)
+  const n = chars.length
+  const at = (k, s) => { for (let q = 0; q < s.length; q++) if (chars[k + q] !== s[q]) return false; return true }
+  const slice = (a, b) => chars.slice(a, b).join('')
+  // ASCII whitespace only, the same set in both twins (str.isspace and \s differ outside ASCII).
+  const isSpace = (ch) => ' \t\n\r\f\v'.includes(ch)
+  const out = []
+  let i = 0
+  while (i < n) {
+    const c = chars[i]
+    if ((lang === 'py' && c === '#') || (lang === 'js' && at(i, '//'))) {
+      let j = chars.indexOf('\n', i)
+      if (j === -1) j = n
+      out.push(blankText(slice(i, j)))
+      i = j
+      continue
+    }
+    if (lang === 'js' && at(i, '/*')) {
+      let j = -1
+      for (let k = i + 2; k < n - 1; k++) if (chars[k] === '*' && chars[k + 1] === '/') { j = k; break }
+      if (j === -1) { out.push(slice(i, n)); break }
+      out.push(blankText(slice(i, j + 2)))
+      i = j + 2
+      continue
+    }
+    if (c === "'" || c === '"' || (lang === 'js' && c === '`')) {
+      let prefix = ''
+      if (lang === 'py') {
+        let k = i
+        while (k > 0 && isAlpha(chars[k - 1]) && i - k < 2) k--
+        if (k < i && PY_STR_PREFIX.test(slice(k, i)) && (k === 0 || !isWordish(chars[k - 1]))) prefix = slice(k, i).toLowerCase()
+      }
+      const triple = lang === 'py' && at(i, c + c + c)
+      const quote = triple ? c + c + c : c
+      const interp = (lang === 'js' && c === '`') || prefix.includes('f')
+      const multiline = triple || (lang === 'js' && c === '`')
+      let j = i + quote.length
+      const parts = []
+      let buf = ''
+      let closed = false
+      while (j < n) {
+        const ch = chars[j]
+        if (ch === '\\' && j + 1 < n) { buf += ch + chars[j + 1]; j += 2; continue }
+        if (at(j, quote)) { closed = true; break }
+        if (ch === '\n' && !multiline) break
+        if (interp && ((lang === 'js' && at(j, '${')) || (lang === 'py' && ch === '{' && !at(j, '{{')))) {
+          const start = j + (lang === 'js' ? 2 : 1)
+          let depth = 1
+          let k = start
+          while (k < n && depth) {
+            if (chars[k] === '{') depth++
+            else if (chars[k] === '}') depth--
+            k++
+          }
+          if (depth) break
+          parts.push([false, buf])
+          buf = ''
+          parts.push([true, slice(j, k)])
+          j = k
+          continue
+        }
+        if (interp && lang === 'py' && at(j, '{{')) { buf += '{{'; j += 2; continue }
+        buf += ch
+        j++
+      }
+      if (!closed) {
+        // Raw up to where the scan stopped: its text is not read again as code (a `//` in it is no comment).
+        out.push(slice(i, j))
+        i = j
+        continue
+      }
+      parts.push([false, buf])
+      const prose = parts.some(([code, s]) => !code && Array.from(s).some(isSpace))
+      out.push(quote)
+      for (const [code, s] of parts) out.push(code || !prose ? s : blankText(s))
+      out.push(quote)
+      i = j + quote.length
+      continue
+    }
+    out.push(c)
+    i++
+  }
+  return out.join('')
+}
+// The masking language of an interpreter: python, a JS runtime, else none.
+const langOf = (prog) => (PYTHON.test(basename(prog)) ? 'py' : NODEISH.test(basename(prog)) ? 'js' : null)
+const codeStringSends = (code, lang = null) => {
+  const masked = maskProseLiterals(code, lang)
+  return CODE_SEND.test(masked) || CODE_SEND_MODULE.test(masked) || webMailSends(masked) ||
+    (CODE_EXECISH.test(masked) && CODE_SENDER_LIT.test(code))
+}
 
 // Unquoted newline / backtick / `$(` become segment separators; quoted text is
 // untouched (it is content). Tracks quote state by hand -- no shell involved.
@@ -146,13 +437,382 @@ export function segmentsTokens(cmd) {
 
 const basename = (t) => t.split('/').pop()
 
-function segmentIsSend(toksIn, depth) {
+// SENDWRAP924: a wrapper in front of the sender is stepped over WITH its own
+// flags -- see the full rationale at _WRAPPERS in outgoing-copy-gate.py (the
+// python twin). An unknown long flag without `=` is read both ways, so it errs
+// toward auditing. send-invocation-cases.json binds the two copies.
+const WRAPPERS = new Map([
+  ['time', ['fo', ['format', 'output'], 0]],
+  ['sudo', ['ughpCUrtDRT', ['user', 'group', 'host', 'prompt', 'close-from', 'other-user',
+    'role', 'type', 'chdir', 'chroot', 'command-timeout'], 0]],
+  // ENVOPTHEAD1104: env is read by envHeads (a structural parser); the entry keeps env a wrapper for the depth bound
+  ['env', ['uCSPaLU', ['unset', 'chdir', 'split-string', 'argv0'], 0]],
+  ['nohup', ['', [], 0]],
+  ['nice', ['n', ['adjustment'], 0]],
+  ['exec', ['a', [], 0]],
+  ['command', ['', [], 0]],
+  ['xargs', ['ILnPsdEa', ['arg-file', 'delimiter', 'eof', 'replace', 'max-lines', 'max-args',
+    'max-procs', 'max-chars', 'process-slot-var'], 0]],
+  ['timeout', ['sk', ['signal', 'kill-after'], 1]],
+  ['setsid', ['', [], 0]],
+  // ENVOPTHEAD1104 (Bence 69481): launchers whose value options were read as the program (see the python twin)
+  ['stdbuf', ['ioe', ['input', 'output', 'error'], 0]],
+  ['ionice', ['cnpPu', ['class', 'classdata', 'pid', 'pgid', 'uid'], 0]],
+  ['chrt', ['TPD', ['sched-runtime', 'sched-period', 'sched-deadline'], 1]],
+  ['caffeinate', ['tw', [], 0]],
+])
+// JSCDSEND1104 (Bence 69588, Samu 69591): the homebrew g-prefixed GNU launchers read as their pair (see the python twin)
+const G_PREFIXED = ['env', 'timeout', 'nohup', 'nice', 'stdbuf']
+for (const n of G_PREFIXED) WRAPPERS.set('g' + n, WRAPPERS.get(n))
+const HEAD_DEPTH = 8
+
+// MAILGATEUV1020: a project launcher's `run` subcommand in front of the sender --
+// see the full rationale at _LAUNCHERS in outgoing-copy-gate.py (the python twin).
+// name -> [subcommand, short flags taking a value, long flags taking a value,
+// module flags, flag lists measured as complete].
+const UV_RUN_LONG_VAL = ['extra', 'no-extra', 'group', 'no-group', 'only-group', 'env-file', 'with',
+  'with-editable', 'with-requirements', 'package', 'python-platform', 'index', 'default-index',
+  'index-url', 'extra-index-url', 'find-links', 'index-strategy', 'keyring-provider',
+  'upgrade-package', 'resolution', 'prerelease', 'fork-strategy', 'exclude-newer',
+  'exclude-newer-package', 'no-sources-package', 'reinstall-package', 'link-mode',
+  'config-setting', 'config-settings-package', 'no-build-isolation-package', 'no-build-package',
+  'no-binary-package', 'cache-dir', 'refresh-package', 'python', 'color', 'allow-insecure-host',
+  'directory', 'project', 'config-file']
+const LAUNCHERS = new Map([
+  ['uv', ['run', 'wifPCp', UV_RUN_LONG_VAL, ['-m', '--module'], true]],
+  ['pipx', ['run', '', ['index-url', 'pip-args', 'python', 'spec', 'with'], [], true]],
+  ...['poetry', 'pdm', 'hatch', 'pipenv', 'rye', 'conda', 'mamba', 'micromamba']
+    .map((n) => [n, ['run', '', [], [], false]]),
+])
+
+function launcherHeads(toks, spec, d) {
+  const [sub, shortVal, longVal, moduleFlags, complete] = spec
+  // The subcommand may follow the launcher's global options (`uv --directory d run`):
+  // every word before it is an option or the value right after one.
+  let j = -1
+  for (let x = 1; x < toks.length; x++) {
+    if (toks[x] === sub) { j = x; break }
+    if (!toks[x].startsWith('-') && !(x > 1 && toks[x - 1].startsWith('-'))) break
+  }
+  if (j < 0) return [toks]
+  const heads = []
+  if (!complete) {
+    // An unmeasured launcher's options are unknown, so every word in its option
+    // run that could be the program is judged as the program: the word after an
+    // option may be that option's value, or the command (Dani's #2086 review:
+    // `conda run --no-capture-output -n base python send.py` mixes a flag and a
+    // value option, which no single reading of all options fits).
+    for (let x = j + 1; x < toks.length; x++) {
+      if (toks[x] === '--') { heads.push(toks.slice(x + 1)); break }
+      if (toks[x].startsWith('-') && toks[x].length > 1) continue
+      heads.push(toks.slice(x))
+      if (!(x > j + 1 && toks[x - 1].startsWith('-') && toks[x - 1].length > 1)) break
+    }
+    if (!heads.length) heads.push([])
+    return heads.flatMap((h) => commandHeads(h, d + 1))
+  }
+  let i = j + 1
+  let head = null
+  while (i < toks.length) {
+    const t = toks[i]
+    if (t === '--') { i++; break }
+    if (moduleFlags.includes(t)) { head = ['python3', '-m', ...toks.slice(i + 1)]; break }
+    if (t.startsWith('--')) {
+      const eq = t.indexOf('=')
+      if (eq > 0 && moduleFlags.includes(t.slice(0, eq))) { head = ['python3', '-m', t.slice(eq + 1), ...toks.slice(i + 1)]; break }
+      i += eq < 0 && longVal.includes(t.slice(2)) ? 2 : 1
+      continue
+    }
+    if (t.startsWith('-') && t.length > 1) {
+      let k = -1
+      for (let x = 1; x < t.length; x++) if (shortVal.includes(t[x])) { k = x; break }
+      i += k === t.length - 1 ? 2 : 1
+      continue
+    }
+    break
+  }
+  heads.push(head ?? toks.slice(i))
+  return heads.flatMap((h) => commandHeads(h, d + 1))
+}
+
+// ENVOPTHEAD1104: `env -S STRING` splits STRING into words and runs them (the words after it appended), so the
+// real command is inside the value; see the python twin. A value that does not split counts as a send (null).
+function envSplitHeads(value, rest, d) {
+  let segs
+  try { segs = segmentsTokens(value) } catch { return [null] }
+  if (!segs || !segs.length) segs = [[]]
+  segs[segs.length - 1] = [...segs[segs.length - 1], ...rest]
+  // Bence 69552: GNU env parses the options at the START of the split words too; the first segment goes back
+  // through env's own option parser (see the python twin)
+  return segs.flatMap((s, k) => commandHeads(k === 0 ? ['env', ...s] : s, d + 1))
+}
+
+// Samu 69521: env's options read STRUCTURALLY (see the python twin): the known no-value ones are stepped over, a
+// known value option takes its value (exact or a unique long prefix), anything else is undecidable (null: a send).
+const ENV_SHORT_NOVALUE = 'i0v'
+const ENV_LONG_NOVALUE = ['ignore-environment', 'null', 'debug', 'list-signal-handling', 'help', 'version', 'block-signal',
+  'default-signal', 'ignore-signal']
+const ENV_SHORT_VALUE = 'uCSPaLU'
+const ENV_LONG_VALUE = ['unset', 'chdir', 'split-string', 'argv0']
+function envHeads(toks, d) {
+  let i = 1
+  while (i < toks.length) {
+    const t = toks[i]
+    if (ENV_ASSIGN.test(t)) { while (i < toks.length && ENV_ASSIGN.test(toks[i])) i++; break } // NAME=VALUE ends the options
+    if (t === '--') { i++; break }
+    if (t === '-') { i++; continue } // the old spelling of -i
+    if (t.startsWith('--')) {
+      const name = envLongName(t)
+      if (name === 'split-string') {
+        const eq = t.indexOf('=')
+        return eq >= 0 ? envSplitHeads(t.slice(eq + 1), toks.slice(i + 1), d) : envSplitHeads(toks[i + 1] ?? '', toks.slice(i + 2), d)
+      }
+      if (ENV_LONG_VALUE.includes(name)) { i += t.includes('=') ? 1 : 2; continue }
+      if (ENV_LONG_NOVALUE.includes(name)) { i++; continue }
+      return [null]
+    }
+    if (t.startsWith('-')) {
+      let step = 1
+      for (let x = 1; x < t.length; x++) {
+        const ch = t[x]
+        if (ENV_SHORT_NOVALUE.includes(ch)) continue
+        if (ENV_SHORT_VALUE.includes(ch)) {
+          const joined = x < t.length - 1
+          if (ch === 'S') return joined ? envSplitHeads(t.slice(x + 1), toks.slice(i + 1), d) : envSplitHeads(toks[i + 1] ?? '', toks.slice(i + 2), d)
+          step = joined ? 1 : 2
+          break
+        }
+        return [null]
+      }
+      i += step
+      continue
+    }
+    break
+  }
+  return commandHeads(toks.slice(i), d + 1)
+}
+
+function commandHeads(toksIn, d = 0) {
   let toks = toksIn
-  while (toks.length && ENV_ASSIGN.test(toks[0])) toks = toks.slice(1)
+  while (toks.length && (ENV_ASSIGN.test(toks[0]) || CMD_POSITION_KEYWORDS.has(toks[0]))) toks = toks.slice(1)
+  if (!toks.length) return [toks]
+  const w = basename(toks[0])
+  // Still a wrapper at the depth bound: counts as a send (null), see the python twin.
+  if (d >= HEAD_DEPTH) return (WRAPPERS.has(w) || LAUNCHERS.has(w) || w === 'function' || w === 'coproc') ? [null] : [toks]
+  if (w === 'function') return commandHeads(toks.slice(2), d + 1)
+  if (w === 'coproc') return [...commandHeads(toks.slice(1), d + 1), ...commandHeads(toks.slice(2), d + 1)]
+  if (w === 'env' || w === 'genv') return envHeads(toks, d)
+  const launcher = LAUNCHERS.get(w)
+  if (launcher) return launcherHeads(toks, launcher, d)
+  const spec = WRAPPERS.get(w)
+  if (!spec) return [toks]
+  const [shortVal, longVal, positionals] = spec
+  let i = 1
+  const starts = []
+  while (i < toks.length) {
+    const t = toks[i]
+    if (t === '--') { i++; break }
+    if (t.startsWith('--')) {
+      if (!t.includes('=') && longVal.includes(t.slice(2))) { i += 2; continue }
+      if (!t.includes('=')) starts.push(i + 2)
+      i++
+      continue
+    }
+    if (t.startsWith('-') && t.length > 1) {
+      if (w === 'command' && (t.includes('v') || t.includes('V'))) return []
+      let k = -1
+      for (let j = 1; j < t.length; j++) if (shortVal.includes(t[j])) { k = j; break }
+      i += k === t.length - 1 ? 2 : 1
+      continue
+    }
+    break
+  }
+  starts.unshift(i)
+  return starts.flatMap((s) => commandHeads(toks.slice(s + positionals), d + 1))
+}
+
+// SUBAGENTMAILGATE1016 (measured on the sub-agent gate, 2026-10-16): the
+// support-mail sender was recognised only as `python3 <path>/send.py --to ...`,
+// that is, with the script as the FIRST argument and the exact `--to` flag. Six
+// spellings ran the same sender past this gate: an interpreter option first
+// (`python3 -u`, `python3 -X utf8`), a version-suffixed interpreter, a glob or a
+// variable as the script path (`s?nd.py`, `$P`), and the program read from
+// stdin (`python3 - --to ... < send.py`). argparse also takes `--t` for `--to`.
+// The boundary, fail-closed where the command cannot be read statically:
+//   - the script operand is found past the interpreter's own options (a
+//     separate argument for -X / -W / --check-hash-based-pycs);
+//   - a recipient flag is `--to` or any argparse abbreviation of it (`--t`),
+//     with or without `=value` (the sender's --to is required, so every
+//     delivering call carries one of these);
+//   - send.py by basename + a recipient flag: a send (as before, now from any
+//     operand position, interpreter spelling and flag spelling);
+//   - a script operand that cannot be resolved statically (glob or brace
+//     characters, or a `$` expansion) + a recipient flag: a send, because what
+//     runs is undecidable here (until MAILGATEVARARGS1020 also "or another `$`
+//     token", see below);
+//   - a program read from stdin (`-`, or no script operand and a `<` redirect)
+//     + a recipient flag: a send (a heredoc-fed program is judged by its body,
+//     heredocProgramSends, as before).
+// Anything else stays allowed: `python3 -u other.py`, `python3 -c "print(1)"`,
+// `for f in *.py; do python3 $f; done`, `python3 x.py --to-date ...`,
+// `python3 "$DIR/gen.py" "$OUT"`.
+// Mirrors _python_head_sends in hooks/outgoing-copy-gate.py; the shared
+// send-invocation-cases.json binds the two.
+//
+// MAILGATEVARARGS1020 (measured on a production install, 2026-10-19): the
+// "or another `$` token" half denied ordinary scripted work. In one day 26
+// sub-agent Bash calls, across four agents, were denied as mail sends; none
+// of them was one (no recipient flag, no sender, no mail program). Each was a
+// script run from a variable path with a variable argument:
+// `python3 "$SP/gen.py" "$SP/out.json"`, `python3 "$L" /dev/null "$SP/o.txt"`,
+// `python3 $A/check.py $S/x.json && python3 $A/stamp.py --note-file "$A/n.json"`.
+// The agents lost turns on rewrites and workarounds. The extra `$` rule also
+// guarded nothing the rest of the gate guards: a literal sender path with a
+// variable argument (`python3 scripts/support-mail/send.py $ARGS`) has always
+// passed, because a recipient flag inside a variable is not visible statically
+// on ANY branch. So this branch now asks what the send.py and the stdin
+// branches ask: is there a recipient flag. A variable path WITH one
+// (`python3 $P --to ...`) is still a send; `python3 $SENDER $ARGS` passes,
+// pinned as a documented limit in send-invocation-cases.json.
+const PY_OPT_WITH_ARG = new Set(['-X', '-W', '--check-hash-based-pycs'])
+const RECIPIENT_FLAG = /^--to?(=|$)/
+const UNDECIDABLE_PATH = /[*?[{$]/
+
+// FLEETTOFLAG1025 v4 (Merlin 34827; the python twin: _FLEET_EXEMPT_BLOCK / _known_agents / _fleet_to_exempt): no tokenizer reading
+// of the recipient value any more. On an UNDECIDABLE program or script the recipient flag is a send, EXCEPT when every --to / --to=
+// value is a KNOWN agent name (the install's agents/ directories and its MAIN_AGENT_ID) AND the WHOLE command line has no `@`, no `~`
+// word other than a `~/` path and no --cc / --bcc. Every other shape is a send (fail-closed).
+const FLEET_EXEMPT_BLOCK = /@|(?:^|[\s='"(])~(?!\/)|--b?cc\b/
+const FLEET_TOKEN_BLOCK = /^(?:--(?:cc?|bc{0,2})(?:=|$)|~(?!\/))/ // on the DEQUOTED words: `--c""c`, `--\cc` are `--cc` to the program;
+// (v4.1, Merlin 34962) an argparse abbreviation (--c, --b, --bc) is --cc / --bcc to a default-argparse script: a send
+const AGENT_NAME = /^[a-z0-9][a-z0-9_-]*$/
+let knownAgentsOverride = null // the shared conformance list sets it (send-invocation-cases.json known_agents); null = the install
+let lineExemptOk = false // set per top-level isSendInvocation call from the WHOLE command line
+export function setKnownAgentsOverride(list) { knownAgentsOverride = list == null ? null : new Set(list) }
+const tok = (t) => t.replace(/^\n+|\n+$/g, '')
+const recipientFlag = (t) => RECIPIENT_FLAG.test(tok(t))
+// the agent names of THIS install: <root>/agents/* directories and MAIN_AGENT_ID in <root>/.env (root = one level above this
+// file). Any read error = an empty set, i.e. no exception (fail-closed).
+function knownAgents() {
+  if (knownAgentsOverride !== null) return knownAgentsOverride
+  const root = join(dirname(fileURLToPath(import.meta.url)), '..')
+  const names = new Set()
+  try {
+    const d = join(root, 'agents')
+    for (const e of readdirSync(d, { withFileTypes: true })) if (e.isDirectory() && AGENT_NAME.test(e.name)) names.add(e.name)
+  } catch { /* no agents/ directory: only the main agent can be known */ }
+  try {
+    const m = readFileSync(join(root, '.env'), 'utf-8').match(/^\s*MAIN_AGENT_ID\s*=\s*['"]?([^'"\s#]+)/m)
+    if (m && AGENT_NAME.test(m[1])) names.add(m[1])
+  } catch { /* no .env: the main agent is not known (fail-closed) */ }
+  return names
+}
+// FLEETTOFLAG1025 v4 (Codex 0dd77c650df7): no address marker in the line -- neither in the raw text nor in any DEQUOTED word of any
+// segment, the substitution-flattened form included. An unparseable line is not clean (fail-closed).
+function lineClean(cmd) {
+  if (FLEET_EXEMPT_BLOCK.test(cmd)) return false
+  let words
+  try {
+    words = [cmd, flattenSubstitutions(cmd)].flatMap((c) => segmentsTokens(c).flat())
+  } catch { return false }
+  return !words.some((w) => w.includes('@') || FLEET_TOKEN_BLOCK.test(tok(w)))
+}
+// true (not a letter) only if the whole line passed the address check and every --to / --t value -- the very next token, or the
+// part after `=` -- is a known agent name. A missing or empty value is not a name.
+function fleetToExempt(rest) {
+  if (!lineExemptOk) return false
+  const vals = []
+  for (let i = 0; i < rest.length; i++) {
+    const t = tok(rest[i])
+    if (t === '--to' || t === '--t') vals.push(i + 1 < rest.length ? tok(rest[i + 1]) : '')
+    else if (t.startsWith('--to=') || t.startsWith('--t=')) vals.push(t.slice(t.indexOf('=') + 1))
+  }
+  if (!vals.length) return false
+  const known = knownAgents()
+  return vals.every((v) => known.has(v))
+}
+// an undecidable program / script with a recipient flag is a send unless the fleet-agent exception holds
+const undecidableRecipientSends = (rest) => rest.some((t) => recipientFlag(t)) && !fleetToExempt(rest)
+function pythonScriptOperand(rest) {
+  let stdinRedirect = false
+  for (let i = 0; i < rest.length; i++) {
+    const t = rest[i]
+    if (t === '--') return { script: rest[i + 1] ?? null, stdin: false, stdinRedirect }
+    if (t === '-') return { script: null, stdin: true, stdinRedirect }
+    if (/^-[cm]/.test(t)) return { script: null, stdin: false, stdinRedirect } // code string / module: judged elsewhere
+    if (PY_OPT_WITH_ARG.has(t)) { i++; continue }
+    if (t.startsWith('<')) { stdinRedirect = true; if (t === '<') i++; continue }
+    if (/^\d*>/.test(t)) { if (/^\d*>>?$/.test(t)) i++; continue }
+    if (t.startsWith('-') && t.length > 1) continue
+    return { script: t, stdin: false, stdinRedirect }
+  }
+  return { script: null, stdin: false, stdinRedirect }
+}
+// A command or process substitution as a word of the command (`$(...)`, a
+// backtick pair, `<(...)`, `>(...)`), with the substitution replaced by one
+// placeholder word that carries a `$`. maskSubshellMarkers splits these into
+// their own segments, which is right for judging the INNER command, but it
+// leaves the outer one without the word: `python3 $(echo .../send.py) --to x`
+// became `python3` and `--to x`. Judged on this form as well, the word is an
+// undecidable script path (or interpreter) like a variable. Quoted text is left
+// alone: a quoted `"$(...)"` already reaches the tokenizer as a `$` word.
+export function flattenSubstitutions(cmd) {
+  let out = ''
+  let q = null
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i]
+    if (q) {
+      if (ch === '\\' && q === '"' && i + 1 < cmd.length) { out += ch + cmd[++i]; continue }
+      if (ch === q) q = null
+      out += ch
+      continue
+    }
+    if (ch === "'" || ch === '"') { q = ch; out += ch; continue }
+    if (ch === '\\' && i + 1 < cmd.length) { out += ch + cmd[++i]; continue }
+    const opens = (ch === '$' || ch === '<' || ch === '>') && cmd[i + 1] === '('
+    if (opens || ch === '`') {
+      let depth = 1
+      let j = i + (opens ? 2 : 1)
+      let iq = null
+      for (; j < cmd.length && depth > 0; j++) {
+        const c = cmd[j]
+        if (iq) { if (c === iq) iq = null; continue }
+        if (c === "'" || c === '"') { iq = c; continue }
+        if (ch === '`') { if (c === '`') depth = 0; continue }
+        if (c === '(') depth++
+        else if (c === ')') depth--
+      }
+      out += ' $__SUBST__ '
+      i = j - 1
+      continue
+    }
+    out += ch
+  }
+  return out
+}
+
+function pythonHeadSends(rest) {
+  const recipient = rest.some((t) => recipientFlag(t))
+  const { script, stdin, stdinRedirect } = pythonScriptOperand(rest)
+  if (script !== null && SENDPY.test(basename(script))) return recipient
+  if (script !== null && UNDECIDABLE_PATH.test(script)) return undecidableRecipientSends(rest) // MAILGATEVARARGS1020, FLEETTOFLAG1025 v4
+  if (stdin || (script === null && stdinRedirect)) return recipient
+  return false
+}
+
+function segmentIsSend(toksIn, depth) {
+  return commandHeads(toksIn).some((h) => headIsSend(h, depth))
+}
+
+function headIsSend(toks, depth) {
+  if (toks === null) return true // the depth bound was hit on a wrapper: audit it
   if (!toks.length) return false
   const prog = basename(toks[0])
   const rest = toks.slice(1)
   if (SENDER_PROG.test(prog)) return true
+  if (MAIL_PROG.test(prog) && mailProgSends(rest)) return true
+  // MAILGATEAPIB1027: curl speaks SMTP too (an smtp:// or smtps:// URL, --mail-rcpt, --mail-from)
+  if (CURLISH.test(prog) && rest.some((t) => CURL_SMTP.test(t))) return true
   if (WRAPPER_SHELL.test(prog) && depth < 3) {
     for (let i = 0; i < rest.length; i++) {
       if (rest[i] === '-c' && rest[i + 1] && isSendInvocation(rest[i + 1], depth + 1)) return true
@@ -161,19 +821,161 @@ function segmentIsSend(toksIn, depth) {
   if (PYTHON.test(prog) || NODEISH.test(prog)) {
     for (let i = 0; i < rest.length; i++) {
       if ((rest[i] === '-c' || rest[i] === '-e' || rest[i] === '--eval') &&
-          rest[i + 1] && codeStringSends(rest[i + 1])) return true
+          rest[i + 1] && codeStringSends(rest[i + 1], langOf(prog))) return true
     }
   }
   const candidates = [prog]
   if ((PYTHON.test(prog) || NODEISH.test(prog)) && rest.length) candidates.push(basename(rest[0]))
-  if (candidates.some((c) => SENDPY.test(c)) &&
-      rest.some((t) => t === '--to' || t.startsWith('--to='))) return true
+  // Issue #1853: `python3 -m send` (or -m pkg.send) is the same sender by module name.
+  if (PYTHON.test(prog)) {
+    for (let i = 0; i < rest.length - 1; i++) {
+      if (rest[i] === '-m' && rest[i + 1].split('.').pop() === 'send') candidates.push('send.py')
+    }
+  }
+  if (candidates.some((c) => SENDPY.test(c)) && rest.some((t) => recipientFlag(t))) return true
+  if (PYTHON.test(prog) && pythonHeadSends(rest)) return true
+  // An interpreter or program that cannot be resolved statically ($PY, a glob,
+  // a substitution) with a recipient flag: what runs is undecidable here.
+  // FLEETTOFLAG1025: the address rule -- but a send.py run by it (`$PY scripts/support-mail/send.py --to x`) keeps the bare flag rule
+  const scriptTok = pythonScriptOperand(rest).script // the script position (interpreter options, redirections skipped), not a data argument
+  if (UNDECIDABLE_PATH.test(toks[0]) && (undecidableRecipientSends(rest)
+      || (scriptTok != null && SENDPY.test(basename(scriptTok)) && rest.some((t) => recipientFlag(t))))) return true
   if (toks.some((t) => GRAPHMAIL.test(basename(t))) && rest.includes('send')) return true
-  if (CURLISH.test(prog) && rest.some((t) => RESEND_TARGET.test(t))) return true
+  // RESENDGETTWIN1010: only an actual send (POST/PUT/..., or a body) fires; a
+  // read-only GET/HEAD passes; an undecidable method stays fail-closed.
+  if (CURLISH.test(prog) && rest.some((t) => RESEND_TARGET.test(t))) {
+    return curlResendVerdict(prog, rest) !== 'read'
+  }
   return false
 }
 
+// True when some segment is still a wrapper at the depth bound (HEADDEPTH924),
+// so the deny says WHY -- see wrapper_depth_hit in outgoing-copy-gate.py.
+export function wrapperDepthHit(cmd) {
+  let segments
+  try {
+    segments = segmentsTokens(cmd)
+  } catch {
+    return false
+  }
+  // Only when the bound is the WHOLE reason: a visible send in another segment wins.
+  const heads = segments.flatMap((toks) => commandHeads(toks))
+  return heads.some((h) => h === null) && !heads.some((h) => h !== null && headIsSend(h, 0))
+}
+
+// JSCDSEND1104 (Samu 69516): a script run counts as a send when the script (found under the cwd or a cd / env -C
+// target) imports a mail library or names a mail API, and ALSO when it cannot be read: a missing script, an
+// undecidable path or cd. Then the way out of a false denial is a script that exists at run time, named so the gate
+// can find it.
+export function buildScriptSendMsg(botName, ownerName) {
+  return (
+    'TILTVA (governance hard-gate): a futtatott szkript levelet kuldhet, vagy a kapu nem tudja elolvasni. ' +
+    'Kuldesnek szamit, ha a szkript UTJA VALTOZOBOL JON, es a kapu nem tudja eldonteni, mi az erteke (ISSUE2582). ' +
+    'Cimzettet vivo futasnal (--to/--cc/--bcc vagy e-mail-cim a parancsban), es egy cd $(...) utan mindig, kuldesnek ' +
+    'szamit az is, ha a szkript a futas pillanataban NEM LETEZIK, vagy ha egy cd / env -C celkonyvtara nem dontheto el. ' +
+    'Ha a szkriptnek nincs koze levelhez: ellenorizd, hogy a fajl letezik, es literalis uttal (vagy literalis cd utan) ' +
+    'futtasd. Valtozoval is mehet, ha UGYANEBBEN a parancsban, blokkon kivul, egyszer, literalis ertekkel allitod be ' +
+    '(D=/abszolut/ut; python3 $D/x.py), es nem $(...), $HOME vagy egy elozo hivas adja az erteket. ' + buildGateMsg(botName, ownerName)
+  )
+}
+
+// EMAILGATESUBST1116: the wording for a send command built by process substitution, a here-string, a stdin heredoc or
+// xargs (unverifiableSendConstruction): the envelope cannot be verified in that form.
+export function buildUnverifiableConstructionMsg(botName, ownerName) {
+  return (
+    'TILTVA (governance hard-gate): ezt a kuldo parancsot folyamat-behelyettesites (<(...)), here-string (<<<), ' +
+    'stdin-heredoc vagy xargs epiti, igy a level boritekja (cimzett, torzs) ebben az alakban nem ellenorizheto. ' +
+    'Ha nem levelkuldes: futtasd a programot kozvetlenul, literalis argumentumokkal. ' + buildGateMsg(botName, ownerName)
+  )
+}
+
+export function buildWrapperDepthMsg() {
+  return (
+    'TILTVA (governance hard-gate): a parancs valodi fejet nem latom. ' +
+    `A parancs a burkolo-korlatnal (${HEAD_DEPTH} egymasba agyazott burkolo: sudo, time, env, nohup, nice, timeout...) ` +
+    'is meg burkolo, tehat nem tudom eldonteni, hogy levelkuldes-e, es a kapu ilyenkor fail-closed. ' +
+    `Ha ez NEM levelkuldes: csokkentsd a burkolok szamat ${HEAD_DEPTH} vagy kevesebb ala. ` +
+    'Ha levelkuldes: sub-agentkent Bash-bol amugy sem kuldhetsz, a kimeno emailt a fo-agens kuldi.'
+  )
+}
+
+// Issue #1853, the heredoc form: the segmenter drops heredoc BODIES, but when the
+// command that opens one is an interpreter (`python3 - <<'PY'`, `node <<EOF`) the body
+// IS the program. Mirrors _heredoc_program_sends in hooks/outgoing-copy-gate.py.
+// NARROWED (Geri's #1855 review): inside a heredoc body the exec + sender-literal half takes
+// the literal only as a lowercase, QUOTED command word (an argv item or an os.system command),
+// so a card id like SENDMAIL... in a report's prose no longer matches. Mirrors
+// _HEREDOC_SENDER_ARGV / _heredoc_body_sends in hooks/outgoing-copy-gate.py.
+// NOT COVERED, named: a program the classifier never reads -- `python3 /tmp/x.py`,
+// `python3 < /tmp/x.py`, `cat /tmp/x.py | python3 -`, `python3 -c "exec(open('/tmp/x.py').read())"`;
+// also a here-string fed to an interpreter (`python3 <<<'import send'`) and a CommonJS
+// destructuring rename of the Graph sender (`const { sendMail: s } = require(...)`).
+// A heredoc fed to a SHELL (`bash <<EOF`) is a shell program: its body is judged with
+// isSendInvocation itself, one level deeper (Geri/Samu, #1855).
+// WRITTEN, THEN RUN IN THE SAME COMMAND (#1855): `cat > P <<TAG` / `cat <<TAG > P`, then an
+// interpreter or a shell on the same path token P: the body is judged as if fed directly.
+// Exact token match; a file run by ANOTHER Bash call stays out of reach.
+// PIPED (#1855): `cat <<'EOF' | bash` or `| python3 -` hands the body over the pipe on the
+// heredoc's opening line; it is judged the same way.
+const HEREDOC_SENDER_ARGV = /['"](?:[^'"\s]*\/)?(?:sendmail|msmtp|swaks|send\.py)(?=['"\s])/
+const heredocBodySends = (body, lang = null) => {
+  const masked = maskProseLiterals(body, lang)
+  return CODE_SEND.test(masked) || CODE_SEND_MODULE.test(masked) || (CODE_EXECISH.test(masked) && HEREDOC_SENDER_ARGV.test(body))
+}
+const HEREDOC_SHELL = /(?:^|[\s;&|(])(?:\S*\/)?(?:bash|sh|zsh|dash)\b[^\n<]*$/i
+const HEREDOC_INTERP = /(?:^|[\s;&|(])(?:\S*\/)?(python3?(?:\.\d+)?|node|tsx|ts-node|deno|bun)\b[^\n<]*$/i
+const HEREDOC_PIPE = /\|\s*(?:\S*\/)?(python3?(?:\.\d+)?|node|tsx|ts-node|deno|bun|bash|sh|zsh|dash)\b/i
+const HEREDOC_REDIRECT = /(?:^|[\s;&|(])(?:cat|tee)\b[^\n]*?(?:>>?|\btee(?:\s+-a)?)\s*(['"]?)([^\s'"<>;&|]+)\1/
+function writtenThenRun(cmd, written, depth) {
+  if (!written.size) return false
+  let segments
+  try { segments = segmentsTokens(cmd) } catch { return false }
+  for (const toks of segments) {
+    for (const head of commandHeads(toks)) {
+      if (!head || !head.length) continue
+      const prog = basename(head[0])
+      let args = head.slice(1).filter((t) => !t.startsWith('-'))
+      if (prog.toLowerCase() === 'npx' && args.length) args = args.slice(1) // npx <runner> <file>
+      if (!args.length || !written.has(args[0])) continue
+      const body = written.get(args[0])
+      if ((PYTHON.test(prog) || NODEISH.test(prog)) && heredocBodySends(body, langOf(prog))) return true
+      if (WRAPPER_SHELL.test(prog) && depth < 3 && isSendInvocation(body, depth + 1)) return true
+    }
+  }
+  return false
+}
+function heredocProgramSends(cmd, depth = 0) {
+  const written = new Map()
+  for (const m of cmd.matchAll(HEREDOC_RE)) {
+    const opener = cmd.slice(cmd.lastIndexOf('\n', m.index - 1) + 1, m.index) + m[1]
+    const w = HEREDOC_REDIRECT.exec(opener)
+    if (w) written.set(w[2], cmd.slice(m.index + m[1].length + 1, m.index + m[0].length - m[2].length))
+    const piped = HEREDOC_PIPE.exec(m[1])
+    if (piped) {
+      const pbody = cmd.slice(m.index + m[1].length + 1, m.index + m[0].length - m[2].length)
+      if (WRAPPER_SHELL.test(piped[1])) {
+        if (depth < 3 && isSendInvocation(pbody, depth + 1)) return true
+      } else if (heredocBodySends(pbody, langOf(piped[1]))) return true
+    }
+    const lineStart = cmd.lastIndexOf('\n', m.index - 1) + 1
+    const head = cmd.slice(lineStart, m.index)
+    const bodyStart = m.index + m[1].length + 1
+    const body = cmd.slice(bodyStart, m.index + m[0].length - m[2].length)
+    const interp = HEREDOC_INTERP.exec(head)
+    if (interp) {
+      if (heredocBodySends(body, langOf(interp[1]))) return true
+    } else if (HEREDOC_SHELL.test(head) && depth < 3) {
+      if (isSendInvocation(body, depth + 1)) return true
+    }
+  }
+  return writtenThenRun(cmd, written, depth)
+}
+
 export function isSendInvocation(cmd, depth = 0) {
+  // FLEETTOFLAG1025 v4: the fleet-agent exception is decided on the WHOLE line; a wrapper body (depth > 0) can only tighten it.
+  // A module-level flag is enough: the hook is one process per tool call, and the evaluation is single-threaded.
+  lineExemptOk = (depth === 0 || lineExemptOk) && lineClean(cmd)
+  if (heredocProgramSends(cmd, depth)) return true
   let segments
   try {
     segments = segmentsTokens(cmd)
@@ -182,32 +984,1813 @@ export function isSendInvocation(cmd, depth = 0) {
     // this path the gate is exactly as strict as before -- never weaker.
     return SEND_PATTERNS.some((re) => re.test(cmd))
   }
-  return segments.some((toks) => segmentIsSend(toks, depth))
+  if (segments.some((toks) => segmentIsSend(toks, depth))) return true
+  // The same command with every substitution as one undecidable word (see
+  // flattenSubstitutions): the outer command keeps the word it would run.
+  const flat = flattenSubstitutions(cmd)
+  if (flat === cmd) return false
+  try {
+    return segmentsTokens(flat).some((toks) => segmentIsSend(toks, depth))
+  } catch {
+    return SEND_PATTERNS.some((re) => re.test(cmd))
+  }
+}
+
+// EMAILGATESUBST1116: a send command built by process substitution, a here-string, a stdin heredoc or xargs is
+// refused as unverifiable. Twin of unverifiable_send_construction in hooks/outgoing-copy-gate.py, where the boundary
+// is written out; unverifiable-construction-cases.json binds the two. gateDecision calls it before the send checks.
+const UNVERIFIABLE_HINT = /<<|<\(|=\(|xargs/
+const UV_HEREDOC = /(<<-?\s*(['"]?)(\w+)\2[^\n]*)\n(?:[\s\S]*?\n)?\3(?=\s|$)/g
+const UV_PIPE_OUT = '__GATEPIPEOUT__'
+const UV_PIPE_IN = '__GATEPIPEIN__'
+const UV_COPIERS = ['cat', 'tee'] // a program whose standard output is its standard input
+const UV_MARK = /^__GATE(HEREDOC|PROCSUBST)(\d+)__$/
+const UV_STDIN_PATHS = ['/dev/stdin', '/dev/fd/0', '/proc/self/fd/0']
+const UV_FD_PATH = /^\/(?:dev\/fd|proc\/self\/fd)\/\d+$/
+const UV_WHOLE_EXPANSION = /^\s*(?:\$(?:\w+|\{[^}]*\}|\([\s\S]*\)|[@*#?$!-])|`[\s\S]*`)\s*$/
+const UV_PROBE_ADDR = 'x@unverifiable.invalid'
+const UV_RCPT_FLAG = /^--(?:to?|cc?|bcc?|b|mail-rcpt)$/ // with argparse prefixes; curl's recipient
+const UV_RCPT_GLUED = /^--(?:to?|cc?|bcc?|b|mail-rcpt)=/
+const UV_POSITIONAL = /\$(?:[0-9@*]|\{[0-9@*]\})/g
+const XARGS_SHORT_VAL = 'adEIJLnPRsS'
+const XARGS_SHORT_OPT = 'eil'
+const XARGS_SHORT_FLAG = '0oprtx'
+const XARGS_LONG_VAL = ['arg-file', 'delimiter', 'max-args', 'max-procs', 'max-chars', 'process-slot-var']
+const XARGS_LONG_FLAG = ['null', 'no-run-if-empty', 'interactive', 'verbose', 'exit', 'open-tty', 'show-limits', 'help',
+  'version', 'eof', 'max-lines', 'replace']
+const uvTokens = (cmd) => segmentsTokens(stripShellComments(cmd))
+
+function uvMark(cmdIn, texts) {
+  const cmd = cmdIn.replace(UV_HEREDOC, (g0, g1, _q, tag, offset, whole) => {
+    texts.push(['heredoc', g0.slice(g1.length + 1, g0.length - tag.length)])
+    const head = /<<-?\s*(['"]?)\w+\1/.exec(g1)
+    const sep = /(?:^|[\s;&|(])\d+$/.test(whole.slice(0, offset)) ? '' : ' ' // `0<<TAG` keeps its fd
+    return `${sep}<< __GATEHEREDOC${texts.length - 1}__` + g1.slice(head.index + head[0].length)
+  })
+  let out = ''
+  let q = null
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i]
+    if (q) {
+      if (ch === '\\' && q === '"' && i + 1 < cmd.length) { out += ch + cmd[++i]; continue }
+      if (ch === q) q = null
+      out += ch
+      continue
+    }
+    if (ch === "'" || ch === '"') { q = ch; out += ch; continue }
+    if (ch === '\\' && i + 1 < cmd.length) { out += ch + cmd[++i]; continue }
+    if (ch === '#' && (i === 0 || ' \t\n;&|('.includes(cmd[i - 1]))) {
+      while (i < cmd.length && cmd[i] !== '\n') out += cmd[i++] // a comment: an apostrophe in it opens no quote
+      i--
+      continue
+    }
+    if (ch === '|' && !(i > 0 && cmd[i - 1] === '>')) {
+      if (cmd[i + 1] === '|') { out += '||'; i++; continue }
+      // a pipe: the segment before it ends in UV_PIPE_OUT, the one after it starts with UV_PIPE_IN
+      out += ` ${UV_PIPE_OUT} | ${UV_PIPE_IN} `
+      if (cmd[i + 1] === '&') i++
+      continue
+    }
+    if (cmd[i + 1] === '(' && (ch === '<' || (ch === '=' && (i === 0 || ' \t\n;&|(<'.includes(cmd[i - 1]))))) {
+      let depth = 1
+      let j = i + 2
+      let iq = null
+      while (j < cmd.length && depth > 0) {
+        const c = cmd[j++]
+        if (iq) { if (c === iq) iq = null; continue }
+        if (c === "'" || c === '"') iq = c
+        else if (c === '(') depth++
+        else if (c === ')') depth--
+      }
+      texts.push(['procsubst', depth === 0 ? cmd.slice(i + 2, j - 1) : null])
+      out += ` __GATEPROCSUBST${texts.length - 1}__ `
+      i = j - 1
+      continue
+    }
+    out += ch
+  }
+  return out
+}
+
+function uvProducedText(inner) {
+  if (inner == null) return null
+  let segs
+  try { segs = uvTokens(inner) } catch { return null }
+  if (segs.length !== 1 || !segs[0].length) return null
+  const prog = basename(segs[0][0])
+  let words = segs[0].slice(1)
+  if (prog === 'echo') {
+    while (words.length && /^-[neE]+$/.test(words[0])) words = words.slice(1)
+    const text = words.join(' ')
+    return text.includes('\\') ? null : text
+  }
+  if (prog === 'printf' && words.length === 1 && !words[0].includes('%')) {
+    const text = words[0].replaceAll('\\n', '\n').replaceAll('\\t', '\t')
+    return text.includes('\\') ? null : text
+  }
+  return null
+}
+
+function uvText(word, texts) {
+  const m = UV_MARK.exec(word ?? '')
+  if (!m) return { marked: false, text: null }
+  const [kind, text] = texts[Number(m[2])]
+  return { marked: true, text: kind === 'procsubst' ? uvProducedText(text) : text }
+}
+
+function uvStdinAndArgs(rest, texts, pipeFeed = null) {
+  let feed = pipeFeed // what a pipe brings in; a redirection overrides it
+  const args = []
+  for (let i = 0; i < rest.length;) {
+    const t = rest[i]
+    const nxt = rest[i + 1] ?? ''
+    const m = /^(\d*)(<<<)([\s\S]*)$/.exec(t) || /^(\d*)(<<-?)([\s\S]*)$/.exec(t) || /^(\d*)(<)([\s\S]*)$/.exec(t)
+    if (m) {
+      const target = m[3] || nxt
+      if (m[1] === '' || m[1] === '0') {
+        if (m[2] === '<<<') feed = { text: target }
+        else {
+          const r = uvText(target, texts)
+          feed = (r.marked || m[2] !== '<') ? { text: r.text } : { file: true }
+        }
+      }
+      i += m[3] ? 1 : 2
+      continue
+    }
+    const o = /^(\d*|&)>>?\|?([\s\S]*)$/.exec(t)
+    if (o) { i += o[2] ? 1 : 2; continue }
+    args.push(t)
+    i++
+  }
+  return { feed, args }
+}
+
+function uvProgramSource(kind, prog, args) {
+  if (kind === 'sh') {
+    let i = 0
+    let forced = false
+    while (i < args.length) {
+      const t = args[i]
+      if (t === '--' || t === '-') { i++; break }
+      if (t === '--rcfile' || t === '--init-file') { i += 2; continue }
+      if (t.startsWith('--')) { i++; continue }
+      if ((t[0] === '-' || t[0] === '+') && t.length > 1) {
+        if (t[0] === '-' && t.slice(1).includes('c')) return { src: 'string', word: args[i + 1] ?? '' }
+        forced = forced || (t[0] === '-' && t.slice(1).includes('s'))
+        i += /[oO]/.test(t.slice(1)) ? 2 : 1
+        continue
+      }
+      break
+    }
+    return forced || i >= args.length ? { src: 'stdin' } : { src: 'file', word: args[i] }
+  }
+  if (kind === 'src') {
+    const words = args.filter((t) => t !== '--')
+    return words.length ? { src: 'file', word: words[0] } : { src: null }
+  }
+  if (kind === 'py') {
+    const { script, stdin } = pythonScriptOperand(args)
+    if (script != null) return { src: 'file', word: script }
+    if (stdin || !args.some((t) => /^-[cm]/.test(t))) return { src: 'stdin' }
+    return { src: null }
+  }
+  if (args.some((t) => ['-e', '-p', '--eval', '--print'].includes(t) || t.startsWith('--eval=') || t.startsWith('--print='))) {
+    return { src: null }
+  }
+  const script = nodeScriptOperand(prog, args)
+  return script != null ? { src: 'file', word: script } : { src: 'stdin' }
+}
+
+function uvProgramTextSends(kind, text, cwd, depth, texts) {
+  if (text == null || UV_WHOLE_EXPANSION.test(text)) return true // cannot be told: counts as a send
+  if (kind === 'sh' || kind === 'src') {
+    return isSendInvocation(text) || scriptRunSends(text, cwd) || (depth < SHELL_C_DEPTH && uvSends(text, cwd, depth + 1, texts))
+  }
+  return heredocBodySends(text, kind)
+}
+
+// Dani's #2842 review B1: see _uv_copier_output in hooks/outgoing-copy-gate.py.
+function uvCopierOutput(head, texts) {
+  const prog = basename(head[0])
+  if (!UV_COPIERS.includes(prog)) return null
+  const { feed, args } = uvStdinAndArgs(head.slice(1), texts)
+  if (!feed || feed.file) return null
+  if (prog === 'cat' && args.some((a) => !a.startsWith('-'))) return null // a file operand: the output is not only the stdin
+  return feed
+}
+
+function uvHead(head, cwd, depth, texts, pipeFeed = null) {
+  let prog = basename(head[0])
+  let rest = head.slice(1)
+  while (prog === 'builtin' && rest.length) { prog = basename(rest[0]); rest = rest.slice(1) }
+  if (prog === 'eval') return depth < SHELL_C_DEPTH && rest.length > 0 && uvSends(rest.join(' '), cwd, depth + 1, texts)
+  const kind = WRAPPER_SHELL.test(prog) ? 'sh' : (prog === 'source' || prog === '.') ? 'src'
+    : PYTHON.test(prog) ? 'py' : (NODEISH.test(prog) && prog.toLowerCase() !== 'npx') ? 'js' : null
+  if (!kind) return false
+  const { feed, args } = uvStdinAndArgs(rest, texts, pipeFeed)
+  let { src, word } = uvProgramSource(kind, prog, args)
+  if (src === 'file') {
+    const r = uvText(word, texts)
+    if (r.marked) return uvProgramTextSends(kind, r.text, cwd, depth, texts)
+    if (UV_FD_PATH.test(word) && !UV_STDIN_PATHS.includes(word)) return true // another descriptor: its feed is not read here
+    if (!UV_STDIN_PATHS.includes(word)) return false
+    src = 'stdin'
+  }
+  if (src === 'string') return kind === 'sh' && depth < SHELL_C_DEPTH && uvSends(word, cwd, depth + 1, texts)
+  if (src !== 'stdin' || !feed || feed.file) return false
+  return uvProgramTextSends(kind, feed.text, cwd, depth, texts)
+}
+
+const uvShellWord = (w) => (/^[A-Za-z0-9_@%+=:,./$-]+$/.test(w) ? w : "'" + w.replaceAll("'", "'\\''") + "'")
+
+// memoized on (index, replace string): a run of unknown options costs linear time (Dani's #2842 review R1)
+function uvXargsTemplates(words, replIn = null, jIn = 0, memo = new Map()) {
+  const key = `${jIn}\u0000${replIn}`
+  if (memo.has(key)) return memo.get(key)
+  const out = []
+  let repl = replIn
+  let j = jIn
+  while (j < words.length) {
+    const t = words[j]
+    if (t === '--') { j++; break }
+    if (t.startsWith('--')) {
+      const eq = t.indexOf('=')
+      const name = eq < 0 ? t.slice(2) : t.slice(2, eq)
+      if (name === 'replace') repl = eq < 0 ? '{}' : t.slice(eq + 1)
+      if (eq < 0 && XARGS_LONG_VAL.includes(name)) { j += 2; continue }
+      if (eq < 0 && !XARGS_LONG_FLAG.includes(name)) out.push(...uvXargsTemplates(words, repl, j + 2, memo))
+      j++
+      continue
+    }
+    if (t.startsWith('-') && t.length > 1) {
+      let step = 1
+      for (let k = 1; k < t.length; k++) {
+        const c = t[k]
+        if (XARGS_SHORT_VAL.includes(c) || XARGS_SHORT_OPT.includes(c)) {
+          let val = t.slice(k + 1)
+          if (!val && XARGS_SHORT_VAL.includes(c)) { val = words[j + 1] ?? ''; step = 2 }
+          if (c === 'I' || c === 'J' || c === 'i') repl = val || '{}'
+          break
+        }
+        if (!XARGS_SHORT_FLAG.includes(c)) { out.push(...uvXargsTemplates(words, repl, j + 2, memo)); break }
+      }
+      j += step
+      continue
+    }
+    break
+  }
+  const seen = new Map()
+  for (const [t, r] of [...out, [words.slice(j), repl]]) seen.set(JSON.stringify([t, r]), [t, r])
+  memo.set(key, [...seen.values()])
+  return memo.get(key)
+}
+
+function uvXargsSends(words, cwd, texts) {
+  for (const [raw, repl] of uvXargsTemplates(words)) {
+    const template = uvStdinAndArgs(raw, texts).args // a redirection there is xargs' own
+    if (!template.length) continue
+    if (isSendInvocation(template.map(uvShellWord).join(' '))) return true // the template program is itself a send
+    let hit
+    let filled
+    if (repl) {
+      hit = template.some((w, i) => (w.includes(repl) && i > 0 && UV_RCPT_FLAG.test(template[i - 1])) || (UV_RCPT_GLUED.test(w) && w.includes(repl)))
+      filled = template.map((w) => w.replaceAll(repl, UV_PROBE_ADDR))
+    } else {
+      hit = UV_RCPT_FLAG.test(template[template.length - 1])
+      filled = [...template, UV_PROBE_ADDR]
+    }
+    if (hit) {
+      const line = filled.map(uvShellWord).join(' ')
+      if (isSendInvocation(line) || scriptRunSends(line, cwd)) return true
+    }
+    for (const h of commandHeads(template)) {
+      if (!h || !h.length || !WRAPPER_SHELL.test(basename(h[0]))) continue
+      let k = -1
+      for (let x = 1; x < h.length; x++) if (SHELL_C_FLAG.test(h[x])) { k = x; break }
+      if (k < 0) continue
+      if (k === h.length - 1) {
+        if (!repl) return true // the -c program itself comes from the input: cannot be told
+        continue
+      }
+      let text = h[k + 1]
+      if (repl && text.trim() === repl) return true // the -c program is the input line: cannot be told
+      if (repl) text = text.replaceAll(repl, UV_PROBE_ADDR)
+      text = text.replace(UV_POSITIONAL, UV_PROBE_ADDR)
+      if (isSendInvocation(text) || scriptRunSends(text, cwd)) return true
+    }
+  }
+  return false
+}
+
+function uvSends(cmd, cwd, depth, texts) {
+  let segments
+  try { segments = uvTokens(uvMark(cmd, texts)) } catch { return false } // unparseable: isSendInvocation's legacy fallback judges it
+  let pipeFeed = null // what the previous segment writes into the pipe, when it is a copier
+  for (let toks of segments) {
+    const feedIn = toks[0] === UV_PIPE_IN ? pipeFeed : null
+    pipeFeed = null
+    const pipesOut = toks[toks.length - 1] === UV_PIPE_OUT
+    toks = toks.filter((t) => t !== UV_PIPE_IN && t !== UV_PIPE_OUT)
+    if (!toks.length) continue // e.g. `( ... ) |`: a subshell is no copier here
+    if (toks[toks.length - 1] === '<' || toks[toks.length - 1] === '=') {
+      // a `<(` / `=(` the scanner did not mark (a quote opened in a comment before it): its text is unknown
+      texts.push(['procsubst', null])
+      toks = [...toks.slice(0, -1), `__GATEPROCSUBST${texts.length - 1}__`]
+    }
+    for (let i = 0; i < toks.length; i++) {
+      if ((basename(toks[i]) === 'xargs' || basename(toks[i]) === 'gxargs') && uvXargsSends(toks.slice(i + 1), cwd, texts)) return true
+    }
+    const heads = commandHeads(toks).filter((h) => h && h.length)
+    if (heads.some((h) => uvHead(h, cwd, depth, texts, feedIn))) return true
+    if (pipesOut) pipeFeed = heads.map((h) => uvCopierOutput(h, texts)).find((f) => f) ?? null
+  }
+  return false
+}
+
+export function unverifiableSendConstruction(cmd, cwd = process.cwd(), depth = 0) {
+  if (typeof cmd !== 'string' || !UNVERIFIABLE_HINT.test(cmd)) return false
+  return uvSends(cmd, cwd, depth, [])
+}
+
+// SCRIPTSENDGATE1020: a sender script under any name. isSendInvocation knows a
+// Python sender only by the file name send.py, so `python3 helden_send.py --to
+// x@y.hu < body.txt` -- a self-written SMTP script, the usual way a mail goes
+// out on this fleet -- was no send for this gate (measured 2026-10-20). Cheap,
+// local signals close it for the sub-agents. A run is a send when:
+//   1. an interpreter (python, node, tsx, bun, deno) or a directly executed
+//      script is given an e-mail address after --to / --cc / --bcc. This holds
+//      with no script file too (`python3 -m pkg`, `python3 -c ...`);
+//   2. the script file IMPORTS a mail library: an import statement of the
+//      python SMTP modules (smtplib, aiosmtplib, yagmail), or a require /
+//      import of nodemailer for a node script. A bare mention (a comment, a
+//      mock, a regex like this file's own) is no import and passes;
+//   3. one level of local helper modules imported by the script, resolved
+//      next to it, imports one (`from mailhelper import send_mail`);
+//   4. a shell `-c` string (sh, bash, zsh, dash) runs one of the above.
+// A directly executed file (`./x`, `/abs/x`, `x.py`) is read as python or node
+// by its #! line, else by its extension; an extensionless file without a
+// python/node #! line is not judged.
+// Deliberately NOT part of isSendInvocation: that function is the shared
+// contract with the main agent's python gates (send-invocation-cases.json),
+// and on the main agent the owner's single approval in the chat is the rule
+// (owner decision, 2026-10-20). This narrowing is for the sub-agent hard gate
+// only, where every recognised Bash send is denied anyway.
+// Not seen, on purpose (docs/security-hardening.md lists them): mail sent
+// without one of these libraries (Gmail API client, an HTTP mail API, raw
+// socket SMTP, perl/ruby), a script read from stdin or named through a
+// variable, a script reached after `cd dir &&` (resolved against the session
+// cwd), helpers past the first level, an import after the first 1 MiB, and
+// code assembled at runtime.
+const PY_MAIL_MODULE = String.raw`(?:(?:aio)?smtplib|yagmail)`
+const PY_MAIL_IMPORT = new RegExp(
+  String.raw`^[ \t]*(?:import[ \t]+[^\n#]*\b${PY_MAIL_MODULE}\b|from[ \t]+${PY_MAIL_MODULE}\b[^\n]*\bimport\b)` +
+  String.raw`|\bimport_module\(\s*['"]${PY_MAIL_MODULE}['"]`,
+  'm',
+)
+const NODE_MAIL_MODULE = String.raw`['"]nodemailer['"]`
+const NODE_MAIL_IMPORT = new RegExp(
+  String.raw`\brequire\s*\(\s*${NODE_MAIL_MODULE}\s*\)|^[ \t]*import\b[^\n]*${NODE_MAIL_MODULE}|\bimport\s*\(\s*${NODE_MAIL_MODULE}\s*\)`,
+  'm',
+)
+// MAILGATESCRIPT1027 R2: groups: 1 = X and 2 = NAMES of `from X import NAMES`, 3 = NAMES of `import NAMES`
+const PY_LOCAL_IMPORT = /^[ \t]*(?:from[ \t]+([\w.]+)[ \t]+import\b(?:[ \t]*\(?[ \t]*([\w., \t]+))?|import[ \t]+([\w., \t]+))/gm
+// MAILGATESCRIPT1027 R1: `export ... from './x'` (an ESM re-export) loads the helper too
+// MAILGATESCRIPT1027 R2: a type-only import or export loads nothing
+const NODE_LOCAL_IMPORT = /(?:^[ \t]*export(?![ \t]+type[ \t]*(?:\{|\*|[A-Za-z_$][\w$]*[ \t]+from\b))\b[^\n]*?\bfrom\s*|\brequire\s*\(\s*|^[ \t]*import(?![ \t]+type[ \t]*(?:\{|\*|[A-Za-z_$][\w$]*[ \t]+from\b))\b[^\n]*?\bfrom\s*|^[ \t]*import\s*|\bimport\s*\(\s*)['"](\.{1,2}\/[^'"\n]+)['"]/gm
+const NODE_EXTS = ['', '.js', '.mjs', '.cjs', '.ts', '/index.js', '/index.mjs', '/index.ts']
+const HELPER_LIMIT = 40
+const ADDRESS_FLAG = /^--(?:to|cc|bcc)(?:=(.*))?$/
+const SCRIPT_FILE = /\.(?:py|mjs|cjs|js|ts)$/i
+const SHELL_C_FLAG = /^-[a-zA-Z]*c[a-zA-Z]*$/
+const SCRIPT_READ_LIMIT = 1024 * 1024
+const SHEBANG_READ_LIMIT = 512
+const SHELL_C_DEPTH = 3
+
+function readScriptHead(path, limit = SCRIPT_READ_LIMIT) {
+  let fd = null
+  try {
+    fd = openSync(path, 'r')
+    const buf = Buffer.alloc(limit)
+    const n = readSync(fd, buf, 0, limit, 0)
+    return buf.subarray(0, n).toString('utf-8')
+  } catch {
+    return null
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd) } catch { /* already closed */ }
+    }
+  }
+}
+
+// JSCDSEND1104 (Bence 69475, Samu 69478): the python twin's cd handling (outgoing-copy-gate.py _cd_bases,
+// MAILGATESCRIPT1027 R1/R2), ported. This twin resolved a relative script under the cwd only, so
+// `cd <dir> && python3 send.py` read the cwd's file and a sender in <dir> was no send. The directories a relative
+// script may be under: the cwd, and every literal `cd DIR` target of the command (cumulative over chained cds, and
+// DIR alone under the cwd). undecidable: some `cd` names a directory that cannot be known here.
+const CD_OPTIONS = new Set(['-P', '-L', '-e', '-@'])
+
+function cdBases(cwd, cmdWords) {
+  const cwdAbs = typeof cwd === 'string' && isAbsolute(cwd)
+  let cur = cwdAbs ? cwd : null
+  const bases = cwdAbs ? [cwd] : []
+  let undecidable = false
+  let i = 0
+  while (i < cmdWords.length) {
+    const word = cmdWords[i]
+    if (word !== 'cd' && word !== 'pushd') { i++; continue }
+    i++
+    // Samu 69538: pushd DIR changes the directory like cd (its -n is stepped over: a DIR read as a target only adds a
+    // candidate); pushd +N / -N rotates the stack, which cannot be known here
+    while (i < cmdWords.length && (CD_OPTIONS.has(cmdWords[i]) || (word === 'pushd' && cmdWords[i] === '-n'))) i++
+    if (i < cmdWords.length && cmdWords[i] === '--') i++ // `--` ends the options: the next word is DIR
+    const d = i < cmdWords.length ? cmdWords[i] : null
+    const tilde = d !== null && (d === '~' || d.startsWith('~/'))
+    if (!d || d === '-' || (d.startsWith('~') && !tilde) || UNDECIDABLE_PATH.test(d)
+      || (word === 'pushd' && /^[+-]\d+$/.test(d))) { undecidable = true; cur = null; continue }
+    let next
+    if (tilde) next = join(homedir(), d.slice(1))
+    else if (isAbsolute(d)) next = d
+    else if (cur !== null) next = join(cur, d)
+    else {
+      // after an undecidable cd: where DIR is cannot be known, but DIR under the cwd is still one candidate (Samu 69648)
+      if (cwdAbs) bases.push(join(cwd, d))
+      undecidable = true; cur = null; continue
+    }
+    bases.push(next)
+    if (!tilde && !isAbsolute(d) && cwdAbs) bases.push(join(cwd, d))
+    cur = next
+  }
+  return { bases: [...new Set(bases.map((b) => resolve(b)))], undecidable }
+}
+
+// A relative script-shaped operand and a cd that cannot be resolved: what runs cannot be known (a send).
+function relativeUnderUndecidableCd(script, cwd, cmdWords) {
+  if (!script || isAbsolute(script) || script === '~' || script.startsWith('~/')) return false
+  if (!(SCRIPT_FILE.test(script) || script.includes('/'))) return false
+  return cdBases(cwd, cmdWords).undecidable
+}
+
+// Every absolute path the script operand can name: itself when absolute, `~` expanded, a relative one under the
+// cwd and under every literal `cd DIR` target of the command. May be empty.
+function resolveScriptPaths(script, cwd, cmdWords) {
+  if (!script || UNDECIDABLE_PATH.test(script)) return []
+  let p = script
+  if (p === '~' || p.startsWith('~/')) p = join(homedir(), p.slice(1))
+  if (isAbsolute(p)) return [p]
+  return [...new Set(cdBases(cwd, cmdWords).bases.map((b) => resolve(b, p)))]
+}
+
+// node/tsx/bun/deno: the first non-option word is the script; -e/--eval code
+// strings are isSendInvocation's to judge.
+// MAILGATESCRIPT1027: `bun run x` / `deno run x` skip the run word; `npx tsx x` / `npx ts-node x`
+// / `npx node x` name the script after the runner, any other npx package is no script.
+function nodeScriptOperand(prog, rest) {
+  const words = []
+  for (const t of rest) {
+    if (t === '--') continue
+    if (t.startsWith('-')) return null
+    words.push(t)
+    if (words.length === 2) break
+  }
+  if (prog === 'npx') return /^(?:tsx|ts-node|node)$/.test(words[0] ?? '') ? (words[1] ?? null) : null
+  if ((prog === 'bun' || prog === 'deno') && words[0] === 'run') return words[1] ?? null
+  return words[0] ?? null
+}
+
+// COPYSUBST1116 (Marveen 4114): a recipient value the gate cannot read as text (a substitution, also the flattened
+// $__SUBST__ word, a variable, an ANSI-C $'..' string, a backtick) may be any address; see the python twin
+const nonliteralValue = (val) => val.includes('$') || val.includes('`')
+// argparse takes any unambiguous prefix of a long option, so `--bc x@y` is --bcc to the program
+const ADDRESS_FLAG_ABBREV = /^--(to?|cc?|b(?:cc?)?)(?:=([\s\S]*))?$/
+const FLAT_SUBST_WORD = '$__SUBST__'
+function addressFlagGiven(rest) {
+  for (let i = 0; i < rest.length; i++) {
+    const m = ADDRESS_FLAG_ABBREV.exec(rest[i])
+    if (!m) continue
+    const nxt = rest[i + 1] ?? ''
+    let val = m[2] ?? nxt
+    if (m[2] === '' && nxt === FLAT_SUBST_WORD) val = nxt // `--to=$(..)` flattened: the word is set apart by a space
+    // the one-letter prefixes count an address only: `--c "$CFG"` is too often no recipient
+    if (val.includes('@') || (m[1].length > 1 && nonliteralValue(val))) return true
+  }
+  return false
+}
+
+// ENVOPTHEAD1104: the program an `env` #! line runs; -u, -C and -P take a value, NAME=VALUE is skipped.
+// Bence 69552: a #! line's env words go through the same env option parser as a command line's (see the python twin)
+function shebangEnvProgram(words) {
+  const progs = commandHeads(['env', ...words.filter(Boolean)]).filter((h) => h && h.length).map((h) => basename(h[0]))
+  return progs.find((p) => PYTHON.test(p) || (NODEISH.test(p) && p !== 'npx')) ?? progs[0] ?? ''
+}
+
+// 'py' | 'node' | null from a #! line (`#!/usr/bin/python3`, `#!/usr/bin/env -S node`).
+function shebangKind(text) {
+  const m = /^#!\s*(\S+)([^\n]*)/.exec(text ?? '')
+  if (!m) return null
+  let prog = basename(m[1])
+  if (prog === 'env' || prog === 'genv') prog = basename(shebangEnvProgram(m[2].trim().split(/\s+/)))
+  if (PYTHON.test(prog)) return 'py'
+  if (NODEISH.test(prog) && prog !== 'npx') return 'node'
+  return null
+}
+
+// One level of local helpers: modules the script imports, resolved next to it.
+function localHelperPaths(path, text, kind) {
+  // MAILGATESCRIPT1027 R1: next to the script and, for a symlinked entry, next to its real path
+  const dirs = [dirname(path)]
+  try {
+    const real = dirname(realpathSync(path))
+    if (!dirs.includes(real)) dirs.push(real)
+  } catch { /* lexical directory only */ }
+  // MAILGATESCRIPT1027 R2: the limit applies per directory, so a symlinked entry's real-path helpers are looked at
+  const lists = []
+  for (const dir of dirs) {
+    const out = []
+    if (kind === 'py') {
+      for (const m of text.matchAll(PY_LOCAL_IMPORT)) {
+        if (m[1] && m[1].startsWith('.')) {
+          const rest = m[1].replace(/^\.+/, '')
+          let base = dir
+          for (let i = 0; i < m[1].length - rest.length - 1; i++) base = dirname(base)
+          const rels = rest ? [rest.split('.').join('/')] : (m[2] ?? '').split(',').map((n) => n.trim().split(/\s+/)[0])
+          for (const rel of rels) {
+            if (rel) out.push(join(base, `${rel}.py`), join(base, rel, '__init__.py'))
+          }
+          continue
+        }
+        const names = m[1] ? [m[1]] : (m[3] || '').split(',').map((n) => n.trim().split(/\s+/)[0])
+        for (const name of names) {
+          if (!name || name.startsWith('.')) continue
+          const rel = name.split('.').join('/')
+          out.push(join(dir, `${rel}.py`), join(dir, rel, '__init__.py'))
+        }
+      }
+    } else {
+      for (const m of text.matchAll(NODE_LOCAL_IMPORT)) {
+        for (const ext of NODE_EXTS) out.push(resolve(dir, m[1] + ext))
+      }
+    }
+    lists.push([...new Set(out)].filter((p) => p !== path).slice(0, HELPER_LIMIT))
+  }
+  return [...new Set(lists.flat())]
+}
+
+// MAILGATEAPIB1027: a script file's (or helper's) text: the mail imports, the web mail APIs, and a CALL that runs a
+// mail program (a process-starting call whose first argument, a string or a list's first item, starts with
+// sendmail, msmtp or swaks; read on the raw text). See _FILE_EXEC_SENDER in hooks/outgoing-copy-gate.py for why
+// not the looser code-string rule. Mirrors _text_sends there.
+// Samu 50995 N1: the call is found on the MASKED text (a call shape quoted inside a prose literal is blanked there),
+// its first argument is read from the RAW text at the same position. The masker keeps the length in code points,
+// not in UTF-16 units, so the position is carried over in code points.
+const FILE_EXEC_CALL = new RegExp(
+  String.raw`(?:\bsubprocess\.(?:run|call|check_call|check_output|Popen)|\bos\.(?:system|popen)|\bexec(?:File)?(?:Sync)?|\bspawn(?:Sync)?)\s*\(`, 'g')
+const FILE_EXEC_ARG = new RegExp(
+  String.raw`^\s*\[?\s*['"` + '`' + String.raw`](?:[^'"` + '`' + String.raw`\s]*\/)?(?:sendmail|msmtp|swaks)(?=['"` + '`' + String.raw`\s])`)
+function fileExecSends(raw, masked) {
+  const rawCp = Array.from(raw)
+  // not expected; the raw text is then judged alone, which errs toward a send
+  if (rawCp.length !== Array.from(masked).length) masked = raw
+  for (const m of masked.matchAll(FILE_EXEC_CALL)) {
+    const at = Array.from(masked.slice(0, m.index + m[0].length)).length
+    if (FILE_EXEC_ARG.test(rawCp.slice(at).join(''))) return true
+  }
+  return false
+}
+const textSends = (raw, masked, imports) =>
+  imports.test(masked) || webMailSends(masked) || fileExecSends(raw, masked)
+function fileSends(path, text, kind, readScript) {
+  const imports = kind === 'py' ? PY_MAIL_IMPORT : NODE_MAIL_IMPORT
+  const lang = kind === 'py' ? 'py' : 'js'
+  if (textSends(text, maskProseLiterals(text, lang), imports)) return true
+  // The helpers are found on the raw text: a helper named only in a docstring is read too, which errs toward a send.
+  return localHelperPaths(path, text, kind).some((h) => {
+    const t = readScript(h)
+    return t !== null && textSends(t, maskProseLiterals(t, lang), imports)
+  })
+}
+
+// python runs a directory's __main__.py, and a zip app's __main__.py from inside the archive
+// (MAILGATEDIRZIP1027). The archive is not unpacked here, so a zip run by python is a send.
+const ZIP_MAGIC = 'PK\u0003\u0004'
+// JSCDSEND1104: { readable, sends } like the python twin's _judge_candidates for one path.
+function judgeScript(path, kind, readScript) {
+  let p = path
+  let text = readScript(p)
+  if (text === null && kind === 'py') {
+    p = join(path, '__main__.py')
+    text = readScript(p)
+  }
+  // node runs DIR/package.json "main", else DIR/index.js; a main that cannot be read as named is a send
+  if (text === null && kind === 'node') {
+    const pkg = readScript(join(path, 'package.json'))
+    let main = null
+    if (pkg !== null) {
+      try { main = JSON.parse(pkg)?.main ?? null } catch { return { readable: true, sends: true } }
+    }
+    const declared = typeof main === 'string' && main !== ''
+    p = declared ? resolve(path, main) : join(path, 'index.js')
+    text = readScript(p)
+    if (text === null && declared) return { readable: true, sends: true }
+  }
+  if (text === null) return { readable: false, sends: false }
+  if (kind === 'py' && text.includes(ZIP_MAGIC)) return { readable: true, sends: true }
+  return { readable: true, sends: fileSends(p, text, kind, readScript) }
+}
+
+function scriptFileSends(path, kind, readScript) {
+  return judgeScript(path, kind, readScript).sends
+}
+
+// Any readable candidate that sends is a send; the candidates are where the script may be (the cwd, each cd target).
+function judgeCandidates(paths, kind, readScript) {
+  let readable = false
+  for (const path of paths) {
+    const r = judgeScript(path, kind, readScript)
+    if (!r.readable) continue
+    readable = true
+    if (r.sends) return { readable: true, sends: true }
+  }
+  return { readable, sends: false }
+}
+
+// MAILGATEDIRZIP1027: MOD of `-m MOD` / `-mMOD` among the interpreter options, else null (the Python twin's
+// _python_module). `python -m MOD` runs MOD.py or MOD/__main__.py under cwd; an installed module cannot be
+// read here, so with no readable candidate it is not a send.
+function pythonModule(rest) {
+  for (let i = 0; i < rest.length; i++) {
+    const t = rest[i]
+    if (t === '-m') return rest[i + 1] ?? null
+    if (/^-m[^-]/.test(t)) return t.slice(2)
+    // -m at the end of a cluster of flags without a value (`-um MOD`, `-Im MOD`, `-BmMOD`)
+    const cluster = /^-[bBdEhiIOPqRsSuvVx]+m(.*)$/.exec(t)
+    if (cluster) return cluster[1] || (rest[i + 1] ?? null)
+    if (PY_OPT_WITH_ARG.has(t)) { i++; continue }
+    if (t.startsWith('-') && t !== '--' && !t.startsWith('-c')) continue
+    return null
+  }
+  return null
+}
+// JSCDSEND1104 (Samu 69538 / 69623): a run is ADDRESSED when the command names a recipient: --to / --cc / --bcc (any
+// value) or an e-mail address anywhere in it. This gate (a hard deny) calls the fail-closed branches (an undecidable cd
+// or -m, a missing or unreadable script) a send ONLY on an addressed run: without an address, a script the gate cannot
+// read is no send (a developer's `cd $WT && python3 -m pytest`, a script written and run in one command). ISSUE2582
+// (Samu 72403): an undecidable SCRIPT PATH is no longer among them, it is a send on every run, as on the main gate.
+// A READABLE sender is a send either way, as it takes the address from inside. The main agent's approval gate (the
+// python twin) keeps the fail-closed branches on every run (its _FAIL_CLOSED_NEEDS_ADDRESS is false): this is the one
+// place the two gates differ, and script-run-cases.json holds both verdicts per row (main / sub).
+const FAIL_CLOSED_NEEDS_ADDRESS = true
+const EMAIL_IN_WORD = /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/
+function runIsAddressed(rest, cmdWords) {
+  return [...rest, ...cmdWords].some((w) => ADDRESS_FLAG.test(w) || EMAIL_IN_WORD.test(w))
+}
+
+function pythonModuleSends(module, cwd, readScript, cmdWords = [], addressed = false) {
+  if (!/^[\w.]+$/.test(module)) return false
+  const rel = module.split('.').join('/')
+  const { bases, undecidable } = cdBases(cwd, cmdWords)
+  if (undecidable && addressed) return true // JSCDSEND1104: a cd that cannot be resolved: fail-closed when addressed
+  const paths = bases.flatMap((b) => [resolve(b, rel + '.py'), resolve(b, rel, '__main__.py')])
+  return judgeCandidates(paths, 'py', readScript).sends
+}
+
+function headRunsSenderScript(toks, cwd, readScript, depth, cmdWords = []) {
+  if (!toks || !toks.length) return false
+  const prog = basename(toks[0])
+  const rest = toks.slice(1)
+  if (WRAPPER_SHELL.test(prog)) {
+    if (depth >= SHELL_C_DEPTH) return false
+    for (let i = 0; i < rest.length - 1; i++) {
+      if (!SHELL_C_FLAG.test(rest[i])) continue
+      // COPYSUBST1116: the body as written AND with the double-quote escapes undone (this only adds a verdict)
+      const body = rest[i + 1]
+      if ([...new Set([body, undoDquoteEscapes(body)])].some((b) => scriptRunSends(b, cwd, readScript, depth + 1, cmdWords))) return true
+    }
+    return false
+  }
+  let evalRest = rest
+  let isEval = prog === 'eval'
+  if (prog === 'builtin' || prog === 'command') {
+    // Revizor 4123 L2, 4138 L8: `builtin eval ...`, `builtin command eval ...`, `command -p eval ...`
+    let k = 0
+    while (k < rest.length && (['builtin', 'command', '--'].includes(rest[k]) || /^-[pvV]+$/.test(rest[k]))) k++
+    if (k < rest.length && basename(rest[k]) === 'eval') {
+      isEval = true
+      evalRest = rest.slice(k + 1)
+    }
+  }
+  if (isEval) {
+    // COPYSUBST1116: eval runs its joined words as a command line
+    if (evalRest[0] === '--') evalRest = evalRest.slice(1) // Revizor 4123 L2: `eval -- ...`
+    if (depth >= SHELL_C_DEPTH || !evalRest.length) return false
+    const line = evalRest.join(' ')
+    return [...new Set([line, undoDquoteEscapes(line)])].some((b) => scriptRunSends(b, cwd, readScript, depth + 1, cmdWords))
+  }
+  let script
+  let kind
+  // the fail-closed branches below fire when `addressed` (see FAIL_CLOSED_NEEDS_ADDRESS)
+  // Samu 69648 (3a): after a command-substitution cd, what runs is out of sight even without an address
+  const addressed = !FAIL_CLOSED_NEEDS_ADDRESS || cmdWords.includes(SUBST_MARK) || runIsAddressed(rest, cmdWords)
+  if (PYTHON.test(prog)) {
+    if (addressFlagGiven(rest)) return true // also under -m / -c, where no file is named
+    const module = pythonModule(rest)
+    if (module) return pythonModuleSends(module, cwd, readScript, cmdWords, addressed)
+    script = pythonScriptOperand(rest).script
+    kind = 'py'
+  } else if (NODEISH.test(prog)) {
+    script = nodeScriptOperand(prog, rest)
+    // MAILGATESCRIPT1027 R1: npx with another package than the tsx / ts-node / node runner form is no script run
+    if (prog === 'npx' && script === null) return false
+    if (addressFlagGiven(rest)) return true
+    kind = 'node'
+  } else if (substArtefact(toks[0])) {
+    return false // Samu 69682: a piece of a cut command substitution, not a file that runs
+  } else if (SCRIPT_FILE.test(toks[0]) || toks[0].includes('/')) {
+    // a directly executed file: its #! line picks the interpreter, else its extension; every candidate on its own
+    const extKind = /\.py$/i.test(toks[0]) ? 'py' : SCRIPT_FILE.test(toks[0]) ? 'node' : null
+    if (addressed && relativeUnderUndecidableCd(toks[0], cwd, cmdWords)) return true
+    const addr = addressFlagGiven(rest)
+    let readable = false
+    for (const path of resolveScriptPaths(toks[0], cwd, cmdWords)) {
+      const head = readScript(path, SHEBANG_READ_LIMIT)
+      if (head === null) continue
+      const k = shebangKind(head) ?? extKind
+      if (!k) continue
+      if (addr) return true
+      readable = true
+      if (scriptFileSends(path, k, readScript)) return true
+    }
+    if (readable) return false
+    if (!extKind) return false // no candidate with a kind is readable: a #! line cannot be known, the extension gives none
+    // the kind is known and no candidate is readable: fail-closed when addressed (JSCDSEND1104); an undecidable path
+    // (`$D/x.py`) always (ISSUE2582, Samu 72403, the same tightening as above)
+    return addressed || UNDECIDABLE_PATH.test(toks[0])
+  } else {
+    return false
+  }
+  if (script === null) return false
+  // ISSUE2582 (Samu 72403): an undecidable SCRIPT PATH (`python3 $X`, `node $D/x.js`, a variable the command does not
+  // provably set) is a send on this gate too, addressed or not, as on the main gate. A TIGHTENING: before, an unaddressed
+  // one passed here, so `D=$(..); python3 $D/send.py` ran unread. An undecidable cd or -m keeps the older rule.
+  if (UNDECIDABLE_PATH.test(script)) return true
+  if (addressed && relativeUnderUndecidableCd(script, cwd, cmdWords)) return true
+  let paths = resolveScriptPaths(script, cwd, cmdWords)
+  if (prog === 'node' && !/\.[^/]*$/.test(basename(script))) {
+    // Samu 69538: node loads an extensionless script as X, X.js or X.json; a native X.node addon cannot be read here
+    if (addressed && paths.some((p) => readScript(p + '.node', SHEBANG_READ_LIMIT) !== null)) return true
+    paths = paths.flatMap((p) => [p, p + '.js', p + '.json'])
+  }
+  const { readable, sends } = judgeCandidates(paths, kind, readScript)
+  if (readable) return sends
+  // JSCDSEND1104: a missing script is a send when addressed; `bun test` is not
+  return addressed && (SCRIPT_FILE.test(script) || script.includes('/'))
+}
+
+// Samu 69538: the tokenizer cuts a command substitution out of its word, so `cd $(git rev-parse --show-toplevel)` and a
+// backtick cd reach cdBases as a bare `cd` (and the next segment's first word looked like its DIR). Read on the raw
+// command: such a cd or pushd is an undecidable cd.
+const SUBST_CD = /(?:^|[\s;&|(!{])(?:cd|pushd)(?:\s+-\S*)*\s+["']?[^\s;&|"']*(?:\$\(|`)/
+// the undecidable cd word handed on for it; also what tells headRunsSenderScript a substitution cd was seen
+const SUBST_MARK = '$CMD_SUBST_CD'
+
+// Samu 69682 (1): the tokenizer does not nest quotes inside a command substitution, so `H="$(cd "$(...)" && pwd)/x"`
+// comes out in pieces, and ` && pwd)/x` stood at a segment's head like a file run by path. A head that starts with
+// whitespace, or has more `)` than `(`, is such a piece: no file runs under that name. The python twin agrees.
+function substArtefact(t) {
+  if (/^\s/.test(t)) return true
+  let open = 0, close = 0
+  for (const ch of t) { if (ch === '(') open++; else if (ch === ')') close++ }
+  return close > open
+}
+
+// Samu 69682 (2): substitutions whose value is known from a literal path are resolved on the raw command before it is
+// tokenized: $(dirname P), $(basename P), $(realpath P), P a literal (quoted or not), nested too. A cd after one is a
+// literal cd. With a variable argument ("$0", $VAR, ${VAR}) the substitution becomes an outside variable: the cd is
+// undecidable, but no command-substitution mark (a script's own `cd "$(dirname "$0")"` must not be a deny). Any other
+// substitution, or one with options, stays as it is.
+const DET_SUBST = /\$\(\s*(dirname|basename|realpath)\s+(?:"([^"$`\\]*)"|'([^']*)'|([^\s$`'"()|;&<>*?[\]{}\\]+)|("?)(\$(?:\{[A-Za-z_]\w*\}|[A-Za-z_]\w*|[0-9]))\5)\s*\)/
+const OUTSIDE_PATH_VAR = '$GATE_OUTSIDE_PATH'
+const SAFE_LITERAL = /^[^\s$`'"()|;&<>*?[\]{}\\]+$/
+function detSubstValue(fn, p, cwd) {
+  if (fn === 'dirname') {
+    const s = p.replace(/\/+$/, '') || '/'
+    if (s === '/') return '/'
+    const i = s.lastIndexOf('/')
+    if (i < 0) return '.'
+    return s.slice(0, i).replace(/\/+$/, '') || '/'
+  }
+  if (fn === 'basename') {
+    const s = p.replace(/\/+$/, '')
+    return s === '' ? '/' : s.split('/').pop()
+  }
+  const abs = isAbsolute(p) ? p : (typeof cwd === 'string' && isAbsolute(cwd) ? join(cwd, p) : null)
+  if (abs === null) return null
+  try { return realpathSync(abs) } catch { return resolve(abs) }
+}
+function resolveDeterministicSubst(cmd, cwd) {
+  let s = cmd
+  for (let n = 0; n < 16; n++) {
+    const m = DET_SUBST.exec(s)
+    if (!m) break
+    let v
+    if (m[6] !== undefined) v = OUTSIDE_PATH_VAR
+    else {
+      const p = m[2] ?? m[3] ?? m[4]
+      v = p === OUTSIDE_PATH_VAR ? OUTSIDE_PATH_VAR : detSubstValue(m[1], p, cwd)
+      if (v === null || !(v === OUTSIDE_PATH_VAR || SAFE_LITERAL.test(v))) break
+    }
+    s = s.slice(0, m.index) + v + s.slice(m.index + m[0].length)
+  }
+  return s
+}
+
+// Samu 69648 (2): a shell comment is no recipient and runs nothing. The python twin's shlex drops an unquoted `#...`;
+// this tokenizer kept it, so `cd $WT && python3 -m pytest # ask a@x.hu` was an addressed run here only. Dropped as bash
+// does: an unquoted `#` at the start of a word, up to the newline (kept, so the next line is still a command); a
+// quoted `#` is text. Run on the command after its heredoc bodies are cut (a body is data, not shell).
+function stripShellComments(cmd) {
+  let out = ''
+  let q = null
+  const parens = [] // Bence 69701: 's' for an open $( , 'p' for a plain ( -- which ) closes a command substitution
+  let substCloseAt = -1
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i]
+    if (q) {
+      if (ch === '\\' && q === '"' && i + 1 < cmd.length) { out += ch + cmd[++i]; continue }
+      if (ch === q) q = null
+      out += ch
+      continue
+    }
+    if (ch === '\\' && i + 1 < cmd.length) { out += ch + cmd[++i]; continue }
+    if (ch === "'" || ch === '"') { q = ch; out += ch; continue }
+    // a ) that closes a $( ends no word: `$(echo a)#x` is one word (Bence 69701, as the python twin's mask)
+    if (ch === '#' && (i === 0 || /[\s;&|(]/.test(cmd[i - 1]) || (cmd[i - 1] === ')' && substCloseAt !== i - 1))) {
+      while (i + 1 < cmd.length && cmd[i + 1] !== '\n') i++
+      continue
+    }
+    if (ch === '$' && cmd[i + 1] === '(') { parens.push('s'); out += '$('; i++; continue }
+    if (ch === '(') parens.push('p')
+    else if (ch === ')' && parens.length && parens.pop() === 's') substCloseAt = i
+    out += ch
+  }
+  return out
+}
+
+// Samu 69648 (3a): `D=dir; cd $D` (also `export D=dir`) names a directory the command itself sets. That literal dir is
+// handed on as one more cd word, so a script there is read; the `cd $D` itself stays undecidable (the variable may be
+// set elsewhere when the assignment does not run). A VAR set only outside the command is not resolved.
+const VAR_REF = /^\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))$/
+function assignedCdDirs(segments) {
+  const vars = new Map()
+  const out = []
+  for (const toks of segments) {
+    const assigns = toks[0] === 'export' ? toks.slice(1) : toks
+    if (assigns.length && assigns.every((t) => ENV_ASSIGN.test(t))) {
+      for (const t of assigns) {
+        const eq = t.indexOf('=')
+        const v = t.slice(eq + 1)
+        if (v === '' || UNDECIDABLE_PATH.test(v)) vars.delete(t.slice(0, eq))
+        else vars.set(t.slice(0, eq), v)
+      }
+      continue
+    }
+    for (let i = 1; i < toks.length; i++) {
+      if (toks[i - 1] !== 'cd' && toks[i - 1] !== 'pushd' && !(toks[i - 1] === '--' && (toks[i - 2] === 'cd' || toks[i - 2] === 'pushd'))) continue
+      const m = VAR_REF.exec(toks[i])
+      const v = m ? vars.get(m[1] ?? m[2]) : undefined
+      if (v !== undefined) out.push(v)
+    }
+  }
+  return out
+}
+
+// ISSUE2582 (A): `D=/x; python3 $D/a.py` -- a variable the command itself sets to a literal is filled in where its value
+// at run time is certain; everything else keeps the variable (today's verdict). The full proof is at the python twin's
+// _bind_literal_vars (outgoing-copy-gate.py); the two agree, script-run-cases.json binds them.
+// Samu 72415: a block keyword opens / closes a block (an assignment inside one does not bind). Dani (review of #2586):
+// the NAME may appear nowhere in the command but in its one assignment and its plain uses; eval / source / `.` / alias /
+// autoload / trap in command position (also behind command / builtin / exec / ...) switch the binding off.
+const BIND_GLOBAL_BLOCK = new Set(['eval', 'source', '.', 'alias', 'autoload', 'trap'])
+const BIND_PRECMD = new Set(['command', 'builtin', 'exec', 'noglob', 'nocorrect', '-', 'nohup', 'nice', 'time'])
+const BIND_OPEN = new Set(['if', 'while', 'until', 'case', '{', 'for', 'select'])
+const BIND_CLOSE = new Set(['fi', 'done', 'esac', '}'])
+const BIND_LEAD = new Set(['then', 'do', 'else', 'elif', '!', 'time'])
+function substEnd(cmd, i) {
+  // the index just past the `$(...)` or backtick substitution that starts at i (inside double quotes), else -1
+  if (cmd[i] === '`') {
+    for (let j = i + 1; j < cmd.length; j++) {
+      if (cmd[j] === '\\') { j++; continue }
+      if (cmd[j] === '`') return j + 1
+    }
+    return -1
+  }
+  let depth = 0
+  let q = null
+  for (let j = i + 1; j < cmd.length; j++) {
+    const c = cmd[j]
+    if (q) {
+      if (c === '\\' && q === '"') { j++; continue }
+      if (c === q) q = null
+    } else if (c === '\\') j++
+    else if (c === "'" || c === '"') q = c
+    else if (c === '(') depth++
+    else if (c === ')') { depth--; if (depth === 0) return j + 1 }
+  }
+  return -1
+}
+const BIND_NAME = /[A-Za-z_][A-Za-z_0-9]*/y
+const BIND_LITERAL = /^[^\s$`'"()|;&<>*?[\]{}\\!~#]+$/
+const BIND_ASSIGN = /^([A-Za-z_][A-Za-z_0-9]*)(\[[^\]]*\])?(\+?)=/
+function bindName(s, at) {
+  BIND_NAME.lastIndex = at
+  const m = BIND_NAME.exec(s)
+  return m ? { name: m[0], end: at + m[0].length } : null
+}
+function heredocBodySpans(cmd) {
+  return [...cmd.matchAll(new RegExp(HEREDOC_RE.source, 'g'))].map((m) => [m.index + m[1].length + 1, m.index + m[0].length - m[2].length])
+}
+function bindScan(cmd) {
+  const spans = heredocBodySpans(cmd)
+  const segs = []
+  const stack = []
+  let depth = 0
+  let cur = { words: [], sepBefore: null, depth: 0 }
+  let word = null
+  let q = null
+  const newWord = (pos) => ({ text: '', quoted: false, escaped: false, refs: [], start: pos })
+  const endWord = () => { if (word !== null) { cur.words.push(word); word = null } }
+  const endSeg = (sep) => {
+    endWord()
+    cur.sepAfter = sep
+    if (cur.words.length) segs.push(cur)
+    cur = { words: [], sepBefore: sep, depth }
+  }
+  const n = cmd.length
+  let i = 0
+  while (i < n) {
+    const span = spans.find(([s]) => s === i)
+    if (span) { i = span[1]; continue } // a heredoc body: data, not shell
+    const ch = cmd[i]
+    if (q === "'") {
+      if (ch === "'") q = null
+      else word.text += ch // a single-quoted `$D` is the literal text: no ref is recorded, nothing is filled in
+      i++
+      continue
+    }
+    if (ch === '\\' && i + 1 < n) { // an escaped `\$D` is literal text too: no ref
+      if (word === null) word = newWord(i)
+      word.escaped = true // inside "..." a backslash may stay: the value is not certain, never bound
+      word.text += cmd[i + 1]
+      i += 2
+      continue
+    }
+    if (ch === '$' && i + 1 < n && (cmd[i + 1] === '{' || bindName(cmd, i + 1))) {
+      if (word === null) word = newWord(i)
+      if (cmd[i + 1] === '{') {
+        const m = bindName(cmd, i + 2)
+        if (m && cmd[m.end] === '}') {
+          if (!':[('.includes(cmd[m.end + 1] ?? 'x')) word.refs.push([m.name, i, m.end + 1]) // zsh modifier / subscript
+          word.text += cmd.slice(i, m.end + 1)
+          i = m.end + 1
+          continue
+        }
+        word.text += ch // ${D%x}, ${D:-x}, ...: not filled in (and ${D=x} cannot change a D set before)
+        i++
+        continue
+      }
+      const m = bindName(cmd, i + 1)
+      if (!':[('.includes(cmd[m.end] ?? 'x')) word.refs.push([m.name, i, m.end]) // zsh `$D:h` modifier, `$D[1]` subscript
+      word.text += cmd.slice(i, m.end)
+      i = m.end
+      continue
+    }
+    if (q === '"') {
+      if (ch === '"') q = null
+      else if (ch === '`' || cmd.startsWith('$(', i)) {
+        const end = substEnd(cmd, i)
+        if (end < 0) return null // an unclosed substitution: not read here
+        // a quoted "$(...)" runs in a subshell: nothing in it is filled in (a name in it is one more occurrence)
+        word.text += cmd.slice(i, end)
+        i = end
+        continue
+      } else word.text += ch
+      i++
+      continue
+    }
+    if (ch === "'" || ch === '"') {
+      if (word === null) word = newWord(i)
+      word.quoted = true
+      q = ch
+      i++
+      continue
+    }
+    if (ch === '#' && word === null) {
+      while (i < n && cmd[i] !== '\n') i++
+      continue
+    }
+    if (ch === ' ' || ch === '\t') { endWord(); i++; continue }
+    if (ch === '\n' || ch === ';') { endSeg(';'); i++; continue }
+    if (ch === '`') {
+      if (stack.length && stack[stack.length - 1] === 'b') stack.pop()
+      else stack.push('b')
+      depth = stack.length
+      endSeg('(')
+      i++
+      continue
+    }
+    if (cmd.startsWith('$(', i)) { stack.push('s'); depth = stack.length; endSeg('('); i += 2; continue }
+    if (ch === '(') { stack.push('p'); depth = stack.length; endSeg('('); i++; continue }
+    if (ch === ')') { if (stack.length) stack.pop(); depth = stack.length; endSeg(')'); i++; continue }
+    if (ch === '&' || ch === '|') {
+      const prev = i ? cmd[i - 1] : ''
+      const nxt = i + 1 < n ? cmd[i + 1] : ''
+      if (ch === '&' && (prev === '<' || prev === '>' || nxt === '>')) {
+        if (word === null) word = newWord(i)
+        word.text += ch // a redirect (2>&1, &>), not a background run
+        i++
+        continue
+      }
+      if (ch === '|' && prev === '>') { word.text += ch; i++; continue } // >| is a redirect
+      if (cmd.startsWith('&&', i) || cmd.startsWith('||', i)) { endSeg(cmd.slice(i, i + 2)); i += 2; continue }
+      const pipeAmp = cmd.startsWith('|&', i)
+      endSeg(pipeAmp ? '|&' : ch)
+      i += pipeAmp ? 2 : 1
+      continue
+    }
+    if (word === null) word = newWord(i)
+    word.text += ch
+    i++
+  }
+  if (q) return null
+  endSeg(null)
+  return segs
+}
+export function bindLiteralVars(cmd) {
+  if (!cmd.includes('$') || !cmd.includes('=')) return cmd
+  const scanned = bindScan(cmd)
+  if (scanned === null) return cmd
+  const segs = scanned
+  const outside = outsideBodies(cmd, 0, cmd.length)
+  if (/(?<![A-Za-z0-9_])IFS(?![A-Za-z0-9_])/.test(outside)) return cmd
+  let block = 0 // how many blocks are open at the segment
+  for (const seg of segs) {
+    const words = seg.words
+    let k = 0
+    while (k < words.length && !words[k].quoted) {
+      const t = words[k].text
+      if (BIND_OPEN.has(t)) {
+        block++
+        if (t === 'for' || t === 'select' || t === 'case') { k = words.length; break } // the rest is a word list
+        k++
+        continue
+      }
+      if (BIND_CLOSE.has(t)) { block = Math.max(0, block - 1); k++; continue }
+      if (BIND_LEAD.has(t)) { k++; continue }
+      break
+    }
+    seg.block = block // eval / source / `.` ... in command position: boundIsPlain, quoted or not
+  }
+  const refCount = new Map()
+  for (const seg of segs) for (const w of seg.words) for (const [name] of w.refs) refCount.set(name, (refCount.get(name) ?? 0) + 1)
+  const binds = new Map() // name -> [segment index, value, conditional]
+  segs.forEach((seg, idx) => {
+    const words = seg.words
+    const assigns = words.length && words[0].text === 'export' && !words[0].quoted ? words.slice(1) : words
+    if (!assigns.length || !assigns.every((w) => BIND_ASSIGN.test(w.text))) return
+    if (seg.depth !== 0 || seg.block !== 0 || ![null, ';', '&&', '||'].includes(seg.sepAfter)) return
+    let conditional
+    if (seg.sepBefore === null || seg.sepBefore === ';') conditional = false
+    else if (seg.sepBefore === '&&') conditional = true
+    else return
+    for (const w of assigns) {
+      const eq = w.text.indexOf('=')
+      const name = w.text.slice(0, eq)
+      const value = w.text.slice(eq + 1)
+      if (w.escaped || !BIND_LITERAL.test(value) || name === 'IFS') continue
+      const occurrences = (outside.match(new RegExp(String.raw`(?<![A-Za-z0-9_])` + name + String.raw`(?![A-Za-z0-9_])`, 'g')) || []).length
+      if (occurrences !== 1 + (refCount.get(name) ?? 0)) continue // the name is named somewhere else: it may be set another way
+      binds.set(name, [idx, value, conditional])
+    }
+  })
+  if (!binds.size) return cmd
+  const edits = []
+  segs.forEach((seg, idx) => {
+    const words = seg.words
+    words.forEach((w, k) => {
+      const prev = k ? words[k - 1].text : null
+      const prev2 = k > 1 ? words[k - 2].text : null
+      if (prev === 'cd' || prev === 'pushd' || (prev === '--' && (prev2 === 'cd' || prev2 === 'pushd'))) return
+      for (const [name, start, end] of w.refs) {
+        const b = binds.get(name)
+        if (b === undefined || idx <= b[0]) continue
+        if (b[2] && segs.slice(b[0], idx).some((s) => s.sepAfter !== '&&')) continue
+        edits.push([start, end, b[1], name])
+      }
+    })
+  })
+  let bound = cmd
+  for (const [start, end, value] of [...edits].sort((a, b) => b[0] - a[0])) bound = bound.slice(0, start) + value + bound.slice(end)
+  // each bound name stands once in the bound command plus its uses left as they were (see the python twin)
+  const expected = new Map([...binds.keys()].map((n) => [n, 1 + (refCount.get(n) ?? 0) - edits.filter((e) => e[3] === n).length]))
+  return boundIsPlain(bound, expected) ? bound : cmd
+}
+
+// Dani (review of #2586, the computed name): the BOUND command is read once more; a variable-setting builtin anywhere,
+// a dynamic or quoted command name, arithmetic, an assigning ${...}, a subscript or [[ ... -eq ... ]] keep today's
+// verdict for the whole command (see the python twin's _bound_is_plain for the list and the shapes).
+const BIND_SETTERS = new Set(['read', 'declare', 'typeset', 'local', 'readonly', 'mapfile', 'readarray', 'getopts', 'let',
+  'unset', 'vared', 'zparseopts', 'zstyle', 'integer', 'float'])
+const BIND_DYNAMIC_TEXT = /\(\(|\$\[|\$\{[^}]*=|\$\{?[A-Za-z_][A-Za-z_0-9]*\[/
+const BIND_ARITH_TEST = /-(?:eq|ne|lt|le|gt|ge)\b/
+function boundIsPlain(bound, expected = new Map()) {
+  const outside = outsideBodies(bound, 0, bound.length)
+  for (const [name, count] of expected) {
+    if ((outside.match(new RegExp(String.raw`(?<![A-Za-z0-9_])` + name + String.raw`(?![A-Za-z0-9_])`, 'g')) || []).length !== count) return false
+  }
+  if (BIND_DYNAMIC_TEXT.test(outside)) return false
+  if (outside.includes('[[') && BIND_ARITH_TEST.test(outside)) return false
+  const segs = bindScan(bound)
+  if (segs === null) return false
+  for (const seg of segs) {
+    const words = seg.words
+    const texts = words.map((w) => w.text)
+    for (let i = 0; i < texts.length; i++) {
+      const t = texts[i]
+      const rest = texts.slice(i + 1)
+      if (BIND_SETTERS.has(t)) return false
+      if (t === 'export' && !rest.every((x) => BIND_ASSIGN.test(x))) return false
+      if ((t === 'printf' || t === 'print') && rest.some((x) => x.startsWith('-v'))) return false
+      if (t === 'set' && rest.some((x) => x.startsWith('-A') || x.startsWith('+A'))) return false
+    }
+    let k = 0
+    while (k < words.length && (BIND_OPEN.has(words[k].text) || BIND_CLOSE.has(words[k].text) || BIND_LEAD.has(words[k].text))) {
+      if (words[k].text === 'for' || words[k].text === 'select' || words[k].text === 'case') { k = words.length; break }
+      k++
+    }
+    while (k < words.length && BIND_ASSIGN.test(words[k].text)) k++
+    while (k < words.length && BIND_PRECMD.has(words[k].text)) k++
+    if (k < words.length) {
+      const head = words[k]
+      if (BIND_GLOBAL_BLOCK.has(head.text) || head.refs.length || head.text.includes('$') || head.text.includes('`')) return false
+    }
+  }
+  return true
+}
+
+// ISSUE2582 (B): a script written by a heredoc and then run in the same command is judged by its body (see the python
+// twin's _written_scripts for the exact conditions); every other case reads the disk as before.
+const WRITTEN_OPENER = new RegExp(
+  String.raw`^(?<pre>[^\n'"\x60\\]*;[ \t]*)?[ \t]*(?:cat[ \t]+>[ \t]*(?<p1>[^\s'"<>;&|$\x60]+)[ \t]+<<-?[ \t]*(?<q1>'?)(?<t1>\w+)\k<q1>` +
+  String.raw`|cat[ \t]+<<-?[ \t]*(?<q2>'?)(?<t2>\w+)\k<q2>[ \t]+>[ \t]*(?<p2>[^\s'"<>;&|$\x60]+)` +
+  String.raw`|tee[ \t]+(?<p3>[^\s'"<>;&|$\x60-][^\s'"<>;&|$\x60]*)(?:[ \t]+>[ \t]*\/dev\/null)?[ \t]+<<-?[ \t]*(?<q3>'?)(?<t3>\w+)\k<q3>` +
+  String.raw`)[ \t]*$`)
+function lexists(p) { try { lstatSync(p); return true } catch { return false } } // a dangling symlink counts too
+function outsideBodies(cmd, lo, hi) {
+  let out = ''
+  let pos = lo
+  for (const [s, e] of heredocBodySpans(cmd)) {
+    if (e <= lo || s >= hi) continue
+    out += cmd.slice(pos, Math.max(s, lo))
+    pos = Math.min(e, hi)
+  }
+  return out + cmd.slice(pos, hi)
+}
+const reEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+// Dani (review of #2586): the write must happen: only commands before it that cannot leave P there unnamed (a control
+// word is none), and a P that exists now is judged on disk too, which covers noclobber (see the python twin)
+const WRITTEN_SAFE_BEFORE = new Set(['mkdir', 'echo', 'printf', 'true', ':', 'test', '[', 'sleep', 'date', 'pwd', 'ls', 'cd',
+  'pushd', 'rm', 'cat', 'tee', 'export', 'set'])
+function writtenSafeBefore(text) {
+  let segments
+  try { segments = segmentsTokens(text) } catch { return false }
+  for (const toks of segments) {
+    const head = toks.find((t) => !ENV_ASSIGN.test(t))
+    if (head !== undefined && !WRITTEN_SAFE_BEFORE.has(head)) return false
+  }
+  return true
+}
+export function writtenScripts(cmd, cwd) {
+  const out = new Map()
+  // a control word anywhere (outside the bodies) can make the write conditional: `if x; then :; cat > P <<TAG`
+  const hasCd = /(?:^|[\s;&|(])(?:cd|pushd)(?:\s|$)|(?:^|[\s;&|(])(?:g?env)\s[^\n]*(?:-C|--chdir)/.test(cmd)
+  for (const m of cmd.matchAll(new RegExp(HEREDOC_RE.source, 'g'))) {
+    const lineStart = cmd.lastIndexOf('\n', m.index - 1) + 1
+    const openerEnd = m.index + m[1].length
+    const opener = cmd.slice(lineStart, openerEnd)
+    const w = WRITTEN_OPENER.exec(opener)
+    if (!w) continue
+    const g = w.groups
+    const path = g.p1 ?? g.p2 ?? g.p3
+    const quoted = Boolean(g.q1 || g.q2 || g.q3)
+    const bodyEnd = m.index + m[0].length - m[2].length
+    const body = cmd.slice(openerEnd + 1, bodyEnd)
+    if (!quoted && (body.includes('$') || body.includes('`'))) continue
+    let abs
+    if (isAbsolute(path)) abs = normalize(path)
+    else if (!hasCd && typeof cwd === 'string' && isAbsolute(cwd)) abs = normalize(join(cwd, path))
+    else continue
+    // the write runs unconditionally: the line before does not continue into it (&&, ||, |, a backslash)
+    if (/(?:&&|\|\||\||\\)\s*$/.test(cmd.slice(0, lineStart))) continue
+    // nothing before the write can have left P there unnamed (so the write does not fail on it)
+    if (!writtenSafeBefore(outsideBodies(cmd, 0, lineStart) + (g.pre ?? ''))) continue
+    // counted by the FILE NAME, so `./x.py`, `$D/x.py` and `/abs/x.py` are all mentions of x.py
+    const mention = new RegExp(String.raw`(?<![\w.-])` + reEscape(basename(path)) + String.raw`(?![\w.-])`, 'g')
+    const count = (s) => (s.match(mention) || []).length
+    if (count(outsideBodies(cmd, 0, lineStart)) || count(opener) !== 1 || count(outsideBodies(cmd, bodyEnd, cmd.length)) !== 1 ||
+        out.has(abs)) {
+      out.delete(abs)
+      continue
+    }
+    out.set(abs, body)
+  }
+  return out
+}
+
+export function scriptRunSends(cmdIn, cwd = process.cwd(), readScript = readScriptHead, depth = 0, cdWords = []) {
+  const bound = bindLiteralVars(decodeAnsiC(cmdIn)) // Revizor 4123 L1, L3: `$'--to'`, `bash -c $'...'`
+  const allWritten = writtenScripts(bound, cwd)
+  // Dani (review of #2586): a P that exists now may survive the write: its body is judged next to the file on disk
+  for (const [path, body] of allWritten) {
+    if (!lexists(path)) continue
+    const kind = shebangKind(body.slice(0, SHEBANG_READ_LIMIT)) ?? (/\.py$/.test(path) ? 'py' : SCRIPT_FILE.test(path) ? 'node' : null)
+    const reader = (q, lim) => (normalize(q) === path ? body.slice(0, lim) : readScript(q, lim))
+    if (kind && judgeCandidates([path], kind, reader).sends) return true
+  }
+  const written = new Map([...allWritten].filter(([p]) => !lexists(p)))
+  if (written.size) {
+    const diskRead = readScript
+    readScript = (path, limit = SCRIPT_READ_LIMIT) => {
+      const body = typeof path === 'string' ? written.get(normalize(path)) : undefined
+      return body !== undefined ? body.slice(0, limit) : diskRead(path, limit)
+    }
+  }
+  const cmd = resolveDeterministicSubst(bound, cwd)
+  let segments
+  try {
+    segments = segmentsTokens(stripShellComments(cmd.replace(HEREDOC_RE, '$1')))
+  } catch {
+    return false // unparseable: isSendInvocation's legacy fallback already judged it
+  }
+  // JSCDSEND1104: every word of the command, so a `cd DIR` before the run is seen; ENVOPTHEAD1104 (Bence 69475):
+  // `env -C DIR` runs its command in DIR, handed on as a `cd DIR` word (an undecidable DIR then makes it a send).
+  const flat = [...cdWords, ...segments.flat()]
+  const cmdWords = [...flat, ...envChdirDirs(flat).flatMap((d) => ['cd', d]), ...assignedCdDirs(segments).flatMap((d) => ['cd', d]),
+    ...(SUBST_CD.test(cmd) ? ['cd', SUBST_MARK] : [])]
+  if (segments.some((toks) => commandHeads(toks).some((h) => headRunsSenderScript(h, cwd, readScript, depth, cmdWords)))) return true
+  return flatAddressedRunSends(cmd, cwd, readScript, depth, cmdWords)
+}
+
+const ANSI_C_SIMPLE = { a: '\x07', b: '\b', e: '\x1b', E: '\x1b', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v', '\\': '\\', "'": "'", '"': '"', '?': '?' }
+// the text of a bash $'...' string: its backslash escapes decoded (an unknown one keeps its backslash); see the python twin
+function ansiCBody(body) {
+  let out = ''
+  for (let i = 0; i < body.length;) {
+    const ch = body[i]
+    if (ch !== '\\' || i + 1 >= body.length) { out += ch; i++; continue }
+    const e = body[i + 1]
+    if (Object.hasOwn(ANSI_C_SIMPLE, e)) { out += ANSI_C_SIMPLE[e]; i += 2; continue }
+    const tail = body.slice(i + 1)
+    let m = /^[0-7]{1,3}/.exec(tail)
+    let code = m ? parseInt(m[0], 8) : null
+    if (!m) {
+      m = /^x([0-9A-Fa-f]{1,2})/.exec(tail) || /^u([0-9A-Fa-f]{1,4})/.exec(tail) || /^U([0-9A-Fa-f]{1,8})/.exec(tail)
+      if (m) code = parseInt(m[1], 16)
+    }
+    if (m) {
+      try { out += String.fromCodePoint(code) } catch { out += '�' }
+      i += 1 + m[0].length
+      continue
+    }
+    if (e === 'c' && i + 2 < body.length) { out += String.fromCharCode(body.charCodeAt(i + 2) & 0x1f); i += 3; continue }
+    out += ch + e
+    i += 2
+  }
+  return out
+}
+
+// COPYSUBST1116 (Revizor 4123 L1, L3): every unquoted bash $'...' word as the single-quoted text it stands for
+function decodeAnsiC(cmd) {
+  if (!cmd.includes("$'") && !cmd.includes('$"')) return cmd
+  let out = ''
+  let q = null
+  for (let i = 0; i < cmd.length;) {
+    const ch = cmd[i]
+    if (q) {
+      if (ch === '\\' && q === '"' && i + 1 < cmd.length) { out += cmd.slice(i, i + 2); i += 2; continue }
+      if (ch === q) q = null
+      out += ch
+      i++
+      continue
+    }
+    if (ch === '\\' && i + 1 < cmd.length) { out += cmd.slice(i, i + 2); i += 2; continue }
+    if (ch === '$' && cmd[i + 1] === "'") {
+      let j = i + 2
+      while (j < cmd.length && cmd[j] !== "'") j += cmd[j] === '\\' ? 2 : 1
+      const text = ansiCBody(cmd.slice(i + 2, Math.min(j, cmd.length)))
+      out += "'" + text.replaceAll("'", "'\\''") + "'"
+      i = j + 1
+      continue
+    }
+    if (ch === '$' && cmd[i + 1] === '"') { i++; continue } // Revizor 4138 L7: a locale $"..." string is "..."
+    if (ch === "'" || ch === '"') q = ch
+    out += ch
+    i++
+  }
+  return out
+}
+
+// the shell's double-quote escapes undone: \$ \` \" \\ -> the character, backslash-newline -> nothing
+function undoDquoteEscapes(s) {
+  return s.replace(/\\([$`"\\\n])/g, (_, c) => (c === '\n' ? '' : c))
+}
+
+// COPYSUBST1116: the tokenizer cuts an unquoted $(...), backtick or <(...) out of its word and splits the command there,
+// so a --to / --cc / --bcc AFTER it fell into a segment of its own and no run was addressed. The command is judged once
+// more with every substitution as one undecidable word, on the base the segmenter reads (no heredoc bodies, no
+// comments), but ONLY the runs that carry an address. See _flat_addressed_run_sends in the python twin.
+function flatAddressedRunSends(cmd, cwd, readScript, depth, cmdWords) {
+  const base = stripShellComments(cmd.replace(HEREDOC_RE, '$1'))
+  const flat = flattenSubstitutions(base)
+  if (flat === base) return false
+  let segments
+  try {
+    segments = segmentsTokens(flat)
+  } catch {
+    return false
+  }
+  return segments.some((toks) => commandHeads(toks).some((h) => h && h.length && addressFlagGiven(h.slice(1))
+    && headRunsSenderScript(h, cwd, readScript, depth, cmdWords)))
+}
+
+// Bence 69517: GNU env reads a long option by any unique prefix (getopt_long); see the python twin.
+const ENV_LONG_OPTIONS = ['argv0', 'block-signal', 'chdir', 'debug', 'default-signal', 'ignore-environment', 'ignore-signal',
+  'list-signal-handling', 'null', 'split-string', 'unset', 'help', 'version']
+function envLongName(t) {
+  if (!t.startsWith('--') || t === '--') return null
+  const word = t.slice(2).split('=')[0]
+  if (ENV_LONG_OPTIONS.includes(word)) return word
+  const hits = ENV_LONG_OPTIONS.filter((o) => word && o.startsWith(word))
+  return hits.length === 1 ? hits[0] : null
+}
+
+// (value, index after it) when the env word t at j is -S / --split-string (also a prefix or a cluster); else null
+function envSplitValue(t, words, j) {
+  if (t.startsWith('--')) {
+    if (envLongName(t) !== 'split-string') return null
+    const eq = t.indexOf('=')
+    return eq >= 0 ? [t.slice(eq + 1), j + 1] : [words[j + 1] ?? '', j + 2]
+  }
+  if (t.startsWith('-')) {
+    let k = -1
+    for (let x = 1; x < t.length; x++) if (ENV_SHORT_VALUE.includes(t[x])) { k = x; break }
+    if (k > 0 && t[k] === 'S') return k < t.length - 1 ? [t.slice(k + 1), j + 1] : [words[j + 1] ?? '', j + 2]
+  }
+  return null
+}
+
+// JSCDSEND1104: sudo -D/--chdir DIR, the same class as env -C; see the python twin.
+const SUDO_LONG_OPTIONS = ['askpass', 'auth-type', 'background', 'bell', 'chdir', 'chroot', 'close-from', 'command-timeout',
+  'edit', 'group', 'help', 'host', 'list', 'login', 'non-interactive', 'other-user', 'preserve-env', 'preserve-groups',
+  'prompt', 'remove-timestamp', 'reset-timestamp', 'role', 'set-home', 'shell', 'type', 'user', 'validate', 'version']
+const SUDO_LONG_VALUES = ['auth-type', 'chdir', 'chroot', 'close-from', 'command-timeout', 'group', 'host', 'other-user',
+  'prompt', 'role', 'type', 'user']
+function longName(t, names) {
+  if (!t.startsWith('--') || t === '--') return null
+  const word = t.slice(2).split('=')[0]
+  if (names.includes(word)) return word
+  const hits = names.filter((o) => word && o.startsWith(word))
+  return hits.length === 1 ? hits[0] : null
+}
+const CHDIR_SPECS = new Map([
+  ['env', [ENV_SHORT_VALUE, 'C', ENV_LONG_OPTIONS, ENV_LONG_VALUE]],
+  ['genv', [ENV_SHORT_VALUE, 'C', ENV_LONG_OPTIONS, ENV_LONG_VALUE]],
+  ['sudo', ['ughpCUrtDRT', 'D', SUDO_LONG_OPTIONS, SUDO_LONG_VALUES]],
+])
+
+// ENVOPTHEAD1104 / JSCDSEND1104: the directories `env -C DIR` and `sudo -D DIR` (also `--chdir DIR`, `--chdir=DIR`,
+// joined, in a cluster, by a unique prefix, and for env also inside an -S value) run their command in.
+function envChdirDirs(words, d = 0) {
+  const out = []
+  for (let i = 0; i < words.length; i++) {
+    const spec = CHDIR_SPECS.get(basename(words[i]))
+    if (!spec) continue
+    const [shortVal, chdirCh, longNames, longVals] = spec
+    let j = i + 1
+    while (j < words.length) {
+      const t = words[j]
+      if (t === '--' || !(t.startsWith('-') || ENV_ASSIGN.test(t))) break
+      if (basename(words[i]) === 'env' || basename(words[i]) === 'genv') {
+        const split = envSplitValue(t, words, j)
+        if (split) {
+          // Bence 69552: env parses the options at the start of the -S value (and the words after it) again
+          let splitWords = []
+          try { splitWords = segmentsTokens(split[0]).flat() } catch { /* an unsplittable value is a send already */ }
+          if (d < HEAD_DEPTH) out.push(...envChdirDirs(['env', ...splitWords, ...words.slice(split[1])], d + 1))
+          break
+        }
+      }
+      const long = t.startsWith('--') ? longName(t, longNames) : null
+      if (t === '-' + chdirCh || (long === 'chdir' && !t.includes('='))) { if (j + 1 < words.length) out.push(words[j + 1]); j += 2; continue }
+      if (long === 'chdir') out.push(t.slice(t.indexOf('=') + 1))
+      else if (long && !t.includes('=') && longVals.includes(long)) j++ // its value
+      else if (t.startsWith('-') && !t.startsWith('--')) {
+        let k = -1
+        for (let x = 1; x < t.length; x++) if (shortVal.includes(t[x])) { k = x; break }
+        if (k > 0 && t[k] === chdirCh) {
+          if (k < t.length - 1) out.push(t.slice(k + 1))
+          else if (j + 1 < words.length) { out.push(words[j + 1]); j++ }
+        } else if (k === t.length - 1) j++
+      }
+      j++
+    }
+  }
+  return out
 }
 
 // Outbound-shaped operations of the multiplexed manage_email tool. Each of
 // these sends for real unless the call explicitly asks for a draft.
 const MANAGE_EMAIL_SEND_OPS = new Set(['send', 'reply', 'replyall', 'forward'])
 
+// --- tool-name classification ------------------------------------------------
+// JS twin of email_extract.classify_mail_tool (scripts/hooks/email_extract.py,
+// the main agent's gates). Both are bound by the shared case list
+// scripts/hooks/mail-tool-name-cases.json, which
+// src/__tests__/email-gate-matcher-drift.test.ts runs through BOTH copies; the
+// full rationale is at the python twin.
+//
+// Classified by the base-name SUFFIX, never by what precedes it:
+// vendor/gmail-mcp-fork prepends its tool prefix to every tool name verbatim
+// (v2_, v2, work-, ...), so `(^|__)draft_email$`, `(^|__)manage_email$` and
+// `gmail__reply_all$` missed every prefixed form: a prefixed draft skipped the
+// recipient ledger, and a prefixed (or non-"gmail"-server) reply_all was no
+// send at all. send_draft is a send this gate never knew. The classifier is a
+// superset of the patterns this gate carried: send_email and the draft names
+// keep a substring match, manage_email is the suffix (a look-alike such as
+// manage_emails_bulk stays out); the generic connector words count only with
+// "gmail" in the qualified name (the Telegram tool is `..._telegram__reply`).
+// Kinds: 'send_email' | 'connector_send' | 'send_draft' | 'manage_email' |
+// 'draft' | null (reads, search, labels, delete: not outbound).
+const CONNECTOR_GENERIC_SUFFIXES = ['send_message', 'reply', 'forward']
+const DRAFT_NAMES = ['draft_email', 'create_draft', 'update_draft', 'draft_gmail_message']
+// The harder-mail MCP's sends (HARDERMAILGATES1019): connector_send, so the
+// thread-reply narrowing (send_email only) can never release one.
+const MAILBOX_SEND_SUFFIXES = ['send_mail', 'send_mail_auto']
+// The Microsoft Graph MCP's names, hyphens normalized (MS365MAIL1024): the
+// server names its tools with hyphens (send-mail, create-draft-email, ...),
+// which no underscore-shaped suffix ever matched.
+const MS365_SEND_SUFFIXES = ['send_mail', 'send_shared_mailbox_mail', 'reply_mail_message',
+  'reply_all_mail_message', 'forward_mail_message', 'reply_shared_mailbox_mail',
+  'reply_all_shared_mailbox_mail', 'forward_shared_mailbox_mail', 'forward_calendar_event',
+  'reply_to_group_thread']
+const MS365_DRAFT_SEND_SUFFIXES = ['send_draft_message', 'send_shared_mailbox_draft']
+const MS365_DRAFT_SUFFIXES = ['create_draft_email', 'create_shared_mailbox_draft', 'create_reply_draft',
+  'create_reply_all_draft', 'create_forward_draft', 'create_shared_mailbox_reply_draft',
+  'create_shared_mailbox_reply_all_draft', 'create_shared_mailbox_forward_draft',
+  'update_mail_message', 'update_shared_mailbox_message']
+
+export function classifyMailTool(toolName) {
+  const n = String(toolName ?? '').toLowerCase().replaceAll('-', '_')
+  if (!n || n === 'bash') return null
+  // send_gmail_message: the Google Workspace MCP's Gmail send tool
+  if (n.includes('send_email') || n.includes('send_gmail_message')) return 'send_email'
+  if (n.endsWith('reply_all')) return 'connector_send'
+  if (n.includes('gmail') && CONNECTOR_GENERIC_SUFFIXES.some((b) => n.endsWith(b))) return 'connector_send'
+  if (MAILBOX_SEND_SUFFIXES.some((b) => n.endsWith(b))) return 'connector_send'
+  if (MS365_SEND_SUFFIXES.some((b) => n.endsWith(b))) return 'connector_send'
+  if (MS365_DRAFT_SEND_SUFFIXES.some((b) => n.endsWith(b))) return 'send_draft'
+  if (n.endsWith('send_draft')) return 'send_draft'
+  if (n.endsWith('manage_email')) return 'manage_email'
+  if (MS365_DRAFT_SUFFIXES.some((b) => n.endsWith(b))) return 'draft'
+  if (DRAFT_NAMES.some((d) => n.includes(d))) return 'draft'
+  return null
+}
+
+// --- Microsoft Graph letters (MS365MAIL1024) ----------------------------------
+// The ms365 MCP server carries the letter Graph-shaped: body.Message.{subject,
+// body:{contentType, content}, toRecipients/ccRecipients/bccRecipients:
+// [{emailAddress:{address, name?}}]}, a reply's Comment, a forward's
+// ToRecipients. The server reads keys in ANY case (so a key twice in different
+// case is ambiguous -> reason), and moves a stray top-level field into body
+// (so a stray is read wherever it sits). Reading is STRICT for the recipient
+// checks (an unreadable list fails closed, like the Python gate's copy).
+const isPlainObject = (v) => typeof v === 'object' && v !== null && !Array.isArray(v)
+
+const MS365_TOP_GRAPH_KEYS = new Set(['torecipients', 'ccrecipients', 'bccrecipients'])
+
+export function isMs365Shaped(toolInput) {
+  if (!isPlainObject(toolInput)) return false
+  for (const [k, v] of Object.entries(toolInput)) {
+    const lk = String(k).toLowerCase()
+    if (isPlainObject(v) && (lk === 'body' || lk === 'message' || lk === 'post')) return true
+    if (Array.isArray(v) && MS365_TOP_GRAPH_KEYS.has(lk)) return true
+  }
+  return false
+}
+
+// A Microsoft Graph MCP mail tool, decided by NAME (MS365MAIL1024 round 2): the
+// Graph server names its tools with hyphens, and the last segment of the
+// qualified name must contain one -- so the harder-mail server's underscored
+// send_mail is never Graph, however its payload looks. Same rule as
+// ms365_tool_kind in email_extract.py; the suffix lists are classifyMailTool's.
+export function ms365ToolKind(toolName) {
+  const raw = String(toolName ?? '').toLowerCase()
+  const last = raw.split('__').pop()
+  if (!last.includes('-')) return null
+  const n = raw.replaceAll('-', '_')
+  if (MS365_SEND_SUFFIXES.some((s) => n.endsWith(s))) return 'send'
+  if (MS365_DRAFT_SEND_SUFFIXES.some((s) => n.endsWith(s))) return 'draft_send'
+  if (MS365_DRAFT_SUFFIXES.some((s) => n.endsWith(s)) || n.endsWith('create_draft_email')) return 'draft'
+  return null
+}
+
+export function isMs365Tool(toolName) {
+  return ms365ToolKind(toolName) !== null
+}
+
+// Does the call carry Graph MATERIAL at all: an object body/Message/Post, or a
+// top-level Graph recipient key in ANY shape (a non-list toRecipients is
+// Graph material -- it must be read strictly, and fails there)? A Graph-named
+// draft with flat-only fields has none and keeps the flat checks, which is the
+// pinned contract for the ledger-checked drafts; a non-Graph tool with an
+// object body never enters the Graph block.
+function ms365HasGraphFields(toolInput) {
+  if (!isPlainObject(toolInput)) return false
+  for (const [k, v] of Object.entries(toolInput)) {
+    const lk = String(k).toLowerCase()
+    if (isPlainObject(v) && (lk === 'body' || lk === 'message' || lk === 'post')) return true
+    if (MS365_TOP_GRAPH_KEYS.has(lk)) return true
+  }
+  return false
+}
+
+// A Graph-shaped call that ALSO carries flat to/cc/bcc is ambiguous: one reader
+// would hide the other's addresses (SECURITY review on MS365MAIL1024).
+export function ms365FlatConflict(toolInput) {
+  if (!isPlainObject(toolInput)) return null
+  const flat = Object.entries(toolInput)
+    .filter(([k, v]) => ['to', 'cc', 'bcc'].includes(String(k).toLowerCase())
+      && !(v === null || v === undefined || v === '' || (Array.isArray(v) && v.length === 0)))
+    .map(([k]) => k)
+  return flat.length
+    ? `a hivas lapos (${flat.sort().join(', ')}) es Graph-alaku cimzettet is visz -- nem egyertelmu`
+    : null
+}
+
+// (the object with lowercased keys, reason). A key twice in a different case is
+// ambiguous.
+export function ms365Lower(d, where) {
+  const out = {}
+  for (const [k, v] of Object.entries(d)) {
+    const lk = String(k).toLowerCase()
+    if (lk in out) {
+      return [null, `${where}: a(z) '${lk}' mezo ketszer szerepel (kis/nagybetu) -- nem egyertelmu`]
+    }
+    out[lk] = v
+  }
+  return [out, null]
+}
+
+// Python-style sorted set repr, so the deny reasons read the same as the
+// Python gate's: ['a', 'b'].
+function ms365FieldRepr(keys) {
+  const sorted = [...new Set(keys)].sort()
+  return `['${sorted.join("', '")}']`
+}
+
+// Python-style repr of one short string (the quote Python's repr would pick),
+// so an address named in a deny reason reads the same on both gates.
+function ms365StrRepr(s) {
+  const q = s.includes("'") && !s.includes('"') ? '"' : "'"
+  return q + s.replace(/\\/g, '\\\\').split(q).join(`\\${q}`) + q
+}
+
+// [{emailAddress: {address, name?}}] -> (addresses, reason). Strict: nothing
+// else is accepted.
+export function ms365RecipientList(value, where) {
+  if (value === null || value === undefined) return [[], null]
+  if (!Array.isArray(value)) return [[], `${where}: nem lista`]
+  const out = []
+  for (let i = 0; i < value.length; i++) {
+    const here = `${where}[${i}]`
+    const item = value[i]
+    if (!isPlainObject(item)) return [[], `${here}: nem objektum`]
+    const [it, reason] = ms365Lower(item, here)
+    if (reason) return [[], reason]
+    const extra = Object.keys(it).filter((k) => k !== 'emailaddress')
+    if (extra.length) return [[], `${here}: ismeretlen mezo ${ms365FieldRepr(extra)}`]
+    const ea = it.emailaddress
+    if (!isPlainObject(ea)) return [[], `${here}.emailAddress: nem objektum`]
+    const [e, reason2] = ms365Lower(ea, `${here}.emailAddress`)
+    if (reason2) return [[], reason2]
+    const extra2 = Object.keys(e).filter((k) => k !== 'address' && k !== 'name')
+    if (extra2.length) return [[], `${here}.emailAddress: ismeretlen mezo ${ms365FieldRepr(extra2)}`]
+    const addr = e.address
+    if (typeof addr !== 'string' || !addr.trim()) {
+      return [[], `${here}.emailAddress.address: hianyzik vagy nem szoveg`]
+    }
+    if (!MS365_ADDR_RE.test(addr.trim())) {
+      return [[], `${here}.emailAddress.address: nem egyetlen puszta cim (${ms365StrRepr(addr.slice(0, 60))})`]
+    }
+    if ('name' in e && typeof e.name !== 'string') {
+      return [[], `${here}.emailAddress.name: nem szoveg`]
+    }
+    out.push(addr.trim())
+  }
+  return [out, null]
+}
+
+const MS365_RECIPIENT_FIELDS = ['torecipients', 'ccrecipients', 'bccrecipients']
+
+// One bare address, nothing around it: a '"owner@x" <stranger@y>' entry would
+// let a recipient check find the owner while the letter goes to the stranger.
+const MS365_ADDR_RE = /^[^\s<>,;:"'()\[\]@]+@[^\s<>,;:"'()\[\]@]+$/
+
+// {to, cc, bcc, reason} of a Graph-shaped call, for the recipient checks: only
+// the recipient fields are read, each strictly, wherever the server would take
+// them from -- the top level and the top-level message object (strays the server
+// moves into body), body itself (create-draft-email, update-mail-message),
+// body.Message, and body.ToRecipients (a forward). A flat to/cc/bcc next to the
+// Graph shape is a reason first: one reader would hide the other's addresses.
+// A port of ms365_recipients in email_extract.py (same logic, same reason
+// texts), so the two gates cannot drift.
+export function ms365Recipients(toolInput) {
+  if (!isPlainObject(toolInput)) return { to: [], cc: [], bcc: [], reason: 'a hivas: nem objektum' }
+  const flat = ms365FlatConflict(toolInput)
+  if (flat) return { to: [], cc: [], bcc: [], reason: flat }
+  const [top, topReason] = ms365Lower(toolInput, 'a hivas')
+  if (topReason) return { to: [], cc: [], bcc: [], reason: topReason }
+  const places = [['a hivas', top]]
+  if (top.message !== null && top.message !== undefined) {
+    if (!isPlainObject(top.message)) return { to: [], cc: [], bcc: [], reason: 'a hivas.Message: nem objektum' }
+    const [m, msgReason] = ms365Lower(top.message, 'a hivas.Message')
+    if (msgReason) return { to: [], cc: [], bcc: [], reason: msgReason }
+    places.push(['a hivas.Message', m])
+  }
+  const body = top.body
+  if (isPlainObject(body)) {
+    const [b, bodyReason] = ms365Lower(body, 'body')
+    if (bodyReason) return { to: [], cc: [], bcc: [], reason: bodyReason }
+    places.push(['body', b])
+    if (b.message !== null && b.message !== undefined) {
+      if (!isPlainObject(b.message)) return { to: [], cc: [], bcc: [], reason: 'body.Message: nem objektum' }
+      const [m, msgReason] = ms365Lower(b.message, 'body.Message')
+      if (msgReason) return { to: [], cc: [], bcc: [], reason: msgReason }
+      places.push(['body.Message', m])
+    }
+  }
+  const to = [], cc = [], bcc = []
+  const buckets = [to, cc, bcc]
+  for (const [where, d] of places) {
+    for (let f = 0; f < MS365_RECIPIENT_FIELDS.length; f++) {
+      const field = MS365_RECIPIENT_FIELDS[f]
+      const [got, reason] = ms365RecipientList(d[field], `${where}.${field}`)
+      if (reason) return { to: [], cc: [], bcc: [], reason }
+      const bucket = buckets[f]
+      for (const x of got) if (!bucket.includes(x)) bucket.push(x)
+    }
+  }
+  return { to, cc, bcc, reason: null }
+}
+
+// RECOVERYPATH920: the recovery command in the deny message used to be the
+// relative `node scripts/recipient-ledger.mjs`. Sub-agents run with cwd
+// agents/<name>/, which has NO scripts/ directory, so from a gated agent the
+// command died with "Cannot find module .../agents/<name>/scripts/
+// recipient-ledger.mjs" -- the one path the gate offers was unreachable from
+// the only place it is ever read. Resolve it from this file's own location:
+// the gate script and the ledger CLI ship in the same directory, so this is
+// correct from any cwd.
+const LEDGER_CLI = join(dirname(fileURLToPath(import.meta.url)), 'recipient-ledger.mjs')
+
+// Tool-input fields that carry recipient addresses across the mail tools we
+// have. A reply that only names a messageId has none of these -- it is
+// addressed by the thread, not by us, so there is nothing to invent.
+const RECIPIENT_FIELDS = ['to', 'cc', 'bcc', 'recipients', 'recipient', 'recipient_email']
+
+// Every address in this call that the ledger does not know. Pure: the lookup is
+// injected so tests never touch the real ledger file.
+export function unverifiedRecipients(toolInput, isVerified) {
+  const out = []
+  for (const field of RECIPIENT_FIELDS) {
+    const value = toolInput?.[field]
+    if (value === undefined || value === null || value === '') continue
+    for (const addr of parseAddresses(value).addresses) {
+      if (!isVerified(addr) && !out.includes(addr)) out.push(addr)
+    }
+  }
+  return out
+}
+
+// Every recipient piece of this call that is not exactly ONE address
+// (recipient-ledger.mjs parseAddresses): two addresses in one array item, an
+// address in the display name, two <...> pairs, an object value. The ledger
+// cannot vouch for what it cannot read as one address, and the mail tool may
+// still deliver to it, so the gate denies on any such piece.
+export function unparseableRecipients(toolInput) {
+  const out = []
+  for (const field of RECIPIENT_FIELDS) {
+    const value = toolInput?.[field]
+    if (value === undefined || value === null || value === '') continue
+    for (const piece of parseAddresses(value).unparseable) {
+      if (!out.includes(piece)) out.push(piece)
+    }
+  }
+  return out
+}
+
+// Default lookup for the live hook: read the ledger once per invocation. A
+// missing or corrupt ledger means nothing is verified, so the gate blocks --
+// an evidence store that cannot be read must never open the gate silently.
+function ledgerLookup() {
+  const ledger = loadLedger()
+  return (addr) => isVerifiedIn(ledger, addr)
+}
+
 // Pure decision: does this tool call send (or attempt to send) email?
 // Returns { deny, kind? }. `kind` selects the deny wording at the hook
 // entrypoint: 'draft-required' is the manage_email case (drafting is fine,
-// only the actual send is refused), everything else is the sub-agent
-// governance block.
-export function gateDecision(toolName, toolInput) {
+// only the actual send is refused), 'send_email' is the direct MCP send tool
+// (the only path the thread-reply capability below can narrow),
+// 'unverified-recipient' is a draft/manage_email address with no recorded
+// source, and everything else is the sub-agent governance block.
+export function gateDecision(toolName, toolInput, isVerified = null, cwd = process.cwd()) {
   const name = String(toolName ?? '')
+  // Lazy: only build the ledger lookup when a call actually carries addresses,
+  // so a read-shaped tool call never pays a file read.
+  const verify = isVerified ?? (() => {
+    let cached = null
+    return (addr) => (cached ??= ledgerLookup())(addr)
+  })()
   // Any MCP send_email tool, name-agnostic (gmail or a differently-named
   // server in a customer install -> the matcher + this both key on send_email).
-  if (/send_email/i.test(name)) return { deny: true }
+  // Deliberately NOT ledger-checked. This branch is either an unconditional
+  // deny, or -- with --allow-thread-reply -- a narrowing that only passes
+  // recipients read back from the live thread the reply belongs to. A
+  // participant of a thread we can read IS a sourced address in the same sense
+  // the ledger means it (the From header of a mail they sent us), so gating it
+  // against the file would refuse a legitimately sourced reply. The ledger
+  // guards the paths where an address can be typed from memory: drafting and
+  // manage_email.
+  const mailKind = classifyMailTool(name)
+  if (mailKind === 'send_email') return { deny: true, kind: 'send_email' }
+  // The claude.ai Gmail connector (mcp__claude_ai_Gmail__*) has no send_email:
+  // its sends are send_message / reply / forward. Drafts stay allowed and the
+  // reads are not sends, only the three send-shaped tools are denied
+  // (GMAILCONNECTOR914 -- before this line a sub-agent could send through the
+  // connector with no gate at all).
+  // Kind is NOT 'send_email' on purpose: the thread-reply narrowing at the
+  // entrypoint reads send_email-shaped fields (threadId/to), which a connector
+  // reply does not carry, so the connector stays fully gated for every agent.
+  // reply_all is a send on a server of any name, and a tool prefix does not
+  // hide any of the four (classifyMailTool).
+  if (mailKind === 'connector_send') return { deny: true, kind: 'connector-send' }
+  // send_draft sends an existing draft by draftId: a send like any other, and
+  // one whose recipients this gate cannot even see. Sub-agents may not send,
+  // so it gets the governance deny, with no narrowing.
+  if (mailKind === 'send_draft') return { deny: true, kind: 'send-draft' }
+  // Draft-creating MCP tools. Drafting is allowed (that is the whole point of
+  // the draft-required rule), but the ADDRESS in a draft still has to be
+  // verified: the owner presses send on what we typed, so an invented address
+  // reaches the outside world through a draft just as surely as through a send.
+  if (mailKind === 'draft') {
+    // MS365MAIL1024, round 2: the Graph read is decided by the tool NAME, not
+    // by the payload's shape -- a non-Graph tool with an object body keeps the
+    // flat checks below, and a Graph draft carries its recipients as
+    // toRecipients/ccRecipients/bccRecipients items, read the same strict way;
+    // an unreadable recipient list fails closed. A Graph-named draft with no
+    // Graph material at all (flat to/cc/bcc only) keeps the flat checks too:
+    // that is the pinned draft contract, and it errs toward the flat read,
+    // which checks every field it can see.
+    if (isMs365Tool(name) && ms365HasGraphFields(toolInput)) {
+      const r = ms365Recipients(toolInput)
+      if (r.reason) return { deny: true, kind: 'unparseable-recipient', addresses: [r.reason] }
+      const all = [...r.to, ...r.cc, ...r.bcc]
+      const unparseable = unparseableRecipients({ to: all })
+      if (unparseable.length) return { deny: true, kind: 'unparseable-recipient', addresses: unparseable }
+      const bad = unverifiedRecipients({ to: all }, verify)
+      if (bad.length) return { deny: true, kind: 'unverified-recipient', addresses: bad }
+      return { deny: false }
+    }
+    const unparseable = unparseableRecipients(toolInput)
+    if (unparseable.length) return { deny: true, kind: 'unparseable-recipient', addresses: unparseable }
+    const bad = unverifiedRecipients(toolInput, verify)
+    if (bad.length) return { deny: true, kind: 'unverified-recipient', addresses: bad }
+    return { deny: false }
+  }
   // @aaronsb/google-workspace-mcp multiplexes read, draft and send behind one
   // manage_email tool, so the tool NAME cannot decide this one -- the operation
   // plus the draft flag can. This is what replaces the server's own
   // draft-only-email safety policy, which blocks drafting too: that policy keys
   // on ctx.operation alone and never looks at draft:true, so with it enabled the
   // mailbox is effectively read-only (verified live, 2026-08-10).
-  if (/(^|__)manage_email$/i.test(name)) {
+  if (mailKind === 'manage_email') {
     const op = String(toolInput?.operation ?? '').toLowerCase()
     if (!MANAGE_EMAIL_SEND_OPS.has(op)) return { deny: false }
+    // The address check runs before the draft rule, so it applies to the send
+    // AND to the draft the deny message would send us back to write.
+    const unparseable = unparseableRecipients(toolInput)
+    if (unparseable.length) return { deny: true, kind: 'unparseable-recipient', addresses: unparseable }
+    const bad = unverifiedRecipients(toolInput, verify)
+    if (bad.length) return { deny: true, kind: 'unverified-recipient', addresses: bad }
     // Fail safe: only an explicit draft request passes. A missing/ambiguous
     // flag is treated as a real send, even though the server would itself
     // force a draft when attachments are present.
@@ -217,7 +2800,9 @@ export function gateDecision(toolName, toolInput) {
   }
   if (name === 'Bash') {
     const cmd = String(toolInput?.command ?? '')
-    if (isSendInvocation(cmd)) return { deny: true }
+    if (unverifiableSendConstruction(cmd, cwd)) return { deny: true, kind: 'unverifiable-construction' }
+    if (isSendInvocation(cmd)) return wrapperDepthHit(cmd) ? { deny: true, kind: 'wrapper-depth' } : { deny: true }
+    if (scriptRunSends(cmd, cwd)) return { deny: true, kind: 'script-send' }
   }
   return { deny: false }
 }
@@ -231,6 +2816,52 @@ export function buildDraftOnlyMsg(ownerName) {
     'Ird meg ugyanezt draft: true kapcsoloval, es jelezd a tulajdonosnak ' +
     `(${ownerName}), hogy a Gmail piszkozatok kozott varja a jovahagyasat. ` +
     'Csak VERIFIKALT cimre. A kuldes gombot ember nyomja meg.'
+  )
+}
+
+// Deny wording for an address the ledger does not know. This is the one deny
+// the agent can clear on its own -- by going and finding where the address
+// actually comes from. It names the exact command, so the cheap path is the
+// correct path and not "write it anyway".
+export function buildUnverifiedRecipientMsg(addresses) {
+  const list = addresses.join(', ')
+  const first = addresses[0] ?? 'cim@pelda.hu'
+  return (
+    `Nem igazolt cimzett: ${list}. ` +
+    'Ez a kapu azert van, mert egy kitalalt cimre meno level neman elveszik ' +
+    '(support@connectors.hu, 2026-08-14, 550 User doesn\'t exist). ' +
+    'Ne talalgass es ne a support@/info@ szokast hasznald: keresd meg a cimet ' +
+    'egy valodi forrasban -- a toluk kapott level From fejleceben ' +
+    '(manage_email search: from:<domain> in:anywhere), az elo oldalukon, ' +
+    'a Woo rendelesben vagy a Notion lapon. Aztan vedd fel a ledgerbe:\n' +
+    `  node ${LEDGER_CLI} add ${first} --source <forras> --note "<honnan>"\n` +
+    `  --source: ${SOURCE_HELP}\n` +
+    'Ha nem talalsz forrast, a cim NINCS meg: mondd meg a gazdanak, ne kuldj levelet.'
+  )
+}
+
+// Deny wording for a recipient piece that is not exactly one address. The fix
+// is on the caller's side: one clean address per item.
+export function buildUnparseableRecipientMsg(pieces) {
+  return (
+    `Nem ertelmezheto cimzett: ${pieces.join(' | ')}. ` +
+    'A cimzett-mezo minden eleme (vesszovel vagy pontosvesszovel elvalasztva) ' +
+    'pontosan EGY cim legyen: "cim@pelda.hu" vagy "Nev <cim@pelda.hu>". ' +
+    'Ket cim egy elemben, cim a megjelenitett nevben vagy tobb <...> ' +
+    'nem ellenorizheto a cimzett-ledgerrel, ezert a kapu tilt (fail-closed). ' +
+    'Ird at a mezot tiszta cimekre, aztan kuldd ujra.'
+  )
+}
+
+// Wording for a call that needs the ledger while the ledger MODULE does not
+// load (HOOKDEPLOAD1008). It goes to stderr with exit 2, not as the JSON deny:
+// no rewrite of the call helps, the module has to be repaired, and that is the
+// main agent's job -- this gate does not run in its session.
+export function buildLedgerUnavailableMsg(err) {
+  return (
+    'EMAIL-KAPU: TILTVA. A kapu fuggosege (scripts/recipient-ledger.mjs) nem toltheto be ' +
+    `(${err?.message ?? err}) -- fail-closed: a cimzett nem ellenorizheto, ezert a hivas nem mehet at. ` +
+    'A modult a fo ugynok javitja (ez a kapu az o munkameneteben nem fut): jelezd neki.\n'
   )
 }
 
@@ -270,6 +2901,155 @@ export function readBrandEnv(readFile = (p) => readFileSync(p, 'utf-8')) {
   }
 }
 
+// --- thread-scoped reply (BONIMAIL910) --------------------------------------
+// Owner decision 2026-09-10: ONE named agent may send outbound email, but ONLY
+// into an EXISTING Gmail thread and ONLY to addresses that already appear in
+// that thread's headers. The capability is granted per agent in code
+// (agent-scaffold.ts appends --allow-thread-reply to this hook's command when
+// the agent's capability list contains EMAIL_THREAD_REPLY_CAPABILITY); every
+// other agent keeps the unconditional deny above.
+//
+// Why THREAD-MEMBERSHIP and not a topic rule: the 2026-06-25 incident that
+// created this gate was a sub-agent mailing a FABRICATED address in the
+// owner's name. Membership in an existing thread is checkable in code; "is
+// this financial" is not. The narrowing closes exactly the failure shape that
+// created the rule: a new address can never be introduced.
+//
+// Every branch below fails CLOSED: missing threadId, unparseable recipient,
+// empty participant list, credential/fetch/HTTP error, timeout -> deny.
+
+// One address token. Deliberately simple: it must match what appears both in
+// the tool input and in Gmail's From/To/Cc header values.
+const ADDR_TOKEN = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi
+
+// Parse one recipient entry ("addr" or "Name <addr>") to a bare lowercase
+// address. Returns '' when the entry is not a single clean address -- the
+// caller treats that as deny (an unparseable recipient must never slip past
+// the membership check).
+export function extractAddress(raw) {
+  const s = String(raw ?? '').trim()
+  // More than one '@' is ONE clean address only when the display name IS the
+  // bracketed address ("jane@example.com" <jane@example.com>, a common client
+  // form). "invented@example.org <known@example.com>" would otherwise pass the
+  // trailing-bracket test as known@example.com, with a second address in the
+  // display name the membership check never looked at.
+  if ((s.match(/@/g) ?? []).length > 1) {
+    const m = s.match(/^([^<>]*)<([^<>]+)>$/)
+    if (!m) return ''
+    const display = m[1].trim().replace(/^"(.*)"$/, '$1').trim()
+    if (display.toLowerCase() !== m[2].trim().toLowerCase()) return ''
+  }
+
+  const angle = s.match(/<([^<>]+)>$/)
+  const cand = (angle ? angle[1] : s).trim()
+  return /^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i.test(cand) ? cand.toLowerCase() : ''
+}
+
+// Validate the send_email tool input as a thread-reply request. Pure.
+// Returns { ok: true, threadId, recipients } or { ok: false, reason }.
+export function threadReplyRequest(toolInput) {
+  const threadId = toolInput?.threadId
+  if (typeof threadId !== 'string' || !threadId.trim()) {
+    return { ok: false, reason: 'threadId hianyzik (uj szal nyitasa tiltott)' }
+  }
+  const raw = [toolInput?.to, toolInput?.cc, toolInput?.bcc]
+    .flatMap((v) => (Array.isArray(v) ? v : v == null ? [] : [v]))
+  if (!raw.length) return { ok: false, reason: 'nincs cimzett' }
+  const recipients = []
+  for (const r of raw) {
+    const addr = extractAddress(r)
+    if (!addr) return { ok: false, reason: `ertelmezhetetlen cimzett: ${String(r)}` }
+    recipients.push(addr)
+  }
+  return { ok: true, threadId: threadId.trim(), recipients }
+}
+
+// The membership decision itself. Pure. Empty participant list denies: a
+// thread we could not read participants from authorizes nothing.
+export function threadMembershipDecision(recipients, participants) {
+  const set = new Set((participants ?? []).map((p) => String(p).toLowerCase()).filter(Boolean))
+  if (!set.size) return { allow: false, reason: 'a szal resztvevo-listaja ures (fail-closed)' }
+  for (const r of recipients) {
+    if (!set.has(r)) return { allow: false, reason: `cimzett nincs a szalban: ${r}` }
+  }
+  return { allow: true }
+}
+
+// Collect every address that appears in the thread's From/To/Cc/Reply-To
+// headers. Pure over the Gmail API thread payload (format=metadata).
+export function extractParticipants(threadData) {
+  const out = new Set()
+  for (const msg of threadData?.messages ?? []) {
+    for (const h of msg?.payload?.headers ?? []) {
+      const n = String(h?.name ?? '').toLowerCase()
+      if (n === 'from' || n === 'to' || n === 'cc' || n === 'reply-to') {
+        for (const m of String(h?.value ?? '').matchAll(ADDR_TOKEN)) out.add(m[0].toLowerCase())
+      }
+    }
+  }
+  return [...out]
+}
+
+// Fetch the thread's participant addresses with the same credentials the Gmail
+// MCP server uses (same mailbox the send would go through, so the gate and the
+// send see the same thread). Path resolution mirrors the MCP server's own:
+// GMAIL_CREDENTIALS_PATH / GMAIL_OAUTH_PATH env overrides, else ~/.gmail-mcp.
+// Throws on ANY failure; per-request timeouts keep the whole check well under
+// the hook's 10s budget (a hook timeout would be a NON-blocking error, i.e.
+// fail-open -- the script must always decide first).
+export async function fetchThreadParticipants(threadId, opts = {}) {
+  const fetchImpl = opts.fetchImpl ?? fetch
+  const readFile = opts.readFile ?? ((p) => readFileSync(p, 'utf-8'))
+  const now = opts.now ?? (() => Date.now())
+  const home = process.env.HOME || homedir()
+  const credPath = process.env.GMAIL_CREDENTIALS_PATH || join(home, '.gmail-mcp', 'credentials.json')
+  const keysPath = process.env.GMAIL_OAUTH_PATH || join(home, '.gmail-mcp', 'gcp-oauth.keys.json')
+  const creds = JSON.parse(readFile(credPath))
+  let accessToken = creds.access_token
+  const fresh = typeof creds.expiry_date === 'number' && creds.expiry_date > now() + 60_000
+  if (!fresh) {
+    const keys = JSON.parse(readFile(keysPath))
+    const k = keys.installed ?? keys.web
+    if (!k?.client_id || !k?.client_secret || !creds.refresh_token) {
+      throw new Error('gmail credentials incomplete')
+    }
+    const res = await fetchImpl(k.token_uri || 'https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: k.client_id,
+        client_secret: k.client_secret,
+        refresh_token: creds.refresh_token,
+        grant_type: 'refresh_token',
+      }).toString(),
+      signal: AbortSignal.timeout(3500),
+    })
+    if (!res.ok) throw new Error(`token refresh failed: ${res.status}`)
+    accessToken = (await res.json())?.access_token
+  }
+  if (!accessToken) throw new Error('no gmail access token')
+  const url = 'https://gmail.googleapis.com/gmail/v1/users/me/threads/'
+    + encodeURIComponent(threadId)
+    + '?format=metadata&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Cc&metadataHeaders=Reply-To'
+  const res = await fetchImpl(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+    signal: AbortSignal.timeout(3500),
+  })
+  if (!res.ok) throw new Error(`thread fetch failed: ${res.status}`)
+  return extractParticipants(await res.json())
+}
+
+// Deny wording for the thread-reply case: the agent HAS a send right, the
+// specific call fell outside it. Says what the right covers and the way out.
+export function buildThreadDenyMsg(botName, detail) {
+  return (
+    'Kimeno email ezzel a jogosultsaggal CSAK meglevo szalba mehet, es csak a ' +
+    `szalban mar szereplo cimzettnek (szal-kapu). Elutasitva: ${detail}. ` +
+    `Uj cimzetthez vagy uj szalhoz kuldd a tervezett emailt ${botName}nek ` +
+    'inter-agent uzenetben jovahagyasra.'
+  )
+}
+
 function allow() { process.exit(0) }
 
 function deny(reason) {
@@ -305,10 +3085,46 @@ if (isInvokedDirectly()) {
   } catch {
     allow() // malformed/empty input must never break the agent's tool calls
   }
-  const { deny: shouldDeny, kind } = gateDecision(payload?.tool_name, payload?.tool_input)
+  let decision
+  try {
+    decision = gateDecision(payload?.tool_name, payload?.tool_input, null, payload?.cwd || process.cwd())
+  } catch (err) {
+    // HOOKDEPLOAD1008: the call needed the ledger, and the ledger module did
+    // not load. Anything else that throws here is not this branch's to judge.
+    if (!LEDGER_LOAD_ERROR) throw err
+    process.stderr.write(buildLedgerUnavailableMsg(LEDGER_LOAD_ERROR))
+    process.exit(2)
+  }
+  const { deny: shouldDeny, kind, addresses } = decision
   if (shouldDeny) {
     const { botName, ownerName } = readBrandEnv()
-    deny(kind === 'draft-required' ? buildDraftOnlyMsg(ownerName) : buildGateMsg(botName, ownerName))
+    // An address with no recorded source loses before every other branch,
+    // including the thread-reply narrowing below: a verified thread cannot
+    // vouch for an unsourced recipient.
+    if (kind === 'unparseable-recipient') deny(buildUnparseableRecipientMsg(addresses ?? []))
+    if (kind === 'unverified-recipient') deny(buildUnverifiedRecipientMsg(addresses ?? []))
+    if (kind === 'draft-required') deny(buildDraftOnlyMsg(ownerName))
+    if (kind === 'wrapper-depth') deny(buildWrapperDepthMsg())
+    if (kind === 'unverifiable-construction') deny(buildUnverifiableConstructionMsg(botName, ownerName))
+    if (kind === 'script-send') deny(buildScriptSendMsg(botName, ownerName))
+    // Thread-scoped narrowing: only when the scaffold wired this agent's hook
+    // command with the flag (capability-driven, regenerated on every spawn),
+    // and only for the direct send_email tool. Bash send routes and
+    // manage_email stay fully gated even for the capable agent.
+    if (kind === 'send_email' && process.argv.includes('--allow-thread-reply')) {
+      const req = threadReplyRequest(payload?.tool_input)
+      if (!req.ok) deny(buildThreadDenyMsg(botName, req.reason))
+      let verdict
+      try {
+        const participants = await fetchThreadParticipants(req.threadId)
+        verdict = threadMembershipDecision(req.recipients, participants)
+      } catch {
+        verdict = { allow: false, reason: 'a szal resztvevoi nem olvashatok (fail-closed)' }
+      }
+      if (verdict.allow) allow()
+      deny(buildThreadDenyMsg(botName, verdict.reason))
+    }
+    deny(buildGateMsg(botName, ownerName))
   }
   allow()
 }

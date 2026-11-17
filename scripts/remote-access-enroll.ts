@@ -9,6 +9,7 @@
 //   npm run remote-enroll -- --host 203.0.113.10 --port 2222 "<public key line>"
 //   npm run remote-enroll -- --web-port 3421 "<public key line>"
 //   npm run remote-enroll -- --no-dashboard-token "<public key line>"
+//   npm run remote-enroll -- --device-key [--name "<device name>"] "<public key line>"
 //
 // --port is the SSH port; --web-port is the dashboard port the enrolled key may
 // tunnel to (permitopen) AND the port encoded in the bundle. It defaults to the
@@ -22,19 +23,25 @@
 // bundle is a SECRET: hand it over on a private channel only, never by email.
 // Pass --no-dashboard-token to emit a token-free bundle (the device user must
 // then obtain the dashboard access URL out of band).
+//
+// --device-key (BRIDGEINSTKEY1020) carries this device's OWN key instead of the
+// shared token: minted for the key line's install id, exactly as the dashboard's
+// Bridge pairing does, so the device appears in the device-key list and one
+// dashboard revoke cuts both its tunnel and its dashboard access. The remote
+// installer asks for it; without the flag the shared-token default is unchanged
+// for anyone who scripted this command.
 
-import { readFileSync } from 'node:fs'
+import { readFileSync, realpathSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
-import { homedir, hostname, userInfo, networkInterfaces } from 'node:os'
+import { hostname, userInfo, networkInterfaces } from 'node:os'
 import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { isIP } from 'node:net'
 import {
   validatePublicKeyLine,
   buildRestrictedLine,
   buildBundle,
   checkEnrollHost,
-  dashboardTokenDecision,
   encodeBundle,
   resolveHostKey,
   HOST_KEY_PUB_CANDIDATES,
@@ -43,14 +50,20 @@ import {
   type ConnectionBundleInput,
 } from '../src/remote-enroll-core.js'
 import { enrollAuthorizedKey } from '../src/remote-enroll-fs.js'
+import { chooseBundleToken, defaultDeviceName, withCredential, type BundleTokenChoice, type BundleTokenMode } from '../src/bridge-device-key.js'
+import { DEVICE_NAME_RE, mintBridgeDeviceKey } from '../src/web/auth-device-keys.js'
+import { initDatabase, logConfigChange } from '../src/db.js'
+import { resolveSshDir } from '../src/ssh-dir.js'
 import { WEB_PORT as ENV_WEB_PORT } from '../src/config.js'
 
-interface Args {
+export interface Args {
   keyLine?: string
   host?: string
   port: number
   webPort: number
-  includeDashboardToken: boolean
+  tokenMode: BundleTokenMode
+  /** Device-key name (--device-key only); defaults to defaultDeviceName(). */
+  name?: string
 }
 
 /** Dashboard port default: the install's actual WEB_PORT, read from the same
@@ -58,13 +71,15 @@ interface Args {
  * manual `remote-enroll` with no --web-port still targets the real port instead
  * of the 3420 default. Explicit --web-port overrides. Falls back to REMOTE_PORT
  * only when .env carries no WEB_PORT (config already applies that default). */
-function defaultWebPort(): number {
+export function defaultWebPort(): number {
   const n = ENV_WEB_PORT
   return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : REMOTE_PORT
 }
 
-function parseArgs(argv: string[]): Args {
-  const out: Args = { port: 22, webPort: defaultWebPort(), includeDashboardToken: true }
+export function parseArgs(argv: string[]): Args {
+  const out: Args = { port: 22, webPort: defaultWebPort(), tokenMode: 'shared' }
+  let noToken = false
+  let deviceKey = false
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--host') {
@@ -77,7 +92,14 @@ function parseArgs(argv: string[]): Args {
       if (!checked.ok) fail(`--host: ${checked.reason}`)
       out.host = v
     } else if (a === '--no-dashboard-token') {
-      out.includeDashboardToken = false
+      noToken = true
+    } else if (a === '--device-key') {
+      deviceKey = true
+    } else if (a === '--name') {
+      const v = argv[++i]
+      if (!v) fail('--name requires a value')
+      if (!DEVICE_NAME_RE.test(v.trim())) fail('--name must be 1-64 characters: letters, digits, space, . _ -')
+      out.name = v.trim()
     } else if (a === '--port') {
       const v = argv[++i]
       if (!v) fail('--port requires a value')
@@ -98,6 +120,9 @@ function parseArgs(argv: string[]): Args {
       fail('unexpected extra argument; pass the public key line as a single quoted argument')
     }
   }
+  if (noToken && deviceKey) fail('--device-key and --no-dashboard-token are mutually exclusive')
+  if (out.name !== undefined && !deviceKey) fail('--name only applies with --device-key')
+  out.tokenMode = deviceKey ? 'device' : noToken ? 'none' : 'shared'
   return out
 }
 
@@ -167,34 +192,76 @@ function readDashboardToken(): string | null {
   }
 }
 
-async function main(): Promise<void> {
-  const args = parseArgs(process.argv.slice(2))
+/**
+ * The bundle's dashboard credential for this run (see chooseBundleToken).
+ * `openDb` exists for the tests: they open an in-memory database first and pass
+ * a no-op, so the device-key path is exercised end to end without ever opening
+ * the install's real store/claudeclaw.db.
+ */
+export function bundleCredential(
+  args: Pick<Args, 'tokenMode' | 'name'>,
+  installId: string,
+  action: string,
+  openDb: () => void = () => initDatabase(),
+): BundleTokenChoice {
+  const deviceName = args.name ?? defaultDeviceName(installId)
+  return chooseBundleToken(args.tokenMode, {
+    readSharedToken: readDashboardToken,
+    mintDeviceKey: () => {
+      openDb()
+      const minted = mintBridgeDeviceKey(deviceName, installId)
+      logConfigChange('security.bridge_enroll', null, `${deviceName} (${installId}) ${action} device_key_cli`, 'cli')
+      return minted
+    },
+  })
+}
+
+export interface EnrollDeps {
+  /** .ssh directory the restricted line is written into. */
+  sshDir: string
+  /** This machine's ed25519 host key, or null when none can be found. */
+  obtainHostKey: () => { body: string; source: string } | null
+  /** Opens the install database for --device-key (tests pass a no-op after ':memory:'). */
+  openDb?: () => void
+  /** Diagnostics sink (stderr in the CLI). */
+  note?: (line: string) => void
+}
+
+export type EnrollOutcome = { ok: true; encoded: string } | { ok: false; reason: string }
+
+/**
+ * One enrollment, end to end except argv and stdout: write the restricted
+ * authorized_keys line, resolve the host key, pick the credential and build the
+ * encoded bundle. Exported so the tests run the REAL chain -- including the step
+ * that puts the chosen credential into the bundle, which a review mutant
+ * (`readDashboardToken() ?? choice.token`) showed was otherwise unpinned.
+ */
+export async function runEnroll(args: Args, deps: EnrollDeps): Promise<EnrollOutcome> {
+  const note = deps.note ?? (() => {})
   if (args.keyLine === undefined) {
-    fail('missing public key line. Usage: npm run remote-enroll -- "<public key line>"')
+    return { ok: false, reason: 'missing public key line. Usage: npm run remote-enroll -- "<public key line>"' }
   }
 
   let parsed
   try {
     parsed = validatePublicKeyLine(args.keyLine)
   } catch (err) {
-    if (err instanceof RemoteEnrollError) fail(err.message)
+    if (err instanceof RemoteEnrollError) return { ok: false, reason: err.message }
     throw err
   }
 
   const restrictedLine = buildRestrictedLine(parsed, args.webPort)
-  const sshDir = join(homedir(), '.ssh')
-
   const result = await enrollAuthorizedKey({
-    sshDir,
+    sshDir: deps.sshDir,
     restrictedLine,
     installId: parsed.installId,
   })
 
   for (const w of result.warnings) {
-    process.stderr.write(`warning: ${w}\n`)
+    note(`warning: ${w}`)
   }
-  process.stderr.write(
-    `${result.action === 'replaced' ? 'Replaced' : 'Added'} restricted entry for marveen-remote:${parsed.installId} in ${result.authorizedKeysPath}\n`,
+  note(
+    `${result.action === 'replaced' ? 'Replaced' : 'Added'} restricted entry for marveen-remote:${parsed.installId} in ${result.authorizedKeysPath}`,
   )
 
   // Assemble the connection bundle. The consuming side requires the host key,
@@ -203,19 +270,19 @@ async function main(): Promise<void> {
   // own and stays; re-running after fixing the SSH server replaces it by id.)
   const explicitHost = args.host
   const host = explicitHost ?? primaryIPv4() ?? hostname()
-  const resolved = obtainHostKey()
+  const resolved = deps.obtainHostKey()
   if (resolved === null) {
-    fail(
-      'could not obtain this machine\'s ssh-ed25519 host key ' +
+    return {
+      ok: false,
+      reason:
+        'could not obtain this machine\'s ssh-ed25519 host key ' +
         `(checked ${HOST_KEY_PUB_CANDIDATES.join(', ')} and ssh-keyscan on 127.0.0.1). ` +
         'Ensure the SSH server is running (on macOS: System Settings > General > Sharing > Remote Login), then re-run.',
-    )
+    }
   }
-  process.stderr.write(`host key: ${resolved.source}\n`)
+  note(`host key: ${resolved.source}`)
   if (!explicitHost) {
-    process.stderr.write(
-      `hint: host resolved to "${host}". Verify this is the address the device will reach; override with --host if needed.\n`,
-    )
+    note(`hint: host resolved to "${host}". Verify this is the address the device will reach; override with --host if needed.`)
   }
 
   const bundleInput: ConnectionBundleInput = {
@@ -233,27 +300,76 @@ async function main(): Promise<void> {
   // not running), not a silent degrade to an unusable token-free bundle. This is
   // the same "unusable -- fail hard instead of emitting it silently" rule the
   // host-key check above already applies. `--no-dashboard-token` still emits a
-  // deliberate token-free bundle.
-  const tokenDecision = dashboardTokenDecision(args.includeDashboardToken, readDashboardToken())
-  if ('ok' in tokenDecision) {
-    fail(tokenDecision.reason)
-  } else if (tokenDecision.include) {
-    bundleInput.dashboardToken = tokenDecision.token
-    process.stderr.write(
+  // deliberate token-free bundle. `--device-key` mints this device's own key and
+  // never reads the shared token (BRIDGEINSTKEY1020). It opens the database
+  // directly, like dashboard-user does, so it works before the dashboard's
+  // first start too; the running dashboard picks the new row up on first use.
+  const choice = bundleCredential(args, parsed.installId, result.action, deps.openDb)
+  if (!choice.ok) return { ok: false, reason: choice.reason }
+  if (choice.source === 'device') {
+    note(
+      `device key ${choice.replaced ? 'replaced' : 'minted'} for marveen-remote:${parsed.installId}; ` +
+        'it is listed and revocable under the dashboard device keys. The bundle carries it: treat the bundle as a secret.',
+    )
+  } else if (choice.source === 'shared') {
+    note(
       'NOTE: this bundle contains the dashboard access token. Treat it as a secret: ' +
         'hand it over on a private channel, never by email or shared chat. ' +
-        'Use --no-dashboard-token to emit a token-free bundle.\n',
+        'Use --no-dashboard-token to emit a token-free bundle.',
     )
   }
 
-  const encoded = encodeBundle(buildBundle(bundleInput))
+  return { ok: true, encoded: encodeBundle(buildBundle(withCredential(bundleInput, choice))) }
+}
+
+async function main(): Promise<void> {
+  const args = parseArgs(process.argv.slice(2))
+  // ENROLL813: this CLI used to hardcode homedir()/.ssh and did not know the
+  // MARVEEN_SSH_DIR seam at all (grep -c MARVEEN_SSH_DIR on this file was 0).
+  // Nothing automated calls it today -- but any future automated caller would
+  // have written the operator's real authorized_keys with no way to redirect it,
+  // which is the same shape as the leak this change closes. One resolver for
+  // every writer, or the next copy drifts again.
+  const sshDir = resolveSshDir((dir) => {
+    process.stderr.write(`warning: MARVEEN_SSH_DIR override active -- writing to ${dir}, not the real ~/.ssh\n`)
+  })
+  const outcome = await runEnroll(args, {
+    sshDir,
+    obtainHostKey,
+    note: (line) => process.stderr.write(`${line}\n`),
+  })
+  if (!outcome.ok) fail(outcome.reason)
 
   process.stdout.write('----- BEGIN CONNECTION BUNDLE -----\n')
-  process.stdout.write(`${encoded}\n`)
+  process.stdout.write(`${outcome.encoded}\n`)
   process.stdout.write('----- END CONNECTION BUNDLE -----\n')
 }
 
-main().catch((err) => {
-  process.stderr.write(`error: ${err instanceof Error ? err.message : String(err)}\n`)
-  process.exit(1)
-})
+// Import-guard (channel-coordinator idiom): run the CLI only when this file
+// IS the invoked script. The INSTUX1 regression test imports defaultWebPort
+// above, and an unguarded main() would execute the whole enrollment
+// (host-key scan, authorized_keys write) at import time.
+//
+// Realpath on BOTH sides (Marveen review, msg 23506, measured): a bare URL
+// comparison silently no-ops when the script is invoked through a SYMLINKED
+// ABSOLUTE path -- exit 0, zero output, and the installer reads that as
+// "no bundle", which is exactly the silent-failure family this card exists
+// for. On a realpath failure fall back to the URL comparison rather than
+// going silent: an exotic fs must degrade to the old behaviour, not to a
+// CLI that never runs.
+function isInvokedDirectly(): boolean {
+  const argv1 = process.argv[1]
+  if (!argv1) return false
+  try {
+    return realpathSync(argv1) === realpathSync(fileURLToPath(import.meta.url))
+  } catch {
+    return import.meta.url === pathToFileURL(argv1).href
+  }
+}
+
+if (isInvokedDirectly()) {
+  main().catch((err) => {
+    process.stderr.write(`error: ${err instanceof Error ? err.message : String(err)}\n`)
+    process.exit(1)
+  })
+}

@@ -22,7 +22,8 @@ describe('schedule-runner auto-starts a stopped agent for its scheduled task', (
     // The return union must carry 'starting' so the caller can tell an
     // auto-start apart from a genuine busy session.
     const sig = SRC.slice(SRC.indexOf('function attemptFireTask'))
-    expect(sig.slice(0, 200)).toMatch(/'starting'/)
+    // The window is the whole signature, so a new parameter cannot push the union out.
+    expect(sig.slice(0, sig.indexOf('{'))).toMatch(/'starting'/)
   })
 
   it('the missing-session branch auto-starts the agent instead of skipping', () => {
@@ -31,8 +32,11 @@ describe('schedule-runner auto-starts a stopped agent for its scheduled task', (
     expect(guardIdx).toBeGreaterThan(0)
     // Window covering the missing-session block (comment + code, before the
     // real busy-check). Must launch the agent and return the 'starting' state.
-    const missingBlock = SRC.slice(guardIdx, guardIdx + 1800)
-    expect(missingBlock).toMatch(/startAgentProcess\(agentName\)/)
+    // Widened from 1800: the main-agent guard (see
+    // schedule-runner-main-agent-missing.test.ts) now sits ahead of this code
+    // in the same block.
+    const missingBlock = SRC.slice(guardIdx, guardIdx + 2800)
+    expect(missingBlock).toMatch(/startAgentProcess\(agentName, \{ ownsResume: true \}\)/)
     expect(missingBlock).toMatch(/return 'starting'/)
   })
 
@@ -57,7 +61,8 @@ describe('schedule-runner auto-starts a stopped agent for its scheduled task', (
 
   it('documents WHY (daily batch agent), not just what', () => {
     const guardIdx = SRC.indexOf('if (!sessionExistsOnHost(')
-    const rationale = SRC.slice(guardIdx, guardIdx + 900)
+    // Widened from 900 for the same reason as above.
+    const rationale = SRC.slice(guardIdx, guardIdx + 1900)
     expect(rationale).toMatch(/auto-start|batch agent|digest/i)
     expect(rationale).toMatch(/skipIfBusy/i)
   })

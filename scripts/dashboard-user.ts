@@ -20,14 +20,15 @@
 //
 // Passwords are read interactively (twice, muted)
 // or from stdin with --password-stdin for automation. No new dependencies:
-// node:readline for the prompt, the app's own db + password-hash modules.
+// node:readline for the prompt (src/hidden-prompt.ts), the app's own db + password-hash modules.
 
-import { createInterface } from 'node:readline'
 import { initDatabase, getDb, createDashboardUser, getDashboardUser, listDashboardUsers, deleteDashboardUser, updateDashboardUserPassword, logConfigChange } from '../src/db.js'
 import { hashPassword, assertPasswordPolicy, PasswordPolicyError } from '../src/web/password-hash.js'
 import { revokeAllForUser } from '../src/web/auth-sessions.js'
 import { securityReset } from '../src/web/security-reset.js'
 import { notifySecurityEvent } from '../src/notify.js'
+import { takeSupportAccessDown } from '../src/web/support-standby-runtime.js'
+import { promptHidden } from '../src/hidden-prompt.js'
 
 function usage(): never {
   process.stderr.write(
@@ -48,27 +49,6 @@ function readStdin(): Promise<string> {
     process.stdin.setEncoding('utf-8')
     process.stdin.on('data', (c) => (data += c))
     process.stdin.on('end', () => resolve(data.replace(/\n$/, '')))
-  })
-}
-
-// Muted interactive prompt: echo is suppressed so the password is not shown.
-function promptHidden(question: string): Promise<string> {
-  return new Promise((resolve) => {
-    const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: true })
-    const out = process.stdout as NodeJS.WriteStream & { _writeToOutput?: (s: string) => void }
-    process.stdout.write(question)
-    let first = true
-    out._writeToOutput = (str: string) => {
-      // Let the first write (the question echo) through, mute keystrokes after.
-      if (first) { first = false; process.stdout.write(str); return }
-      // Print nothing for typed characters; keep newlines so Enter works.
-      if (str.includes('\n')) process.stdout.write('\n')
-    }
-    rl.question('', (answer) => {
-      out._writeToOutput = undefined
-      rl.close()
-      resolve(answer)
-    })
   })
 }
 
@@ -126,6 +106,8 @@ async function main(): Promise<void> {
       const hash = await hashPassword(pw)
       updateDashboardUserPassword(user.id, hash)
       revokeAllForUser(user.id)
+      // SUPPORTKULCS1109 (terv-v7 3.9): a password reset takes support access off this machine.
+      await takeSupportAccessDown('password_change')
       // Same audit + channel ping as the HTTP break-glass: a password reset
       // that skipped the current-password proof must always leave a trace.
       logConfigChange('security.break_glass_password_reset', null, user.username, 'cli')
@@ -155,12 +137,16 @@ async function main(): Promise<void> {
       }
       revokeAllForUser(user.id)
       deleteDashboardUser(username)
+      // SUPPORTKULCS1109 (terv-v7 3.9): removing a dashboard login takes support access off this machine.
+      await takeSupportAccessDown('user_delete')
       const remaining = listDashboardUsers().length
       process.stdout.write(`Removed "${username}".${remaining === 0 ? ' No users left -- back to token-only mode.' : ''}\n`)
       break
     }
     case 'security:reset': {
       const r = securityReset('cli')
+      // SUPPORTKULCS1109 (terv-v7 3.9): the break-glass reset takes support access off this machine too.
+      await takeSupportAccessDown('security_reset')
       await notifySecurityEvent(`🚨 Biztonsági reset futott a dashboard CLI-ből: ${r.deviceKeysRevoked} eszközkulcs visszavonva, ${r.sessionsCleared} böngésző-munkamenet törölve. A hozzáférési token és a jelszavak változatlanok.`)
       process.stdout.write(
         `Security reset done: ${r.deviceKeysRevoked} device key(s) revoked, ${r.sessionsCleared} browser session(s) cleared.\n` +

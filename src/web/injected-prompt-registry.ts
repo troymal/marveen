@@ -46,6 +46,23 @@ export function normalizeForMatch(text: string): string {
 }
 
 /**
+ * Drop whitespace entirely, for the substring identity test only.
+ *
+ * Collapsing is not enough: a terminal wraps at a fixed column, so it can break
+ * INSIDE a word. The scrape then reads "...the categ ory field..." where the
+ * source has "category", and collapsing leaves a space the original never had,
+ * so `includes` fails on text that IS ours. Removing whitespace on both sides
+ * makes the comparison blind to where the wrap fell.
+ *
+ * This does not loosen the guard against clearing a human draft: the fragment
+ * still has to appear verbatim, character for character, inside something this
+ * process injected into that same pane within the retention window.
+ */
+export function squashForMatch(text: string): string {
+  return text.replace(/\s+/g, '')
+}
+
+/**
  * Remember what was typed into a pane. Called from the single choke point every
  * machine delivery goes through, so scheduled ticks, inter-agent messages and
  * context-guard prompts are all covered, not just the router.
@@ -63,6 +80,15 @@ export function recordInjectedPrompt(session: string, text: string, now: number 
     if (oldestKey != null) records.delete(oldestKey)
   }
   records.set(session, { text, at: now })
+}
+
+/**
+ * Drop the record when it still holds `text`: the sender left this prompt typed but
+ * unsubmitted and will type it again (#2143), so the stuck-input watcher's
+ * 'reinject-recorded' path must not match and submit the leftover copy meanwhile.
+ */
+export function forgetInjectedPrompt(session: string, text: string): void {
+  if (records.get(session)?.text === text) records.delete(session)
 }
 
 /** The last prompt typed into this pane, or null if absent/expired. */
@@ -86,16 +112,36 @@ export function getInjectedPrompt(session: string, now: number = Date.now()): In
  *
  * The scrape may be missing its head (overfull box) or its tail (narrow pane),
  * so a substring test in either direction is the honest check; an equality test
- * would reject exactly the case this exists for.
+ * would reject exactly the case this exists for. It may also be broken MID-WORD
+ * by the wrap, which is why the comparison runs on the whitespace-free form.
  */
 export function matchesInjectedPrompt(parked: string | null, record: InjectedPromptRecord | null): boolean {
   if (parked == null || record == null) return false
-  const a = normalizeForMatch(parked)
-  const b = normalizeForMatch(record.text)
+  const a = squashForMatch(parked)
+  const b = squashForMatch(record.text)
   if (a.length === 0 || b.length === 0) return false
+  // RENAMEPARK1014: the WHOLE record, character for character, is not a
+  // fragment. The floor below exists because a short SUBSTRING ("the") is no
+  // evidence of origin; an exact match of everything this process typed into
+  // this pane within the retention window is. Without this, a short machine
+  // command -- the identity `/rename <name>` (20 chars squashed) -- can never
+  // match its own record and a parked one is held forever.
+  //
+  // INTENDED SCOPE -- wider than `/rename`: the exception applies to EVERY
+  // record, so it also covers the dashboard operator commands that go through
+  // sendPromptToSession and are recorded the same way -- `/login` and `/mcp`
+  // (OPERATOR_COMMAND_TEXT in routes/operator.ts, and the `/login` in
+  // routes/agents.ts). Before RENAMEPARK1014 a parked `/login` or `/mcp` was
+  // held (both are under the floor); now it matches its record and the watcher
+  // presses Enter on it. That is deliberate: the operator asked for exactly that
+  // command, in that pane, within the retention window. It does widen the GH
+  // #717 gate for those exact texts, so identity-rename-recorded.test.ts pins
+  // the operator case too -- narrowing or widening this must break a test.
+  if (a === b) return true
   // A very short fragment is not evidence: "the" appears in every message. The
   // floor is well under the shortest real inter-agent frame (the security
-  // preamble alone is ~700 chars) but high enough to exclude noise.
+  // preamble alone is ~700 chars) but high enough to exclude noise. Counted on
+  // the whitespace-free form, so it is 24 real characters, not 24 columns.
   if (a.length < 24) return false
   return b.includes(a) || a.includes(b)
 }

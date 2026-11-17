@@ -1,7 +1,8 @@
-import { readFileSync } from 'node:fs'
+import { readFileSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { atomicWriteFileSync } from './web/atomic-write.js'
+import { parseEnvContent } from './env-parse.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 // CLAUDECLAW_ENV_DIR: test-only escape hatch so the suite can point .env
@@ -19,24 +20,36 @@ export function readEnvFile(keys?: string[]): Record<string, string> {
     return {}
   }
 
-  const result: Record<string, string> = {}
-  for (const line of content.split('\n')) {
-    const trimmed = line.trim()
-    if (!trimmed || trimmed.startsWith('#')) continue
-    const eqIdx = trimmed.indexOf('=')
-    if (eqIdx === -1) continue
-    const key = trimmed.slice(0, eqIdx).trim()
-    let value = trimmed.slice(eqIdx + 1).trim()
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1)
-    }
-    if (keys && !keys.includes(key)) continue
-    result[key] = value
-  }
-  return result
+  return parseEnvContent(content, keys)
+}
+
+// The mode a newly created .env gets: it holds secrets, and install-macos.sh /
+// install-linux.sh chmod it to 600.
+export const ENV_FILE_MODE = 0o600
+
+// Write a whole .env at ENV_FILE_MODE. writeFileSync's `mode` only applies when
+// the file is CREATED, so rewriting an existing, looser .env in place would keep
+// its old mode. The content goes into a fresh temp file created at 0600 and
+// renamed over the target: the secrets never sit in a loose file, and a reader
+// still holding the old file open does not see them.
+export function writeEnvFileFresh(envPath: string, content: string): void {
+  atomicWriteFileSync(envPath, content, { mode: ENV_FILE_MODE })
+}
+
+const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+// .env is line-based and its values are written unquoted, so a line break (or
+// NUL) in a value, or a key that is not a plain env name, would add a line of
+// the caller's choosing. Every .env writer runs this before touching the file
+// (FLEETIMPORTENVKEY1021, ENVINJECT1028).
+export function assertEnvEntry(key: string, value: string): void {
+  if (!ENV_KEY_RE.test(key)) throw new Error(`refusing to write .env: ${JSON.stringify(key)} is not an env key name`)
+  if (!isSingleLineEnvValue(value)) throw new Error(`refusing to write .env: the value of ${key} holds a line break or NUL`)
+}
+
+/** True when `value` can be one .env value: no CR, LF or NUL. The channel .env writers check this too (ENVTEAMSNAME1028). */
+export function isSingleLineEnvValue(value: string): boolean {
+  return !/[\r\n\0]/.test(value)
 }
 
 // Update (or append) the given keys in .env, preserving every other line,
@@ -57,6 +70,8 @@ export function updateEnvFile(updates: Record<string, string>): void {
     ([, v]) => typeof v === 'string' && v.length > 0,
   )
   if (entries.length === 0) return
+  // Refused before the file is read (FLEETIMPORTENVKEY1021).
+  for (const [key, val] of entries) assertEnvEntry(key, val)
 
   let content = ''
   try {
@@ -84,5 +99,12 @@ export function updateEnvFile(updates: Record<string, string>): void {
     out.push(`${key}=${val}`)
   }
 
-  atomicWriteFileSync(envPath, out.join('\n'))
+  // ENVPERM925: keep the file's own mode. atomicWriteFileSync writes a NEW file
+  // and renames it over .env, so without an explicit mode the result took the
+  // umask default: a 0600 .env holding the bot token and API keys came back
+  // 0644, readable by every local user (measured 2026-09-25 with this function).
+  // A new file is created ENV_FILE_MODE.
+  let mode = ENV_FILE_MODE
+  try { mode = statSync(envPath).mode & 0o777 } catch { /* no .env yet */ }
+  atomicWriteFileSync(envPath, out.join('\n'), { mode })
 }

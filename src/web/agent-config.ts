@@ -1,9 +1,12 @@
-import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs'
-import { join } from 'node:path'
+import { readFileSync, existsSync, readdirSync, statSync, lstatSync, realpathSync } from 'node:fs'
+import { join, resolve, sep } from 'node:path'
 import { homedir } from 'node:os'
 import { PROJECT_ROOT, MAIN_AGENT_ID, DEFAULT_AGENT_MODEL } from '../config.js'
 import { readEnvFile, updateEnvFile } from '../env.js'
 import { atomicWriteFileSync } from './atomic-write.js'
+import { parseExtraChannels, wantsGromzo } from './agent-extra-channels.js'
+import type { ChannelProviderType } from '../channel-provider.js'
+import { logger } from '../logger.js'
 import { safeJoin } from './sanitize.js'
 import { isValidModelId, InvalidModelIdError } from '../model-id.js'
 import {
@@ -13,6 +16,8 @@ import {
   type ModelProfileMapState,
   type ModelResolution,
 } from '../model-profiles.js'
+import { expandAndValidateConfigDir, hasParentTraversal } from '../config-dir-path.js'
+import { readSenderRoleGates, senderRoleGatesPath, storedGateConfig, UNREADABLE_GATES_POLICY } from './sender-role-gate-store.js'
 
 export const AGENTS_BASE_DIR = join(PROJECT_ROOT, 'agents')
 
@@ -25,11 +30,20 @@ export const DEFAULT_MODEL = DEFAULT_AGENT_MODEL
 export const MODEL_ALIASES: Record<string, string> = {
   'opus': 'claude-opus-5[1m]',
   'sonnet': 'claude-sonnet-5',
+  'sonnet-5-5': 'claude-sonnet-5-5',
+  'sonnet55': 'claude-sonnet-5-5',
   'sonnet-5': 'claude-sonnet-5',
   'sonnet5': 'claude-sonnet-5',
   'opus-5': 'claude-opus-5',
   'opus5': 'claude-opus-5',
   'haiku': 'claude-haiku-4-5-20251001',
+  'haiku-5-5': 'claude-haiku-5-5',
+  'haiku55': 'claude-haiku-5-5',
+  'fable': 'claude-fable-5',
+  'fable-5': 'claude-fable-5',
+  'fable5': 'claude-fable-5',
+  'fable-5-2': 'claude-fable-5-2',
+  'fable52': 'claude-fable-5-2',
   'inherit': DEFAULT_MODEL,
 }
 
@@ -49,6 +63,53 @@ export function agentConfigRoot(name: string): string {
 
 export function readFileOr(path: string, fallback: string): string {
   try { return readFileSync(path, 'utf-8') } catch { return fallback }
+}
+
+// JSONCLOBBER926 (card 035e46d0): the read half of every read-modify-write on a
+// JSON config file (agent-config.json, .mcp.json, settings.json, task-config).
+// Until now each site did `try { JSON.parse(readFileOr(path, '{}')) } catch {}`
+// and then WROTE the result back: a file that existed but was unreadable or
+// not valid JSON (a half-written save, a stray character, a permissions slip)
+// was silently replaced by a one-key object, and every other setting in it was
+// gone with no log line -- the same silent-swallow class as the Ollama case.
+// A MISSING file is the normal "first write" and yields {}. An EXISTING file
+// that cannot be read or parsed as a JSON object is a fault: warn with the
+// path and refuse (throw), so the caller's request fails visibly (the route
+// layer answers 500 with the message) instead of destroying the file. Same
+// rule hook-registration-guard already applies to settings.json ("never
+// destroy a user's settings on a parse error").
+// A JSON.parse error message is NOT safe to log: on Node 22 V8 quotes ~10
+// characters of the input around the bad byte ("Unexpected token 's',
+// ..."API_KEY":sk-FAKE-12"... is not valid JSON"), and the files this helper
+// guards (.mcp.json, settings.json) are exactly the ones that carry API keys.
+// Keep only the position, never the excerpt (review on #1600).
+export function redactJsonParseMessage(message: string): string {
+  const pos = /at position \d+(?: \(line \d+ column \d+\))?/.exec(message)
+  return pos ? `SyntaxError ${pos[0]}` : 'SyntaxError (excerpt omitted)'
+}
+
+export function readJsonObjectForWrite(path: string): Record<string, unknown> {
+  if (!existsSync(path)) return {}
+  let raw: string
+  try {
+    raw = readFileSync(path, 'utf-8')
+  } catch (err) {
+    logger.warn({ path, err: (err as Error)?.message }, 'JSON config exists but cannot be read -- refusing to overwrite it')
+    throw new Error(`${path} exists but cannot be read; refusing to overwrite it`)
+  }
+  if (!raw.trim()) return {}
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch (err) {
+    logger.warn({ path, err: redactJsonParseMessage(String((err as Error)?.message ?? err)) }, 'JSON config is not valid JSON -- refusing to overwrite it (fix or remove the file)')
+    throw new Error(`${path} is not valid JSON; refusing to overwrite it`)
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    logger.warn({ path }, 'JSON config is not an object -- refusing to overwrite it')
+    throw new Error(`${path} is not a JSON object; refusing to overwrite it`)
+  }
+  return parsed as Record<string, unknown>
 }
 
 export function extractDescriptionFromClaudeMd(content: string): string {
@@ -153,7 +214,7 @@ export function readAgentModel(name: string): string {
 export function writeAgentModelProfile(name: string, profile: string | null): void {
   const configPath = join(agentDir(name), 'agent-config.json')
   let config: Record<string, unknown> = {}
-  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch { /* start fresh */ }
+  config = readJsonObjectForWrite(configPath)
   if (profile === null) delete config.modelProfile
   else config.modelProfile = profile
   atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
@@ -163,7 +224,7 @@ export function writeAgentModel(name: string, model: string): void {
   if (!isValidModelId(model)) throw new InvalidModelIdError(model)
   const configPath = join(agentDir(name), 'agent-config.json')
   let config: Record<string, unknown> = {}
-  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch {}
+  config = readJsonObjectForWrite(configPath)
   config.model = model
   atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
 }
@@ -182,8 +243,32 @@ export function readAgentDisplayName(name: string): string {
 export function writeAgentDisplayName(name: string, displayName: string): void {
   const configPath = join(agentDir(name), 'agent-config.json')
   let config: Record<string, unknown> = {}
-  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch {}
+  config = readJsonObjectForWrite(configPath)
   config.displayName = displayName
+  atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
+}
+
+// A short, owner-written role line ("P+R", "JIRA ügyintéző") shown under the
+// agent's name in the team graph. The CLAUDE.md description is a full sentence
+// and does not fit a graph node; the role label (leader/member) says where the
+// agent sits, not what it does.
+export const AGENT_TAGLINE_MAX = 60
+
+export function readAgentTagline(name: string): string {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  try {
+    const config = JSON.parse(readFileOr(configPath, '{}'))
+    if (typeof config.tagline === 'string') return config.tagline.trim().slice(0, AGENT_TAGLINE_MAX)
+  } catch { /* fall through */ }
+  return ''
+}
+
+export function writeAgentTagline(name: string, tagline: string): void {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  const config = readJsonObjectForWrite(configPath)
+  const clean = tagline.trim().slice(0, AGENT_TAGLINE_MAX)
+  if (clean) config.tagline = clean
+  else delete config.tagline
   atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
 }
 
@@ -198,85 +283,17 @@ export function readAgentSecurityProfile(name: string): string {
   return 'default'
 }
 
+// expandAndValidateConfigDir and its rules live in ../config-dir-path.ts
+// (dependency-free, shared with the settings registry); re-exported here for
+// the existing callers.
+export { expandAndValidateConfigDir } from '../config-dir-path.js'
+
 // Pure-logic resolver for the optional per-agent claudeConfigDir field.
 // Takes the raw agent-config.json text (or `{}` when no file exists) plus an
 // explicit home-dir, and returns the absolute path to use as
 // CLAUDE_CONFIG_DIR, or null when the field is missing/blank/non-string or
 // the JSON is unparseable. Tilde forms are expanded against the supplied
 // homeDir. Kept dependency-free so it can be unit-tested without the fs.
-//
-// Allowed character set for the path: alphanumerics, dot, slash, hyphen,
-// underscore, tilde. Anything else is rejected.
-//
-// This is a whitelist rather than a blacklist for a reason. The launcher
-// inlines the path into a tmux command via nested template literals, which
-// produces a shell string with both an outer and an inner double-quoted
-// region. Bash treats the inner `"` as a quote delimiter, not a literal,
-// so the path actually lands partly inside and partly outside double-quote
-// context. Inside double quotes most metachars are tame; outside, almost
-// anything (parens, single quote, spaces, semicolons, &, |) is shell-
-// significant. Enumerating "safe outside double quotes" by blacklist is a
-// trap -- a whitelist of characters that survive both layers is far
-// shorter to write and more robust to future changes in the launcher.
-//
-// Local config is only writable by the host operator, so this is defense-
-// in-depth rather than a hard security boundary, but it cheaply removes
-// the trivial way to break the launcher with a config typo.
-//
-// Path values containing `..` segments are also rejected. Without this
-// guard `path.join` would silently collapse them ("~/../../../etc/passwd"
-// resolves to "/etc/passwd"), which is almost never what the operator
-// meant. Absolute paths without `..` remain accepted, so legitimate non-
-// home locations like "/var/lib/claude-coding" still work.
-const CLAUDE_CONFIG_DIR_ALLOWED = /^[A-Za-z0-9_./~-]+$/
-
-// Only `..` segments are rejected, not `.` (current dir) or empty segments
-// from doubled slashes (`//`). Both of those are no-ops -- the OS and
-// `path.join` normalize them away without changing where the path points.
-// `..` is the only segment that meaningfully alters the destination, so
-// it's the only one we treat as suspicious.
-function hasParentTraversal(raw: string): boolean {
-  return raw.split('/').some(segment => segment === '..')
-}
-
-// Expand + validate a raw config-dir string (already extracted from wherever
-// it was stored) against the launcher's shell-safety rules. Shared by the
-// per-agent `claudeConfigDir` resolver and the named-plan registry
-// (claude-plans.ts) so both feed the tmux launcher through the exact same
-// whitelist/traversal/tilde gauntlet -- there is only one place that decides
-// what is safe to inline into the launch command. Returns the absolute path,
-// or null when the value is blank/malformed/unsafe.
-export function expandAndValidateConfigDir(
-  rawValue: string,
-  homeDir: string,
-): string | null {
-  const raw = rawValue.trim()
-  if (!raw) return null
-  if (!CLAUDE_CONFIG_DIR_ALLOWED.test(raw)) return null
-  if (hasParentTraversal(raw)) return null
-  // Tilde may appear at most once, and only as the bare `~` or as the
-  // leading `~/` of a `~/...` form. `~user`, mid-string `~`, double tildes
-  // -- all rejected because the runtime shell would re-expand them at
-  // assignment time even though our resolver does not, and we do not want
-  // the launcher to silently route an agent to a different user's home
-  // directory or to a path the operator did not write.
-  if (raw.includes('~')) {
-    const tildeCount = raw.split('~').length - 1
-    const validForm = raw === '~' || raw.startsWith('~/')
-    if (!validForm || tildeCount > 1) return null
-  }
-  let resolved: string
-  if (raw === '~') resolved = homeDir
-  else if (raw.startsWith('~/')) resolved = join(homeDir, raw.slice(2))
-  else resolved = raw
-  // Re-validate after expansion: if `homeDir` itself contains a character
-  // outside the whitelist (e.g. a space in a multi-word account name), the
-  // resolved path would land in unquoted shell context and break the
-  // launcher cmd. Reject rather than ship a broken export.
-  if (!CLAUDE_CONFIG_DIR_ALLOWED.test(resolved)) return null
-  return resolved
-}
-
 export function resolveClaudeConfigDir(
   rawConfigJson: string,
   homeDir: string,
@@ -355,6 +372,35 @@ export function readAgentRemoteHost(name: string): string | null {
   return readAgentRemoteConfig(name).host
 }
 
+// A POSIX-ish account name. Deliberately narrow: this value is passed to
+// `sudo -u`, so anything outside [a-z0-9_-] (and a leading letter/underscore)
+// is rejected rather than escaped. 32 chars is the useradd limit.
+const RUN_AS_USER_ALLOWED = /^[a-z_][a-z0-9_-]{0,31}$/
+
+// Pure resolver: which OS user this agent's tmux server belongs to, or null when
+// the agent shares the router's own user (today's default for every agent).
+//
+// Why this exists: tmux refuses a cross-user connection even when the socket
+// permissions allow it (measured 2026-08-19: "access not allowed"), so reaching
+// an agent that runs under its own uid means running tmux AS that user. The
+// value is only ever used with `sudo -n -u <user> tmux ...`, backed by a
+// per-agent sudoers rule that grants that one binary and nothing else.
+export function resolveRunAsUser(rawConfigJson: string): string | null {
+  let config: unknown
+  try { config = JSON.parse(rawConfigJson) } catch { return null }
+  if (!config || typeof config !== 'object') return null
+  const raw = (config as Record<string, unknown>).runAsUser
+  if (typeof raw !== 'string') return null
+  const user = raw.trim()
+  if (!user || !RUN_AS_USER_ALLOWED.test(user)) return null
+  return user
+}
+
+export function readAgentRunAsUser(name: string): string | null {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  return resolveRunAsUser(readFileOr(configPath, '{}'))
+}
+
 // Validate-and-persist the remote config. Empty strings clear the fields
 // (revert the agent to local). Returns the resolved config on success, or an
 // error string when a non-empty value fails validation.
@@ -367,7 +413,7 @@ export function writeAgentRemoteConfig(
   const w = workdir.trim()
   const configPath = join(agentDir(name), 'agent-config.json')
   let config: Record<string, unknown> = {}
-  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch {}
+  config = readJsonObjectForWrite(configPath)
 
   // Clearing: both empty -> remove the fields, agent becomes local.
   if (!h && !w) {
@@ -408,8 +454,53 @@ export function readAgentChannelProvider(name: string): string | null {
 export function writeAgentChannelProvider(name: string, provider: string): void {
   const configPath = join(agentDir(name), 'agent-config.json')
   let config: Record<string, unknown> = {}
-  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch {}
+  config = readJsonObjectForWrite(configPath)
   config.channelProvider = provider
+  atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
+}
+
+// Per-agent CO-LISTEN channels (AGENTEXTRACH1006): providers an agent serves IN
+// ADDITION to its channelProvider, e.g. a Telegram agent that also answers on
+// Slack. The sub-agent counterpart of the main agent's CHANNEL_PLUGINS_EXTRA.
+// Absent field -> [] -> the launch is byte-identical to before. Unknown values
+// and the primary provider itself are dropped (see parseExtraChannels).
+export function readAgentExtraChannels(name: string): ChannelProviderType[] {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  try {
+    const config = JSON.parse(readFileOr(configPath, '{}')) as Record<string, unknown>
+    const primary = typeof config.channelProvider === 'string' ? config.channelProvider.trim() || null : null
+    return parseExtraChannels(config.extraChannels, primary)
+  } catch {
+    return []
+  }
+}
+
+// GROMZOAGENTS1028: whether the agent also listens on Gromzo (agent-config `gromzo: true`).
+export function readAgentGromzo(name: string): boolean {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  try {
+    return wantsGromzo((JSON.parse(readFileOr(configPath, '{}')) as Record<string, unknown>).gromzo)
+  } catch {
+    return false
+  }
+}
+
+// GROMZOAGENTPICK1101: the dashboard's switch writes the same flag readAgentGromzo reads.
+export function writeAgentGromzo(name: string, on: boolean): void {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  const config = readJsonObjectForWrite(configPath)
+  if (on) config.gromzo = true
+  else delete config.gromzo
+  atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
+}
+
+export function writeAgentExtraChannels(name: string, extras: readonly string[]): void {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  const config = readJsonObjectForWrite(configPath)
+  const primary = typeof config.channelProvider === 'string' ? config.channelProvider.trim() || null : null
+  const clean = parseExtraChannels(extras, primary)
+  if (clean.length > 0) config.extraChannels = clean
+  else delete config.extraChannels
   atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
 }
 
@@ -447,9 +538,144 @@ export function readAgentMemoryIsolation(name: string): boolean {
 export function writeAgentMemoryIsolation(name: string, enabled: boolean): void {
   const configPath = join(agentDir(name), 'agent-config.json')
   let config: Record<string, unknown> = {}
-  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch {}
+  config = readJsonObjectForWrite(configPath)
   if (enabled) config.memoryIsolation = true
   else delete config.memoryIsolation
+  atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
+}
+
+// Opt-in per-agent agent-state-observer mod (default OFF, MODSTERMEK1005).
+// When true the launcher loads plugins/agent-state-observer for this agent's
+// session (see state-observer.ts for the version gate and what it writes).
+export function readAgentStateObserver(name: string): boolean {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  try {
+    const config = JSON.parse(readFileOr(configPath, '{}'))
+    return config.stateObserver === true
+  } catch { /* fall through */ }
+  return false
+}
+
+// ---- per-agent sender-role gate (hook wiring) --------------------------------
+//
+// The gate itself is scripts/hooks/sender-role-gate.py, a PreToolUse hook that
+// denies the configured risky tools whenever the current turn carries a chat
+// envelope from a sender who is not an owner. These decide whether
+// the launcher WIRES that hook for the agent: the key must be present and not
+// be the explicit "off" shape (riskyTools missing or empty, and no allowTools). A malformed
+// value (string, null, array, non-array riskyTools) deliberately returns
+// TRUE -- the hook gets wired and fails closed on its side -- while an
+// unparseable file returns false, matching how the rest of the launcher
+// already treats a broken agent-config.json.
+
+// PURE: takes the parsed agent-config.json value, no I/O.
+export function senderRoleGateEnabled(config: unknown): boolean {
+  if (!config || typeof config !== 'object' || Array.isArray(config)) return false
+  const cfg = config as Record<string, unknown>
+  if (!Object.hasOwn(cfg, 'senderRoleGate')) return false
+  const gate = cfg.senderRoleGate
+  if (!gate || typeof gate !== 'object' || Array.isArray(gate)) return true
+  // allowTools present (any value) is a decision for the gate: wired, and the hook judges its shape.
+  if (Object.hasOwn(gate, 'allowTools')) return true
+  const risky = (gate as Record<string, unknown>).riskyTools
+  if (risky === undefined) return false
+  if (Array.isArray(risky) && risky.length === 0) return false
+  return true
+}
+
+// The hook's --policy argument: base64url (no padding) of the senderRoleGate value, or null when the gate
+// is off. The launcher copies the table into the generated settings.json at the agent's start, so an edit
+// the agent makes to its own agent-config.json during the session does not change the running gate.
+// base64url keeps the argument inside the hook-argument charset ([A-Za-z0-9_-]).
+export function senderRoleGatePolicyArg(config: unknown): string | null {
+  if (!senderRoleGateEnabled(config)) return null
+  const value = (config as Record<string, unknown>).senderRoleGate
+  return Buffer.from(JSON.stringify(value), 'utf-8').toString('base64url')
+}
+
+/**
+ * The gate's --policy for an agent, from the store only (GROMZOGATECONF1030 (c), Samu 59516): the agent's own
+ * agent-config.json is no source any more (the agent can write it). An unreadable store fails closed: the gate is
+ * wired with a policy the hook reads as malformed (every tool denied in a non-owner's turn).
+ */
+export function readAgentSenderRoleGatePolicy(name: string, gatesPath: string = senderRoleGatesPath()): string | null {
+  const store = readSenderRoleGates(gatesPath)
+  return store.ok ? senderRoleGatePolicyArg(storedGateConfig(store, name)) : UNREADABLE_GATES_POLICY
+}
+
+/** Whether the agent's own agent-config.json still carries a senderRoleGate, which is ignored now (the launcher logs it). */
+export function agentConfigCarriesSenderRoleGate(name: string): boolean {
+  try {
+    const cfg: unknown = JSON.parse(readFileOr(join(agentDir(name), 'agent-config.json'), '{}'))
+    return !!cfg && typeof cfg === 'object' && !Array.isArray(cfg) && Object.hasOwn(cfg, 'senderRoleGate')
+  } catch {
+    return false
+  }
+}
+
+// Opt-in per-agent worksource channel (default OFF). When true the router hands
+// inter-agent messages to this agent by writing a file into its worksource
+// queue instead of typing them into its tmux pane, and the launcher loads the
+// worksource channel plugin for it.
+//
+// DELIBERATELY ITS OWN FLAG, not folded into `channelProvider` or `hasChannel`.
+// `hasChannel` is derived from the presence of a chat-provider TOKEN FILE
+// (agent-process.ts), and it gates the plugin watchdog, the /mcp unlock driver
+// and `--continue` suppression. An agent whose only channel is worksource has
+// no bot poller for the watchdog to find, so reusing `hasChannel` would make it
+// read "plugin down" forever and enter its restart ladder -- a restart loop
+// caused purely by wiring. Keeping this orthogonal is what lets a worksource
+// agent stay invisible to every chat-channel monitor.
+export function readAgentWorksourceChannel(name: string): boolean {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  try {
+    const config = JSON.parse(readFileOr(configPath, '{}'))
+    return config.worksourceChannel === true
+  } catch { /* fall through */ }
+  return false
+}
+
+// Opt-in PULL delivery: the agent runs on its OWN machine and fetches its
+// messages over the HTTP API with a scoped token, so this install never sees a
+// tmux session for it. That is not a worksource agent: worksource writes items
+// into a local queue DIRECTORY and proves itself with a live pane, neither of
+// which exists here. The distinction matters because every tmux-shaped gate in
+// the router ("session absent", "session busy", "session stuck") is a statement
+// about a KEYBOARD this install does not own, and the abandon gate is the
+// destructive one: it flips the row to `failed`, which REMOVES it from the
+// `status=pending` inbox the agent polls. Measured 2026-09-20 on this install:
+// messages 293, 294, 300, 307 and 308 to a remote pull agent were all failed
+// this way after the 60-minute window, and the recipient could not see them at
+// all -- the owner had to nudge him over a chat channel each time. For a pull
+// agent the row simply stays pending until HE closes it.
+export function readAgentPullDelivery(name: string): boolean {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  try {
+    const config = JSON.parse(readFileOr(configPath, '{}'))
+    return config.pullDelivery === true
+  } catch { /* fall through */ }
+  return false
+}
+
+// Persist the opt-in pullDelivery flag. `false` removes the key so the config
+// file stays minimal and the default-OFF semantics remain explicit.
+export function writeAgentPullDelivery(name: string, enabled: boolean): void {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  let config: Record<string, unknown> = {}
+  config = readJsonObjectForWrite(configPath)
+  if (enabled) config.pullDelivery = true
+  else delete config.pullDelivery
+  atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
+}
+
+// Persist the opt-in worksourceChannel flag. `false` removes the key so the
+// config file stays minimal and the default-OFF semantics remain explicit.
+export function writeAgentWorksourceChannel(name: string, enabled: boolean): void {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  let config: Record<string, unknown> = {}
+  config = readJsonObjectForWrite(configPath)
+  if (enabled) config.worksourceChannel = true
+  else delete config.worksourceChannel
   atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
 }
 
@@ -457,7 +683,7 @@ export function writeAgentAuthMode(name: string, mode: AuthMode): void {
   if (!VALID_AUTH_MODES.has(mode)) return
   const configPath = join(agentDir(name), 'agent-config.json')
   let config: Record<string, unknown> = {}
-  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch {}
+  config = readJsonObjectForWrite(configPath)
   config.authMode = mode
   atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
 }
@@ -465,7 +691,7 @@ export function writeAgentAuthMode(name: string, mode: AuthMode): void {
 export function writeAgentSecurityProfile(name: string, profileId: string): void {
   const configPath = join(agentDir(name), 'agent-config.json')
   let config: Record<string, unknown> = {}
-  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch {}
+  config = readJsonObjectForWrite(configPath)
   config.securityProfile = profileId
   atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
 }
@@ -493,7 +719,7 @@ export function readAgentClaudePlan(name: string): string | null {
 export function writeAgentClaudePlan(name: string, planId: string): void {
   const configPath = join(agentDir(name), 'agent-config.json')
   let config: Record<string, unknown> = {}
-  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch {}
+  config = readJsonObjectForWrite(configPath)
   const trimmed = planId.trim()
   if (trimmed) config.claudePlan = trimmed
   else delete config.claudePlan
@@ -509,6 +735,15 @@ export function writeAgentClaudePlan(name: string, planId: string): void {
 // heartbeat sub-agent (Szabi 2026-06-02: "ez a technikai agent meg se
 // jelenjen a dashboardon").
 export const HIDDEN_AGENT_SENTINEL = '.hidden-from-dashboard'
+
+// ROSTERALIAS1026: statSync() FOLLOWS symlinks, so agents/alias -> agents/alpha
+// put ONE directory on the roster under TWO names -- the dashboard list,
+// supervision, the boot hook-seeding loop and the fleet export all saw a
+// phantom agent 'alias' that was really 'alpha'. A symlink whose target is
+// inside agents/ itself is an alias, not an agent, and is dropped; a link to a
+// directory OUTSIDE agents/ (an agent moved to another disk and linked back)
+// stays allowed.
+const warnedRosterAliases = new Set<string>()
 
 /**
  * EVERY agent directory, hidden technical workers included.
@@ -529,8 +764,36 @@ export const HIDDEN_AGENT_SENTINEL = '.hidden-from-dashboard'
  */
 export function listAllAgentNames(): string[] {
   if (!existsSync(AGENTS_BASE_DIR)) return []
+  // The main agent has no agents/<id> directory: it runs in the channels
+  // session. A directory of that name (old drafts left in agents/marveen) is
+  // not a sub-agent, and listing it gave the team graph a second, stopped
+  // 'marveen' node that replaced the main one (MAINGHOST1024).
+  let baseReal: string
+  try { baseReal = realpathSync(AGENTS_BASE_DIR) } catch { baseReal = resolve(AGENTS_BASE_DIR) }
   return readdirSync(AGENTS_BASE_DIR).filter((f) => {
-    try { return statSync(join(AGENTS_BASE_DIR, f)).isDirectory() } catch { return false }
+    if (f === MAIN_AGENT_ID) return false
+    const path = join(AGENTS_BASE_DIR, f)
+    try {
+      const st = lstatSync(path)
+      // Real directory, not through a link: listed exactly as before.
+      if (!st.isSymbolicLink()) return st.isDirectory()
+      const target = realpathSync(path)
+      // A symlink into agents/ itself (another roster directory, or something
+      // inside one) is the same agent under a second name, not a new agent.
+      if (target === baseReal || target.startsWith(baseReal + sep)) {
+        // This runs on every timer tick of many passes: warn once per entry.
+        if (!warnedRosterAliases.has(f)) {
+          warnedRosterAliases.add(f)
+          logger.warn({ entry: f, target }, 'agents/ entry is a symlink into agents/ itself -- not listed as an agent (ROSTERALIAS1026)')
+        }
+        return false
+      }
+      // Target outside agents/ (e.g. an agent directory moved to another disk
+      // and linked back): keep only if it really is a directory.
+      return statSync(path).isDirectory()
+    } catch {
+      return false
+    }
   })
 }
 
@@ -550,6 +813,10 @@ export type VoiceResponseMode = 'text' | 'voice' | 'auto'
 export interface AgentVoiceConfig {
   responseMode: VoiceResponseMode
   voiceModel: string
+  // Router-side STT for inbound voice notes when responseMode is 'text'.
+  // Undefined = follow the install-wide VOICE_TRANSCRIBE_INBOUND default (off
+  // unless configured). Irrelevant for 'voice'/'auto', which always transcribe.
+  transcribeInbound?: boolean
 }
 
 // Canonical set of bundled voice model identifiers (basename without .onnx).
@@ -578,6 +845,9 @@ export function readAgentVoiceConfig(name: string): AgentVoiceConfig {
       voiceModel: KNOWN_VOICE_MODELS.has(vc.voiceModel ?? '')
         ? (vc.voiceModel as string)
         : DEFAULT_VOICE_CONFIG.voiceModel,
+      // Only a real boolean counts; anything else (a string "true", a number)
+      // is treated as unset rather than guessed at.
+      ...(typeof vc.transcribeInbound === 'boolean' ? { transcribeInbound: vc.transcribeInbound } : {}),
     }
   } catch {
     return { ...DEFAULT_VOICE_CONFIG }
@@ -591,13 +861,18 @@ export function writeAgentVoiceConfig(name: string, patch: Partial<AgentVoiceCon
   if (patch.voiceModel !== undefined && !KNOWN_VOICE_MODELS.has(patch.voiceModel)) {
     throw new Error(`Unknown voiceModel: ${patch.voiceModel}`)
   }
+  if (patch.transcribeInbound !== undefined && typeof patch.transcribeInbound !== 'boolean') {
+    throw new Error(`Invalid transcribeInbound: ${String(patch.transcribeInbound)}`)
+  }
   const configPath = join(agentConfigRoot(name), 'agent-config.json')
   let config: Record<string, unknown> = {}
-  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch {}
+  config = readJsonObjectForWrite(configPath)
   const current = readAgentVoiceConfig(name)
+  const transcribeInbound = patch.transcribeInbound ?? current.transcribeInbound
   config.voice = {
     responseMode: patch.responseMode ?? current.responseMode,
     voiceModel: patch.voiceModel ?? current.voiceModel,
+    ...(transcribeInbound !== undefined ? { transcribeInbound } : {}),
   }
   atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
 }
@@ -652,10 +927,135 @@ export function readAgentCapabilities(name: string): string[] {
   return parsePersonaCapabilities(name)
 }
 
+// ---- per-agent tool-name deny --------------------------------------------
+//
+// ORSIKTXRATA914 / 2026-09-14 (Iris measured, Dani confirmed): a whole-tool-name
+// deny in the agent's .claude/settings.json (e.g. "Artifact") does not only
+// block the tool, it REMOVES the tool schema from the prompt -- on Orsi that
+// was 56% of a 64.7k-token base load. But writeAgentSettingsFromProfile()
+// replaces permissions.deny WHOLESALE from the security profile on every
+// spawn, so a hand-edited deny silently reverts at the next respawn (Orsi
+// respawns 2-3x a day). Same class as PROFILREGRESS908: settings.json is a
+// DERIVED file here, not a durable one.
+//
+// The durable per-agent home is agent-config.json "toolDeny" -- the same
+// place "capabilities" lives -- which the scaffold merges into the deny list
+// on every spawn. Putting the names into the shared profile template instead
+// would hit every agent on that profile (and every customer install): a
+// per-agent experiment belongs in per-agent config.
+//
+// Only bare tool names are accepted (Claude Code rule shape "ToolName" or
+// "mcp__server__tool"), never a "Tool(pattern)" rule: this field can only
+// ever WIDEN the deny list, and a name-shaped whitelist keeps a mistyped or
+// injected value from becoming a pattern rule with surprising reach.
+const TOOL_DENY_NAME_RE = /^[A-Za-z][A-Za-z0-9_]{0,127}$/
+export const TOOL_DENY_MAX_PER_AGENT = 64
+
+export function sanitizeToolDenyList(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return []
+  const out: string[] = []
+  for (const v of raw) {
+    if (typeof v !== 'string') continue
+    const t = v.trim()
+    if (!TOOL_DENY_NAME_RE.test(t) || out.includes(t)) continue
+    out.push(t)
+    if (out.length >= TOOL_DENY_MAX_PER_AGENT) break
+  }
+  return out
+}
+
+export function readAgentToolDeny(name: string): string[] {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  try {
+    const config = JSON.parse(readFileOr(configPath, '{}'))
+    return sanitizeToolDenyList(config.toolDeny)
+  } catch {
+    return []
+  }
+}
+
+// ---- per-agent sudo opt-out ------------------------------------------------
+//
+// The fleet deny floor (FLEET_BASELINE_DENY) denies sudo to every sub-agent,
+// and it is rebuilt on every spawn, so a sudo grant written straight into
+// settings.json is gone at the next respawn. An agent whose job IS host
+// administration needs a durable way out.
+//
+// The grant LOOSENS a deny, so its source must not be writable by the agent it
+// frees. That rules out two obvious homes:
+//   - agents/<name>/agent-config.json: inside the agent's own cwd, so its own
+//     Write/Edit tools reach it (toolDeny lives there safely only because it can
+//     only TIGHTEN). An "allowSudo" field there is deliberately not read.
+//   - a SETTINGS_REGISTRY key: POST /api/settings writes it with the fleet's one
+//     shared Bearer token, which every sub-agent holds.
+// So it is the install's .env, key SUDO_AGENTS, read directly and NOT in the
+// registry (the settings route answers an unknown key with 404). It lists agent
+// names, separated by commas or whitespace; an entry that is not a valid agent
+// name is ignored, and an absent or empty key grants nothing.
+//
+// What this does NOT claim: .env sits outside every sub-agent's cwd, but on a
+// single-user host a permissive agent's Bash can still write it. Closing that
+// takes a per-agent OS user, not a deny rule.
+const SUDO_AGENT_NAME_RE = /^[a-z0-9-]{1,50}$/
+
+export function parseSudoAgents(raw: unknown): string[] {
+  if (typeof raw !== 'string') return []
+  const out: string[] = []
+  for (const part of raw.split(/[\s,]+/)) {
+    if (SUDO_AGENT_NAME_RE.test(part) && !out.includes(part)) out.push(part)
+  }
+  return out
+}
+
+export function agentMaySudo(name: string): boolean {
+  if (name === MAIN_AGENT_ID) return false
+  try {
+    return parseSudoAgents(readEnvFile(['SUDO_AGENTS']).SUDO_AGENTS).includes(name)
+  } catch {
+    return false
+  }
+}
+
+// .env ROOT_CLAUDEMD_EXCLUDE_AGENTS: sub-agents that stop loading the install root's CLAUDE.md (the main agent's
+// persona, an ancestor of agents/<name>). Dropping it drops fleet rules too, so it comes from the same place and with
+// the same parsing as SUDO_AGENTS above, never from the agent's own agent-config.json. The main agent never qualifies.
+// A '*' entry means every sub-agent, including ones created later (it is not a valid agent name, so no clash).
+export function agentExcludesRootClaudeMd(name: string): boolean {
+  if (name === MAIN_AGENT_ID) return false
+  try {
+    const raw = readEnvFile(['ROOT_CLAUDEMD_EXCLUDE_AGENTS']).ROOT_CLAUDEMD_EXCLUDE_AGENTS
+    if (typeof raw === 'string' && raw.split(/[\s,]+/).includes('*')) return true
+    return parseSudoAgents(raw).includes(name)
+  } catch {
+    return false
+  }
+}
+
 export function writeAgentCapabilities(name: string, capabilities: string[]): void {
   const configPath = join(agentDir(name), 'agent-config.json')
   let config: Record<string, unknown> = {}
-  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch {}
+  config = readJsonObjectForWrite(configPath)
   config.capabilities = capabilities
+  atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
+}
+
+// ---- per-agent custom provider ---------------------------------------------
+
+export function readAgentCustomProvider(name: string): string | null {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  try {
+    const config = JSON.parse(readFileOr(configPath, '{}'))
+    const value = config.customProvider
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  } catch { /* fall through */ }
+  return null
+}
+
+export function writeAgentCustomProvider(name: string, id: string | null): void {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  let config: Record<string, unknown> = {}
+  config = readJsonObjectForWrite(configPath)
+  if (id && id.trim()) config.customProvider = id.trim()
+  else delete config.customProvider
   atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
 }

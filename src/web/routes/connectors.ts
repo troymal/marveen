@@ -1,7 +1,8 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join, basename } from 'node:path'
 import { homedir } from 'node:os'
-import { execSync } from 'node:child_process'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import { PROJECT_ROOT, OLLAMA_URL } from '../../config.js'
 import { logger } from '../../logger.js'
 import {
@@ -10,17 +11,49 @@ import {
   type McpListEntry,
 } from '../../mcp-list-parser.js'
 import { atomicWriteFileSync } from '../atomic-write.js'
-import { readFileOr, AGENTS_BASE_DIR, listAgentNames } from '../agent-config.js'
+import { readFileOr, AGENTS_BASE_DIR, listAgentNames , readJsonObjectForWrite } from '../agent-config.js'
 import { getMcpListCache, refreshMcpListCache, purgeFromMcpListCache } from '../mcp-list.js'
 import { readBody, json } from '../http-helpers.js'
-import { shellEscape } from '../sanitize.js'
-import { getExternalProjectPaths, addExternalProjectPath, removeExternalProjectPath, getGitHubRepos, installGitHubRepo, removeGitHubRepo, updateGitHubRepo, detectRequiredEnvVars } from '../dashboard-settings.js'
-import { listSecrets, setSecret, getSecret, deleteSecret } from '../vault.js'
+import { mayActAsOwner, refuseOwner } from './auth.js'
+import { getExternalProjectPaths, addExternalProjectPath, removeExternalProjectPath, getGitHubRepos, installGitHubRepo, removeGitHubRepo, updateGitHubRepo, detectRequiredEnvVars, parseRunScriptsFlag } from '../dashboard-settings.js'
+import { listSecrets, setSecret, getSecret, deleteSecret, updateSecretLabel, normalizeVaultLabel, VAULT_LABEL_MAX_LENGTH } from '../vault.js'
+import { logVaultRead, isSshPrivateKeyId, principalOf, readVaultAcl, vaultReadRefused, vaultAclMode } from '../vault-acl.js'
 import {
   getBindings, addBinding, removeBinding, removeBindingsForSecret,
   syncSecret, syncAllBindings, scanMcpConfigs, unsyncBinding,
 } from '../vault-bindings.js'
 import type { RouteContext } from './types.js'
+
+const execFileAsync = promisify(execFile)
+
+// `claude mcp add` / `claude mcp remove` as an argv (no shell) and off the event
+// loop: the synchronous shell form froze the whole dashboard for as long as the
+// CLI took (timeouts of 15-30 s). stdin is closed at once, as the sync call did.
+async function execClaudeMcp(args: string[], timeout: number): Promise<void> {
+  // The shell form threw on a non-string value (its quoting helper calls .replace on
+  // it); execFile would stringify it and run the CLI. Keep the refusal.
+  if (args.some((a) => typeof a !== 'string')) throw new TypeError('claude mcp: every argument must be a string')
+  const pending = execFileAsync('claude', args, { timeout, encoding: 'utf-8' })
+  pending.child.stdin?.end()
+  await pending
+}
+
+// The CLI operations still run one at a time, as the synchronous form did: each
+// one rewrites the same CLI config file, and two overlapping requests (a double
+// click on "install", an uninstall racing an add of the same name) must not
+// interleave. A multi-call operation (the uninstall's user-then-project
+// fallback) holds the slot for all of its calls.
+let claudeMcpQueue: Promise<unknown> = Promise.resolve()
+
+function serializeClaudeMcp<T>(op: () => Promise<T>): Promise<T> {
+  const run = claudeMcpQueue.then(op)
+  claudeMcpQueue = run.catch(() => {})
+  return run
+}
+
+function runClaudeMcp(args: string[], timeout: number): Promise<void> {
+  return serializeClaudeMcp(() => execClaudeMcp(args, timeout))
+}
 
 // The catalog is the union of the committed mcp-catalog.json (the MCPs the
 // central devs ship) and an optional, gitignored mcp-catalog.local.json where
@@ -267,6 +300,11 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
   }
 
   if (path === '/api/connectors/external-paths' && method === 'POST') {
+    // OWNERGATE2-1104: adds a project directory whose .mcp.json servers the dashboard then lists and offers to assign to agents; owner-only.
+    if (!mayActAsOwner(ctx.auth, req)) {
+      refuseOwner(res, 'Adding an external project path needs the dashboard login (an owner session).')
+      return true
+    }
     const body = await readBody(req)
     const { path: p } = JSON.parse(body.toString()) as { path: string }
     const result = addExternalProjectPath(p)
@@ -276,6 +314,11 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
   }
 
   if (path === '/api/connectors/external-paths' && method === 'DELETE') {
+    // OWNERGATE2-1104: removes an external project path (symmetric with the POST); owner-only.
+    if (!mayActAsOwner(ctx.auth, req)) {
+      refuseOwner(res, 'Removing an external project path needs the dashboard login (an owner session).')
+      return true
+    }
     const body = await readBody(req)
     const { path: p } = JSON.parse(body.toString()) as { path: string }
     const paths = removeExternalProjectPath(p)
@@ -289,9 +332,16 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
   }
 
   if (path === '/api/connectors/github-repos' && method === 'POST') {
+    // OWNERGATE2-1104: clones a GitHub repo onto the host and runs npm install in it (with runScripts, its lifecycle scripts: code execution), and vaults the env values sent with it; owner-only.
+    if (!mayActAsOwner(ctx.auth, req)) {
+      refuseOwner(res, 'Installing a GitHub repo needs the dashboard login (an owner session).')
+      return true
+    }
     const body = await readBody(req)
-    const { url, env } = JSON.parse(body.toString()) as { url: string, env?: Record<string, string> }
+    const { url, env, runScripts } = JSON.parse(body.toString()) as { url: string, env?: Record<string, string>, runScripts?: unknown }
     if (!url?.trim()) { json(res, { error: 'URL is required' }, 400); return true }
+    const runScriptsFlag = parseRunScriptsFlag(runScripts)
+    if (runScriptsFlag.error) { json(res, { error: runScriptsFlag.error }, 400); return true }
 
     const envVarMapping: Record<string, string> = {}
     if (env) {
@@ -302,14 +352,24 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
       }
     }
 
-    const result = await installGitHubRepo(url.trim(), Object.keys(envVarMapping).length > 0 ? envVarMapping : undefined)
+    const result = await installGitHubRepo(
+      url.trim(),
+      Object.keys(envVarMapping).length > 0 ? envVarMapping : undefined,
+      undefined,
+      { runScripts: runScriptsFlag.value === true },
+    )
     if (result.error) { json(res, { error: result.error }, 400); return true }
-    json(res, { ok: true, repo: result.repo, requiredEnvVars: result.requiredEnvVars })
+    json(res, { ok: true, repo: result.repo, requiredEnvVars: result.requiredEnvVars, installWarning: result.installWarning, scriptsSkipped: result.scriptsSkipped })
     return true
   }
 
   const githubRepoMatch = path.match(/^\/api\/connectors\/github-repos\/([^/]+)$/)
   if (githubRepoMatch && method === 'DELETE') {
+    // OWNERGATE2-1104: deletes an installed GitHub repo's directory and entry; owner-only.
+    if (!mayActAsOwner(ctx.auth, req)) {
+      refuseOwner(res, 'Removing a GitHub repo needs the dashboard login (an owner session).')
+      return true
+    }
     const name = decodeURIComponent(githubRepoMatch[1])
     const result = removeGitHubRepo(name)
     if (result.error) { json(res, { error: result.error }, 404); return true }
@@ -318,10 +378,23 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
   }
 
   if (githubRepoMatch && method === 'PATCH') {
+    // OWNERGATE2-1104: git pull plus npm install in the repo, and flips runScripts (lifecycle scripts: code execution); owner-only, like the POST.
+    if (!mayActAsOwner(ctx.auth, req)) {
+      refuseOwner(res, 'Updating a GitHub repo needs the dashboard login (an owner session).')
+      return true
+    }
     const name = decodeURIComponent(githubRepoMatch[1])
-    const result = updateGitHubRepo(name)
+    // The body is optional (older clients send none); only `runScripts` is read.
+    const raw = (await readBody(req)).toString().trim()
+    let parsedBody: { runScripts?: unknown } = {}
+    if (raw) {
+      try { parsedBody = JSON.parse(raw) ?? {} } catch { json(res, { error: 'Invalid JSON' }, 400); return true }
+    }
+    const runScriptsFlag = parseRunScriptsFlag(parsedBody.runScripts)
+    if (runScriptsFlag.error) { json(res, { error: runScriptsFlag.error }, 400); return true }
+    const result = updateGitHubRepo(name, runScriptsFlag.value === undefined ? {} : { runScripts: runScriptsFlag.value })
     if (result.error) { json(res, { error: result.error }, 400); return true }
-    json(res, { ok: true })
+    json(res, { ok: true, scriptsSkipped: result.scriptsSkipped })
     return true
   }
 
@@ -390,6 +463,12 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
   }
 
   if (path === '/api/connectors' && method === 'POST') {
+    // OWNERGATE2-1104: runs `claude mcp add` (user or project scope) with a caller-given stdio command, i.e. a
+    // command every agent on that scope will launch; owner-only, before the body is read and before any spawn.
+    if (!mayActAsOwner(ctx.auth, req)) {
+      refuseOwner(res, 'Adding a connector needs the dashboard login (an owner session).')
+      return true
+    }
     const body = await readBody(req)
     const data = JSON.parse(body.toString()) as {
       name: string
@@ -412,7 +491,7 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
     const nameChanged = sanitizedName !== rawName
 
     try {
-      const scopeFlag = data.scope === 'project' ? '-s project' : '-s user'
+      const scope = data.scope === 'project' ? 'project' : 'user'
 
       const catalogEntry: any = {
         id: sanitizedName,
@@ -425,7 +504,7 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
 
       if ((data.type === 'http' || data.type === 'sse') && data.url) {
         const transport = data.type === 'sse' ? 'sse' : 'http'
-        execSync(`claude mcp add --transport ${transport} ${scopeFlag} ${shellEscape(sanitizedName)} ${shellEscape(data.url)} 2>&1`, { timeout: 15000, encoding: 'utf-8' })
+        await runClaudeMcp(['mcp', 'add', '--transport', transport, '-s', scope, sanitizedName, data.url], 15000)
         catalogEntry.type = 'remote'
         catalogEntry.url = data.url
         catalogEntry.transport = transport
@@ -435,8 +514,8 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
         const userSecrets = Object.fromEntries(
           Object.entries(data.env || {}).filter(([, v]) => v !== ''),
         ) as Record<string, string>
-        const argsStr = data.args ? data.args.split(/\s+/).filter(Boolean).map(a => shellEscape(a)).join(' ') : ''
-        execSync(`claude mcp add ${scopeFlag} ${shellEscape(sanitizedName)} -- ${shellEscape(data.command)} ${argsStr} 2>&1`, { timeout: 15000, encoding: 'utf-8' })
+        const argList = data.args ? data.args.split(/\s+/).filter(Boolean) : []
+        await runClaudeMcp(['mcp', 'add', '-s', scope, sanitizedName, '--', data.command, ...argList], 15000)
         catalogEntry.type = 'local'
         catalogEntry.command = data.command
         catalogEntry.args = data.args ? data.args.split(/\s+/).filter(Boolean) : []
@@ -468,7 +547,6 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
 
   if (connectorDetailMatch && method === 'DELETE' && !path.includes('/assign')) {
     const name = decodeURIComponent(connectorDetailMatch[1])
-    let removed = 0
     const mcpFiles = [
       join(PROJECT_ROOT, '.mcp.json'),
       join(homedir(), '.claude.json'),
@@ -489,16 +567,27 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
     for (const extPath of getExternalProjectPaths()) {
       mcpFiles.push(join(extPath, '.mcp.json'))
     }
-    for (const mcpPath of mcpFiles) {
-      try {
-        const parsed = JSON.parse(readFileOr(mcpPath, '{}'))
-        if (parsed.mcpServers && parsed.mcpServers[name]) {
-          delete parsed.mcpServers[name]
-          atomicWriteFileSync(mcpPath, JSON.stringify(parsed, null, 2))
-          removed++
-        }
-      } catch { /* skip unreadable files */ }
-    }
+    // Must not interleave with a running `claude mcp add/remove` child that
+    // rewrites the same ~/.claude.json, so hold the CLI slot for the whole loop.
+    const removed = await serializeClaudeMcp(async () => {
+      let count = 0
+      for (const mcpPath of mcpFiles) {
+        try {
+          const parsed = JSON.parse(readFileOr(mcpPath, '{}'))
+          // Own keys only: "toString" or "__proto__" is truthy on every object,
+          // so a plain lookup counted a removal and rewrote the file for nothing.
+          const servers = parsed.mcpServers
+          if (servers && typeof servers === 'object' && Object.hasOwn(servers, name)) {
+            delete servers[name]
+            // Keep the file's own mode: ~/.claude.json is 0600, and a mode-less
+            // write renames a umask-default (0644) file over it (VAULTMODE818).
+            atomicWriteFileSync(mcpPath, JSON.stringify(parsed, null, 2), { mode: statSync(mcpPath).mode & 0o777 })
+            count++
+          }
+        } catch { /* skip unreadable files */ }
+      }
+      return count
+    })
     if (removed > 0) {
       purgeFromMcpListCache(name)
       json(res, { ok: true, removed })
@@ -512,6 +601,12 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
 
   const connectorAssignMatch = path.match(/^\/api\/connectors\/(.+)\/assign$/)
   if (connectorAssignMatch && method === 'POST') {
+    // OWNERGATE2-1104: writes agents/<name>/.mcp.json (which MCP servers, and so which commands, an agent runs),
+    // the same file PUT /api/agents/:name gates as mcpJson; without this the assign was a way around that gate.
+    if (!mayActAsOwner(ctx.auth, req)) {
+      refuseOwner(res, 'Assigning a connector to agents needs the dashboard login (an owner session).')
+      return true
+    }
     const connectorName = decodeURIComponent(connectorAssignMatch[1])
     const body = await readBody(req)
     const { agents: rawTargetAgents, allAgents: rawVisibleAgents } = JSON.parse(body.toString()) as { agents: string[], allAgents?: string[] }
@@ -563,7 +658,7 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
     for (const agentName of targetAgents) {
       const mcpPath = join(AGENTS_BASE_DIR, agentName, '.mcp.json')
       let mcpConfig: any = {}
-      try { mcpConfig = JSON.parse(readFileOr(mcpPath, '{}')) } catch {}
+      mcpConfig = readJsonObjectForWrite(mcpPath) as any
       if (!mcpConfig.mcpServers) mcpConfig.mcpServers = {}
       mcpConfig.mcpServers[connectorName] = connectorConfig
       atomicWriteFileSync(mcpPath, JSON.stringify(mcpConfig, null, 2))
@@ -634,6 +729,11 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
 
   const catalogInstallMatch = path.match(/^\/api\/mcp-catalog\/([^/]+)\/install$/)
   if (catalogInstallMatch && method === 'POST') {
+    // OWNERGATE2-1104: runs `claude mcp add --scope user`, i.e. adds an MCP server (a command the host runs) for every agent on the machine, and vaults the keys sent with it; owner-only.
+    if (!mayActAsOwner(ctx.auth, req)) {
+      refuseOwner(res, 'Installing an MCP server from the catalog needs the dashboard login (an owner session).')
+      return true
+    }
     const id = decodeURIComponent(catalogInstallMatch[1])
     try {
       const catalog = loadMcpCatalog()
@@ -660,13 +760,8 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
         const defaultEnv = Object.fromEntries(
           Object.entries(item.env || {}).filter(([k, v]) => v !== '' && !(k in userSecrets)),
         ) as Record<string, string>
-        const envFlags = Object.entries(defaultEnv)
-          .map(([k, v]) => `-e ${shellEscape(k)}=${shellEscape(v as string)}`)
-          .join(' ')
-
-        const argsStr = (item.args || []).map((a: string) => shellEscape(a)).join(' ')
-        const cmd = `claude mcp add --scope user ${shellEscape(cliName)} ${envFlags} -- ${shellEscape(item.command)} ${argsStr} 2>&1`
-        execSync(cmd, { timeout: 30000, encoding: 'utf-8' })
+        const envArgs = Object.entries(defaultEnv).flatMap(([k, v]) => ['-e', `${k}=${v as string}`])
+        await runClaudeMcp(['mcp', 'add', '--scope', 'user', cliName, ...envArgs, '--', item.command, ...(item.args || [])], 30000)
         if (Object.keys(userSecrets).length) {
           vaultAndBindEnvSecrets(cliName, join(homedir(), '.claude.json'), userSecrets)
         }
@@ -676,7 +771,7 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
         // Respect the catalog item's transport (http/sse) instead of forcing sse,
         // so one-click remote installs can use streamable-http (e.g. n8n).
         const transport = item.transport === 'http' ? 'http' : 'sse'
-        execSync(`claude mcp add --transport ${transport} --scope user ${shellEscape(cliName)} ${shellEscape(url)} 2>&1`, { timeout: 30000, encoding: 'utf-8' })
+        await runClaudeMcp(['mcp', 'add', '--transport', transport, '--scope', 'user', cliName, url], 30000)
       }
 
       let message = 'Telepítve'
@@ -694,6 +789,12 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
 
   const catalogUninstallMatch = path.match(/^\/api\/mcp-catalog\/([^/]+)\/uninstall$/)
   if (catalogUninstallMatch && method === 'DELETE') {
+    // OWNERGATE3-1104 (review): runs `claude mcp remove` on the user and project scope, i.e. takes an MCP server away
+    // from every agent on the machine; the install twin is owner-only, so is this. Before the catalog read and any spawn.
+    if (!mayActAsOwner(ctx.auth, req)) {
+      refuseOwner(res, 'Removing an MCP server installed from the catalog needs the dashboard login (an owner session).')
+      return true
+    }
     const id = decodeURIComponent(catalogUninstallMatch[1])
     try {
       const catalog = loadMcpCatalog()
@@ -701,13 +802,15 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
       if (!item) { json(res, { error: 'Item not found in catalog' }, 404); return true }
 
       const cliName = item.id
-      try {
-        execSync(`claude mcp remove ${shellEscape(cliName)} -s user 2>&1`, { timeout: 15000 })
-      } catch {
+      await serializeClaudeMcp(async () => {
         try {
-          execSync(`claude mcp remove ${shellEscape(cliName)} -s project 2>&1`, { timeout: 15000 })
-        } catch { /* ignore if not found anywhere */ }
-      }
+          await execClaudeMcp(['mcp', 'remove', cliName, '-s', 'user'], 15000)
+        } catch {
+          try {
+            await execClaudeMcp(['mcp', 'remove', cliName, '-s', 'project'], 15000)
+          } catch { /* ignore if not found anywhere */ }
+        }
+      })
 
       json(res, { ok: true, message: 'Eltávolítva' })
     } catch (err: any) {
@@ -718,6 +821,14 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
   }
 
   // === Vault ===
+  // MAINAUTH1107 (Samu 72304/72307, Dani 72305): an agent's API key (agent-<name>-api-key, the main agent's too) decides
+  // which Anthropic Console account that agent's prompts go to. With the shared access token any sub-agent could
+  // otherwise swap the main agent's key for one of its own account (its prompts would then reach that account:
+  // data leaving, not only billing) or delete it. So writing or deleting one through the generic routes needs the
+  // dashboard login, the same gate as the agent editor's authMode/apiKey fields. Reading is unchanged (the vault ACL).
+  const AGENT_API_KEY_ID = /^agent-[^/]+-api-key$/
+  const agentApiKeyWriteRefused = (id: string): boolean => AGENT_API_KEY_ID.test(id) && !mayActAsOwner(ctx.auth, req)
+
   if (path === '/api/vault' && method === 'GET') {
     // ssh-key-* entries are managed exclusively via the SSH key pool
     // (/api/vault/ssh-keys) and must not appear as generic secret cards too.
@@ -729,9 +840,58 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
     const body = await readBody(req)
     const { id, label, value } = JSON.parse(body.toString()) as { id: string, label: string, value: string }
     if (!id?.trim() || !value) { json(res, { error: 'id and value required' }, 400); return true }
-    setSecret(id.trim(), label || id.trim(), value)
+    if (agentApiKeyWriteRefused(id.trim())) {
+      refuseOwner(res, 'Storing an agent API key needs the dashboard login (an owner session): it decides which Console account the agent runs on.')
+      return true
+    }
+    if (label !== undefined && label !== null && typeof label !== 'string') { json(res, { error: 'label must be a string' }, 400); return true }
+    // An unchanged stored label passes whatever its length (value rotation re-sends it); a new
+    // secret or a changed label is capped. listSecrets() never decrypts anything.
+    if (typeof label === 'string' && label.trim().length > VAULT_LABEL_MAX_LENGTH
+        && label.trim() !== listSecrets().find(s => s.id === id.trim())?.label) {
+      json(res, { error: `label must be at most ${VAULT_LABEL_MAX_LENGTH} characters` }, 400)
+      return true
+    }
+    setSecret(id.trim(), normalizeVaultLabel(id.trim(), label ?? ''), value)
     const syncResult = syncSecret(id.trim())
     json(res, { ok: true, synced: syncResult.updated })
+    return true
+  }
+
+  // D1 (1): the resolver scripts (scripts/vault-resolve.mjs, scripts/vault-headers-helper.mjs) read secrets
+  // here instead of decrypting in the agent's own process, so every read leaves a row (who claimed what)
+  // and VAULT_ACL_MODE=enforce can hold an agent to its allowlist. Not isolation: the master-key file is
+  // readable by the same OS user, and a caller that claims no agent is an owner lane.
+  if (path === '/api/vault/resolve' && method === 'POST') {
+    let body: { ids?: unknown }
+    try { body = JSON.parse((await readBody(req)).toString()) } catch { json(res, { error: 'Invalid JSON body' }, 400); return true }
+    const ids = Array.isArray(body?.ids) ? body.ids : null
+    if (!ids || ids.length === 0 || ids.length > 100 || !ids.every((i) => typeof i === 'string' && i.trim() && i.length <= 200)) {
+      json(res, { error: 'ids must be 1..100 non-empty strings of at most 200 characters' }, 400)
+      return true
+    }
+    const acl = readVaultAcl()
+    const values: Record<string, string> = Object.create(null)
+    const missing: string[] = []
+    const refused: Array<{ id: string; reason: 'ssh-key' | 'acl' }> = []
+    for (const raw of ids as string[]) {
+      const id = raw.trim()
+      if (isSshPrivateKeyId(id)) {
+        logVaultRead(id, ctx.auth, listSecrets().some(s => s.id === id), acl, { channel: 'resolve', refused: true })
+        refused.push({ id, reason: 'ssh-key' })
+        continue
+      }
+      if (vaultReadRefused(id, ctx.auth, acl)) {
+        logVaultRead(id, ctx.auth, listSecrets().some(s => s.id === id), acl, { channel: 'resolve', refused: true })
+        refused.push({ id, reason: 'acl' })
+        continue
+      }
+      const val = getSecret(id)
+      logVaultRead(id, ctx.auth, val !== null, acl, { channel: 'resolve' })
+      if (val === null) missing.push(id)
+      else values[id] = val
+    }
+    json(res, { values, missing, refused, mode: vaultAclMode() })
     return true
   }
 
@@ -741,17 +901,68 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
   // /api/vault/ssh-servers matches THIS generic secret-store route first
   // (id="ssh-servers"), finds no such secret, and returns 404 before
   // tryHandleVaultSsh ever runs (2026-07-01, frontend/backend Vault epic).
-  const isVaultSubroute = vaultMatch && ['bindings', 'sync', 'scan', 'import', 'ssh-servers', 'ssh-keys'].includes(vaultMatch[1])
+  const isVaultSubroute = vaultMatch && ['bindings', 'sync', 'scan', 'import', 'ssh-servers', 'ssh-keys', 'resolve'].includes(vaultMatch[1])
   if (vaultMatch && !isVaultSubroute && method === 'GET') {
     const id = decodeURIComponent(vaultMatch[1])
+    // VAULTSZELES826: SSH private keys are NEVER served by this generic value route.
+    // The SSH feature reads them in-process (vault-ssh-keys.ts, getSecret) and has its own
+    // routes; the list route above only HIDES them from the secret cards (display, not
+    // protection), and the exclusion list above names literal sub-resources, not this id
+    // prefix, so without this branch GET /api/vault/ssh-key-<id> returned the private key.
+    // Measured 2026-09-23 before closing it: no legitimate caller uses this path (the SSH
+    // feature, the dashboard's reveal/edit buttons, scripts, skills, agent commands: 0).
+    // The audit row is kept so an attempt stays visible, and the key is not even decrypted.
+    if (isSshPrivateKeyId(id)) {
+      logVaultRead(id, ctx.auth, listSecrets().some(s => s.id === id), readVaultAcl(), { channel: 'value', refused: true })
+      json(res, { error: 'SSH private keys are not served by this route' }, 403)
+      return true
+    }
+    const acl = readVaultAcl()
+    if (vaultReadRefused(id, ctx.auth, acl)) {
+      logVaultRead(id, ctx.auth, listSecrets().some(s => s.id === id), acl, { channel: 'value', refused: true })
+      json(res, { error: 'Not allowed for this agent by the vault allowlist (VAULT_ACL_MODE=enforce)' }, 403)
+      return true
+    }
     const val = getSecret(id)
+    // VAULTSZELES826 F0: one audit row per value read (id, kind, principal,
+    // allowlist verdict) BEFORE the value leaves the server. Audit only: the
+    // verdict never blocks here. The value is not passed to the logger.
+    logVaultRead(id, ctx.auth, val !== null, acl)
     if (val === null) { json(res, { error: 'Not found' }, 404); return true }
     json(res, { id, value: val })
     return true
   }
 
+  // Label-only update: never decrypts or re-sends the value, and there is nothing to sync
+  // (syncSecret propagates the VALUE into bound MCP configs; the label is not part of them).
+  if (vaultMatch && !isVaultSubroute && method === 'PATCH') {
+    const id = decodeURIComponent(vaultMatch[1])
+    // ssh-key-* entries are managed exclusively by the SSH key pool.
+    if (isSshPrivateKeyId(id)) {
+      json(res, { error: 'SSH private keys are managed by the SSH key pool' }, 403)
+      return true
+    }
+    let body: { label?: unknown } | null
+    try { body = JSON.parse((await readBody(req)).toString()) } catch { json(res, { error: 'Invalid JSON body' }, 400); return true }
+    if (!body || typeof body !== 'object' || typeof body.label !== 'string') {
+      json(res, { error: 'label must be a string' }, 400)
+      return true
+    }
+    if (body.label.trim().length > VAULT_LABEL_MAX_LENGTH) {
+      json(res, { error: `label must be at most ${VAULT_LABEL_MAX_LENGTH} characters` }, 400)
+      return true
+    }
+    if (!updateSecretLabel(id, normalizeVaultLabel(id, body.label))) { json(res, { error: 'Not found' }, 404); return true }
+    json(res, { ok: true })
+    return true
+  }
+
   if (vaultMatch && !isVaultSubroute && method === 'DELETE') {
     const id = decodeURIComponent(vaultMatch[1])
+    if (agentApiKeyWriteRefused(id)) {
+      refuseOwner(res, 'Deleting an agent API key needs the dashboard login (an owner session).')
+      return true
+    }
     if (!deleteSecret(id)) { json(res, { error: 'Not found' }, 404); return true }
     removeBindingsForSecret(id)
     json(res, { ok: true })
@@ -781,6 +992,19 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
     const bindingKey = data.headerName?.trim() || data.envVar?.trim()
     if (!data.vaultSecretId || !bindingKey) {
       json(res, { error: 'vaultSecretId and (envVar or headerName) required' }, 400)
+      return true
+    }
+    // VAULTSZELES826: an SSH private key must never be bound. A header binding would hand it
+    // to vault-headers-helper, which sends it to a REMOTE server as an HTTP header; an env
+    // binding would put it into a child process. Refused before any write or sync runs.
+    // Measured 2026-09-23: the live store/vault-bindings.json has 1 binding, 0 on an ssh-key.
+    if (isSshPrivateKeyId(data.vaultSecretId)) {
+      // The refusal leaves a server-side trace (Marveen 29017): a binding attempt that only
+      // gets a 400 back would be visible to the caller and to no one else. No value is read.
+      const { kind, principal } = principalOf(ctx.auth)
+      logger.warn({ event: 'vault-binding-refused', vaultSecretId: data.vaultSecretId, kind, principal,
+        via: data.headerName?.trim() ? 'header' : 'env' }, 'vault: SSH private key binding refused')
+      json(res, { error: 'SSH private keys cannot be bound to an env var or a header' }, 400)
       return true
     }
 
@@ -863,6 +1087,11 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
         createBinding: boolean
         targets: Array<{ mcpFilePath: string, serverName: string }>
       }>
+    }
+    // MAINAUTH1107: an import names its vault id freely, so it is the same write door as POST /api/vault.
+    if (Array.isArray(importRequests) && importRequests.some((imp) => typeof imp?.vaultId === 'string' && agentApiKeyWriteRefused(imp.vaultId.trim()))) {
+      refuseOwner(res, 'Importing into an agent API key needs the dashboard login (an owner session).')
+      return true
     }
     let imported = 0
     let bound = 0

@@ -27,6 +27,10 @@ vi.mock('../web/channel-monitor.js', () => ({
 }))
 vi.mock('../web/stuck-tool-call-watcher.js', () => ({ shouldDeferForRecentRespawn: () => false }))
 vi.mock('../web/agent-process.js', () => ({
+  withTmuxBatch: (fn: () => unknown) => fn(),
+  // The not-ready-path modal clear: false = no modal, so every caller keeps
+  // its existing skip/busy behaviour and these fixtures are unaffected.
+  clearFeedbackModalAndRecheck: () => false,
   agentRunState: () => 'stopped',
   agentSessionName: (n: string) => `agent-${n}`,
   restartAgentProcess: vi.fn(),
@@ -58,6 +62,35 @@ describe('resumePrompt carries the prod-tree constraint on every variant', () =>
   })
 })
 
+// ORSICTX912 (2026-09-12): msg 23670 was delivered seven seconds after the
+// guard kill started, into the dying session. The queue said delivered, the
+// fresh session never looked back, and completed_at is unused (0/37 measured)
+// so the loss was invisible. The resume prompt is the fresh session's ONLY
+// context, so the re-read instruction must be present on EVERY variant, and
+// it must demand an OBSERVABLE trace (ack to the sender) -- an instruction
+// whose success cannot be observed would run into the same blindness.
+describe('resumePrompt carries the restart-window re-read on every variant', () => {
+  const variants = [
+    ['without a handoff', () => resumePrompt('samu', '/x/HANDOFF.md', false)],
+    ['with a fresh handoff', () => resumePrompt('samu', '/x/HANDOFF.md', true)],
+    ['with a stale handoff', () => resumePrompt('samu', '/x/HANDOFF.md', true, 42)],
+    ['with unmeasurable freshness', () => resumePrompt('samu', '/x/HANDOFF.md', true, 'unknown')],
+    ['main agent', () => resumePrompt('marveen', '/x/HANDOFF.md', true)],
+  ] as const
+  for (const [label, make] of variants) {
+    it(label, () => {
+      const p = make()
+      expect(p).toContain('RESTART-ABLAK')
+      // The queue re-read names the concrete endpoint, not a vague "check".
+      expect(p).toContain('api/messages?agent=')
+      // The observable trace: an ack to the SENDER, required even when the
+      // item needs no work -- this is what makes the v1 measurable at all.
+      expect(p).toContain('nyugtát a feladónak')
+      expect(p).toContain('akkor is, ha nincs belőle teendő')
+    })
+  }
+})
+
 // Review msg 14197: the main agent's channel is the OWNER's Telegram, and
 // session meta must never go there (standing owner preference; a 3am status
 // notice went out exactly this way on 2026-08-05). The closing line is
@@ -70,7 +103,32 @@ describe('resumePrompt closing line is agent-dependent', () => {
     expect(p).toContain('transzkript')
     expect(p).toContain(CONSTRAINT)
   })
-  it('sub-agent: channel notice stays (their channel is the inter-agent queue)', () => {
-    expect(resumePrompt('samu', '/x/HANDOFF.md', true)).toContain('jelezz a csatornádon')
+  it('sub-agent: no channel notice, faulty handoff goes to the main agent via the queue', () => {
+    const p = resumePrompt('samu', '/x/HANDOFF.md', true)
+    expect(p).not.toContain('jelezz a csatornádon')
+    expect(p).toContain('NE küldj üzenetet')
+    expect(p).toContain('inter-agent üzenetben a fő ügynöknek (marveen)')
   })
+})
+
+// Owner request 2026-10-21: no agent may message a channel just because it
+// resumed with fresh context; pinned on every variant for both agent kinds.
+describe('resumePrompt never tells any agent to notify the channel', () => {
+  const variants: Array<[string, boolean, number | 'unknown' | null]> = [
+    ['no handoff', false, null],
+    ['fresh', true, null],
+    ['stale number', true, 42],
+    ['unknown', true, 'unknown'],
+  ]
+  for (const agent of ['samu', 'marveen']) {
+    for (const [label, had, stale] of variants) {
+      it(`${agent}: ${label}`, () => {
+        const p = resumePrompt(agent, '/x/HANDOFF.md', had, stale)
+        expect(p).not.toContain('jelezz a csatornádon')
+        expect(p).toMatch(/NE küldj üzenetet|NEM mehet ki/)
+        if (agent === 'samu') expect(p).toContain('(marveen)')
+        if (agent === 'marveen') expect(p).toContain('a gazdának ne küldj üzenetet')
+      })
+    }
+  }
 })

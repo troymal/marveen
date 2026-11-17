@@ -3,13 +3,14 @@ import { fileURLToPath } from 'node:url'
 import { logger } from '../logger.js'
 import { MAIN_AGENT_ID } from '../config.js'
 import { listAgentNames } from './agent-config.js'
-import { isAgentRunning, capturePane } from './agent-process.js'
+import { isAgentRunning, capturePane, withTmuxBatch } from './agent-process.js'
 import {
   resolveAgentSession,
   resolveAgentProviderType,
 } from './channel-mcp-reconnect.js'
 import { getProvider } from '../channel-provider.js'
 import { MAIN_CHANNELS_SESSION } from './main-agent.js'
+import { whileNotFrozen } from './fleet-freeze.js'
 
 // The MCP reconnect (attemptChannelMcpReconnect) is deliberately synchronous --
 // it drives the interactive /mcp tmux menu with execFileSync('/bin/sleep', ...)
@@ -148,18 +149,25 @@ export function startChannelHealthMonitor(): NodeJS.Timeout {
       logger.debug({ err }, 'channel-health-monitor: main agent check error')
     }
 
-    for (const name of listAgentNames()) {
-      if (!isAgentRunning(name)) continue
-      try {
-        checkAgent(name, resolveAgentSession(name))
-      } catch (err) {
-        logger.debug({ err, agent: name }, 'channel-health-monitor: agent check error')
+    // One list-sessions for the whole per-agent pass: every isAgentRunning()
+    // below asks the identical read-only query, and withTmuxBatch answers all
+    // of them from one memoized spawn while this (synchronous) loop runs. The
+    // pane reads inside checkAgent are capture-pane calls, which are never
+    // memoized, so each agent still gets its own fresh capture.
+    withTmuxBatch(() => {
+      for (const name of listAgentNames()) {
+        if (!isAgentRunning(name)) continue
+        try {
+          checkAgent(name, resolveAgentSession(name))
+        } catch (err) {
+          logger.debug({ err, agent: name }, 'channel-health-monitor: agent check error')
+        }
       }
-    }
+    })
   }
 
   // Offset from channel-monitor's 30s initial delay to avoid
   // overlapping tmux interactions on the same tick.
-  setTimeout(check, 45_000)
-  return setInterval(check, 60_000)
+  setTimeout(whileNotFrozen('channel-health', check), 45_000)
+  return setInterval(whileNotFrozen('channel-health', check), 60_000)
 }

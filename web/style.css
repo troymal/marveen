@@ -9,6 +9,11 @@
   --text: #141413;
   --text-secondary: #30302e;
   --text-muted: #87867f;
+  /* Dimmed body text that still has to be READ, not just noticed: transcript
+     metadata, notes, action lines. Distinct from --text-muted, which sits at
+     3.5:1 on this background and is fine for a label next to something else,
+     but not for a line someone has to follow. Measured 5.4:1 here. GH #426. */
+  --text-dim: #68675f;
   --border: #d1cfc5;
   --border-focus: #d97757;
   --accent: #d97757;
@@ -40,6 +45,7 @@
   --text: #faf9f5;
   --text-secondary: #b0aea5;
   --text-muted: #73726c;
+  --text-dim: #9a9890;   /* 6.4:1 on --bg. See the light-theme note. */
   --border: #3d3d3a;
   --shadow-sm: 0 1px 3px rgba(0,0,0,0.2);
   --shadow-md: 0 4px 16px rgba(0,0,0,0.25);
@@ -362,6 +368,8 @@ nav { display: flex; gap: 4px; }
   vertical-align: middle;
 }
 .updates-badge[hidden] { display: none; }
+/* VIDEOREVIEW1002: .sb-link is display:flex, which wins over the UA [hidden] rule. */
+.sb-link[hidden] { display: none; }
 
 .updates-summary {
   padding: 16px 18px;
@@ -452,6 +460,21 @@ nav { display: flex; gap: 4px; }
 .team-node:hover { border-color: var(--accent); transform: translateY(-1px); }
 .team-node.main { background: var(--accent-soft); border-color: var(--accent); }
 .team-node.leader { border-color: var(--accent); }
+/* Live "working" state, same signal and green as the Activity page's left
+   border. Declared after .main/.leader so an active main or leader shows the
+   working colour rather than its role accent. */
+.team-node.team-node-active {
+  border-color: #22c55e;
+  box-shadow: 0 0 0 1px #22c55e;
+}
+.team-node.team-node-active:hover { border-color: #22c55e; }
+/* Run-state line: the pulsing dot the agent cards use, next to Fut / Leállva. */
+.team-node-status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+}
 /* Drag-and-drop reporting edit (Team page). */
 .team-node.team-draggable { cursor: grab; }
 .team-node.team-dragging { opacity: 0.45; cursor: grabbing; }
@@ -476,6 +499,9 @@ nav { display: flex; gap: 4px; }
 }
 .team-node-name { font-weight: 600; font-size: 14px; color: var(--text); margin-bottom: 2px; }
 .team-node-meta { font-size: 12px; color: var(--text-muted); }
+/* Owner-written tagline: it says what the agent does, so it reads stronger
+   than the muted role line it replaces, and wraps instead of widening the node. */
+.team-node-tagline { color: var(--text); text-align: center; overflow-wrap: anywhere; }
 .team-connector {
   width: 2px;
   height: 16px;
@@ -500,6 +526,12 @@ nav { display: flex; gap: 4px; }
   font-size: 13px;
   text-align: center;
   padding: 24px;
+}
+.team-hint {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-top: 16px;
+  text-align: center;
 }
 
 .theme-toggle {
@@ -547,6 +579,115 @@ main {
 .subtitle { color: var(--text-muted); font-size: 14px; margin-top: 4px; }
 
 /* === Overview page === */
+/* Subscription quota strip (overview page, above the stat cards). Deliberately
+   flat and narrow: it is a glance, not a card, and must not compete with the
+   stats below it. Colour follows the status line -- >=80% danger, >=60% accent
+   -- so the terminal and the dashboard cannot disagree about the same number. */
+.quota-strip {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  padding: 10px 14px;
+  margin-bottom: 14px;
+}
+.quota-strip-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.quota-strip-title { font-size: 12px; font-weight: 500; color: var(--text-muted); }
+.quota-strip-age { font-size: 11px; color: var(--text-muted); }
+.quota-bars { display: flex; flex-direction: column; gap: 6px; }
+.quota-bar {
+  display: grid;
+  grid-template-columns: 56px 1fr auto;
+  align-items: center;
+  gap: 10px;
+}
+.quota-bar-label { font-size: 12px; color: var(--text-muted); }
+.quota-bar-track {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg-input);
+  overflow: hidden;
+}
+/* Weekly row: one segment per calendar day (a partial first and last day
+   when the reset is not at midnight), separators drawn in the card colour
+   so they read as gaps, day names underneath (column widths set inline to
+   match), and a thin "now" marker. The fill is USAGE, the marker is TIME:
+   usage right of the marker means the week is being spent faster than it
+   passes. */
+.quota-bar-col { position: relative; min-width: 0; }
+.quota-bar-track.week { position: relative; }
+.quota-bar-sep {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--bg-card);
+  pointer-events: none;
+}
+.quota-bar-now {
+  position: absolute;
+  top: -3px;
+  width: 2px;
+  height: 12px;
+  margin-left: -1px;
+  border-radius: 1px;
+  background: var(--text);
+  pointer-events: none;
+}
+/* Day names switch by the width of the label row itself (container query),
+   not by an ellipsis: full names need ~58 px per day (longest: "Wednesday",
+   measured at 10 px in DejaVu Sans, wider than the system UI fonts), so
+   below 7 x ~62 px = 440 px the short forms (H K Sze Cs P Szo V /
+   Mon..Sun, <= 22 px) take over, and below 180 px English drops to
+   M T W T F S S. Hungarian has no unambiguous one-letter form, so there
+   (.no-narrow) the day names hide below 180 px; the separators and the now
+   marker on the track still mark the days. */
+.quota-bar-days {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr); /* overridden inline per window */
+  margin-top: 3px;
+  font-size: 10px;
+  color: var(--text-muted);
+  container-type: inline-size;
+  container-name: quota-days;
+}
+.quota-bar-days > span {
+  text-align: center;
+  white-space: nowrap;
+}
+.quota-bar-days .day-short,
+.quota-bar-days .day-narrow { display: none; }
+@container quota-days (max-width: 440px) {
+  .quota-bar-days .day-full { display: none; }
+  .quota-bar-days .day-short { display: inline; }
+}
+@container quota-days (max-width: 180px) {
+  .quota-bar-days .day-short { display: none; }
+  .quota-bar-days .day-narrow { display: inline; }
+  .quota-bar-days.no-narrow > span { display: none; }
+}
+.quota-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--success);
+  transition: width var(--transition);
+}
+.quota-bar-fill.warn { background: var(--accent); }
+.quota-bar-fill.danger { background: var(--danger); }
+/* Stale or rolled over: the numbers stay visible but must not read as current. */
+.quota-bar.muted .quota-bar-fill { background: var(--text-muted); }
+.quota-bar.muted .quota-bar-value { color: var(--text-muted); }
+.quota-bar-value { font-size: 12px; color: var(--text); font-variant-numeric: tabular-nums; }
+.quota-bar-reset { color: var(--text-muted); }
+.quota-strip-note { margin-top: 8px; font-size: 11px; color: var(--text-muted); }
+.quota-strip-note.warn { color: var(--danger); }
+
 .overview-stats {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -587,6 +728,60 @@ main {
 @media (max-width: 1000px) {
   .overview-grid { grid-template-columns: 1fr; }
 }
+
+/* === Projects overview === */
+.projects-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 14px;
+}
+.project-card-progress {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--border);
+  overflow: hidden;
+  margin: 10px 0;
+}
+.project-card-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width var(--transition);
+}
+.project-card-desc {
+  font-size: 13px;
+  color: var(--text-muted);
+  min-height: 1.4em;
+  margin: 8px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.project-card-desc-edit {
+  width: 100%;
+  min-height: 56px;
+  font-size: 13px;
+  font-family: inherit;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg);
+  resize: vertical;
+  box-sizing: border-box;
+}
+.project-card-assignees {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.project-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 12px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
 .overview-card {
   padding: 20px;
   border: 1px solid var(--border);
@@ -601,6 +796,22 @@ main {
 }
 .overview-card-head h3 { font-size: 16px; font-weight: 600; }
 .overview-card-meta { font-size: 12px; color: var(--text-muted); }
+
+/* Overview token card: one row per agent, bar = share of the busiest agent. */
+.overview-token-card { margin-top: 14px; }
+.overview-token-more { text-decoration: none; }
+.overview-token-more:hover { color: var(--accent); }
+.overview-tokens { display: flex; flex-direction: column; gap: 10px; }
+.overview-token-row { display: grid; grid-template-columns: 120px 1fr auto; gap: 4px 12px; align-items: center; }
+.overview-token-name { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.overview-token-bar { height: 8px; border-radius: 4px; background: var(--border); overflow: hidden; }
+.overview-token-bar-fill { height: 100%; border-radius: 4px; background: var(--accent); }
+.overview-token-value { min-width: 64px; font-size: 13px; font-variant-numeric: tabular-nums; text-align: right; }
+.overview-token-sub { grid-column: 2 / 4; font-size: 11px; color: var(--text-muted); }
+.overview-token-total { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+@media (max-width: 600px) {
+  .overview-token-row { grid-template-columns: 90px 1fr auto; }
+}
 
 .overview-team-graph {
   padding: 12px 0;
@@ -674,6 +885,74 @@ main {
 .overview-activity-time { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
 
 /* === Kanban Board === */
+/* Board summary strip (card ed3c8caf, #569): same look as the ongoing strip. */
+.kanban-summary[hidden] { display: none; }
+.kanban-summary {
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  background: var(--bg-input);
+  border-radius: var(--radius);
+  border-left: 3px solid #3b82f6;
+}
+.kanban-summary-head { display: flex; align-items: center; gap: 10px; cursor: pointer; flex-wrap: wrap; }
+.kanban-summary-totals { font-size: 13px; color: var(--text-muted); }
+.kanban-summary-body { display: grid; gap: 6px; margin-top: 8px; }
+.kanban-summary-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.kanban-summary-who { font-size: 13px; font-weight: 600; color: var(--text); min-width: 90px; }
+.kanban-summary-kind { font-size: 12px; color: var(--text-muted); margin-left: 4px; }
+.kanban-summary-kind-stuck { color: #d97706; }
+.kanban-summary-more { font-size: 12px; color: var(--text-muted); }
+.kanban-summary-chip {
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg-card);
+  border: 1px solid var(--border, transparent);
+  border-radius: 12px;
+  padding: 2px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.kanban-summary-chip:hover { border-color: #3b82f6; }
+/* Ongoing tasks strip: one slim row above the board (see KANBAN_ONGOING_LABEL). */
+.kanban-ongoing[hidden] { display: none; }
+.kanban-ongoing {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  background: var(--bg-input);
+  border-radius: var(--radius);
+  border-left: 3px solid #64748b;
+}
+.kanban-ongoing-title {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.kanban-ongoing-body { display: flex; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.kanban-ongoing-chip {
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg-card);
+  border: 1px solid var(--border, transparent);
+  border-radius: 14px;
+  padding: 3px 10px;
+  cursor: pointer;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.kanban-ongoing-chip:hover { border-color: #64748b; }
+.kanban-ongoing-seq { color: var(--text-muted); font-weight: 600; }
+
 /* Five statuses, four fixed tracks: the board always wrapped "done" onto a
  * second row of its own, at every window size. auto-fit fits as many columns
  * as can hold KANBAN_COL_MIN and collapses the rest, so the count follows the
@@ -955,7 +1234,9 @@ main {
   display: flex;
   align-items: center;
   gap: 3px;
+  min-width: 0;
 }
+.kanban-card-assignee .kanban-nickname { font-size: 10px; opacity: 0.85; }
 .assignee-dot {
   width: 14px;
   height: 14px;
@@ -1116,14 +1397,45 @@ main {
   position: relative;
   overflow: hidden;
 }
-.kanban-card[data-priority="urgent"] { border-left: 3px solid var(--danger); }
-.kanban-card[data-priority="high"] { border-left: 3px solid var(--accent); }
-.kanban-card[data-priority="normal"] { border-left: 3px solid transparent; }
-.kanban-card[data-priority="low"] { border-left: 3px solid var(--border); }
+/* === Priority: the WHOLE card carries the colour, not a 3px edge ===
+   On a dense board a 3px stripe is not readable at a glance.
 
-/* Card aging: left stripe overrides priority border when card is stale.
-   Colour is set as --card-aging-color via inline style by JS. */
-.kanban-card[data-aging] { border-left: 3px solid var(--card-aging-color); }
+   The tint is layered OVER --bg-card with a two-stop gradient instead of being
+   written as a background colour: --bg-card differs between the light and dark
+   themes, and a hard-coded tint would go muddy in one of them. This way the
+   same rgba sits on whichever card background is current.
+
+   The left edge stays, thicker, because card aging (below) overrides it and
+   needs somewhere visible to land. */
+.kanban-card[data-priority] {
+  --card-tint: transparent;
+  --card-edge: var(--border);
+  background: linear-gradient(var(--card-tint), var(--card-tint)), var(--bg-card);
+  border-left: 4px solid var(--card-edge);
+}
+/* Deliberately NOT four equal steps: only the top two levels should pull the
+   eye, normal is the neutral middle and low recedes. Tinting all four would
+   turn the whole board into colour and tell you nothing. */
+.kanban-card[data-priority="urgent"] { --card-tint: rgba(191, 77, 67, 0.20); --card-edge: var(--danger); }
+.kanban-card[data-priority="high"]   { --card-tint: rgba(217, 119, 87, 0.18); --card-edge: var(--accent); }
+.kanban-card[data-priority="normal"] { --card-tint: transparent;              --card-edge: var(--border); }
+.kanban-card[data-priority="low"]    { --card-tint: rgba(20, 20, 19, 0.035);  --card-edge: var(--border); }
+/* Low also steps back in contrast, not just in hue: a background tint alone is
+   too weak to read as "background work" on a dense board. */
+.kanban-card[data-priority="low"] .kanban-card-title { color: var(--text-dim); }
+
+/* Dark theme needs both a stronger tint and the opposite direction for `low`:
+   the same alpha that reads on a white card is invisible on a dark one, and a
+   dark wash on a dark card would be indistinguishable from a shadow. */
+[data-theme="dark"] .kanban-card[data-priority="urgent"] { --card-tint: rgba(191, 77, 67, 0.32); }
+[data-theme="dark"] .kanban-card[data-priority="high"]   { --card-tint: rgba(217, 119, 87, 0.28); }
+[data-theme="dark"] .kanban-card[data-priority="low"]    { --card-tint: rgba(250, 249, 245, 0.03); }
+
+/* Card aging: left stripe overrides the priority edge when the card is stale.
+   Colour is set as --card-aging-color via inline style by JS. Only the colour
+   is overridden; the width comes from the priority block above. Must stay
+   AFTER that block: both selectors have the same specificity. */
+.kanban-card[data-aging] { border-left-color: var(--card-aging-color); }
 
 /* Aging badge: hourglass + day/hour counter, top-right (left of the ⚡ action) */
 .kanban-card-aging-badge {
@@ -1173,14 +1485,17 @@ main {
   padding: 0 4px;
   background: var(--bg);
 }
+/* 40px, not the 28 this used to be: at 28px a circle-cropped character
+   portrait is only a colour and a silhouette, at 48px the details read. 40 is
+   what the lane header carries without reflowing. */
 .kanban-swimlane-avatar {
-  width: 28px;
-  height: 28px;
+  width: 40px;
+  height: 40px;
   border-radius: 50%;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 12px;
+  font-size: 16px;
   font-weight: 700;
   color: #fff;
   flex-shrink: 0;
@@ -1193,13 +1508,59 @@ main {
 .kanban-swimlane-avatar.priority-high { background: var(--accent); }
 .kanban-swimlane-avatar.priority-normal { background: var(--text-muted); }
 .kanban-swimlane-avatar.priority-low { background: var(--border); }
+
+/* Character portrait laid over the initial. See kanbanDecorateAvatar in app.js:
+   the letter is painted first and this covers it, so a missing picture needs no
+   round trip -- the <img> removes itself on error and the letter is underneath. */
+.kanban-swimlane-avatar,
+.kanban-team-avatar { position: relative; overflow: hidden; }
+.kanban-avatar-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 50%;
+}
+.kanban-team-avatar {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  font-weight: 700;
+  color: #fff;
+  flex-shrink: 0;
+}
+/* The character name next to the person's name. Quiet on purpose: it is
+   flavour, and the name is what you navigate by. */
+.kanban-nickname {
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.kanban-owner-strip-avatar { width: 34px; height: 34px; font-size: 14px; }
+.kanban-team-avatar.owner { background: var(--accent); }
+.kanban-team-avatar.bot { background: var(--info); }
+.kanban-team-avatar.agent { background: var(--success); }
+.kanban-team-avatar.unknown { background: var(--text-muted); }
 .kanban-swimlane-name {
   font-weight: 600;
   font-size: 14px;
   color: var(--text);
-  margin-right: auto;
 }
+/* The nickname belongs NEXT TO THE NAME, not out at the right edge. It used to
+   be the NAME that carried `margin-right: auto`, which shoved everything after
+   it -- nickname included -- against the card count. The push now starts at
+   the count instead. */
 .kanban-swimlane-count {
+  margin-left: auto;
   font-size: 11px;
   font-weight: 600;
   color: var(--text-muted);
@@ -1270,7 +1631,42 @@ main {
 }
 .card-detail-desc:empty { display: none; }
 
+/* Card 8fe51afd: the testing steps. A left border, not a box, so the block
+   reads as part of the card and not as a warning; `is-testing` is the only
+   state that raises the contrast, and the dashboard sets it only while the
+   card sits in the testing column. */
+.card-detail-test-steps {
+  margin-bottom: 20px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--border);
+  border-radius: 0 6px 6px 0;
+  background: var(--bg-hover, rgba(127, 127, 127, 0.06));
+}
+.card-detail-test-steps h4 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+.card-detail-test-steps-body {
+  margin: 0;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.card-detail-test-steps.is-testing {
+  border-left-color: var(--accent, #7c9cff);
+}
+.card-detail-test-steps.is-testing h4 { color: var(--accent, #7c9cff); }
+
+/* Card 0f21864e (#568): tokens per card, same heading style as the labels. */
+.card-detail-tokens { margin-bottom: 20px; }
+.card-detail-tokens-body { font-size: 13px; color: var(--text); display: grid; gap: 2px; }
 .card-detail-labels { margin-bottom: 20px; }
+.card-detail-tokens h4,
 .card-detail-labels h4 {
   font-size: 12px;
   font-weight: 600;
@@ -1418,7 +1814,7 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
   align-items: center;
 }
 
-/* Agents page: grid / org-chart view toggle */
+/* Agents page: cards / activity / org-chart view toggle */
 .view-toggle {
   display: flex;
   gap: 4px;
@@ -1429,12 +1825,60 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
   border-color: var(--accent);
   background: var(--accent-soft);
 }
+/* Thin vertical rule separating clusters of header buttons. */
+.header-divider {
+  align-self: stretch;
+  width: 1px;
+  min-height: 20px;
+  margin: 0 4px;
+  background: var(--border);
+  flex-shrink: 0;
+}
 
 /* === Agent Grid === */
 .agents-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
   gap: 16px;
+}
+
+/* === Agents grid: "Aktivitás" card mode ===
+   Swaps everything below the avatar/name/description block for the live pane
+   status that used to live on its own Activity page. The header stays, so the
+   card never stops saying which agent it is. */
+.agent-card-activity { display: none; }
+.agents-grid[data-card-mode="activity"] .agent-card-footer,
+.agents-grid[data-card-mode="activity"] .agent-card-actions,
+.agents-grid[data-card-mode="activity"] .agent-reauth-banner,
+.agents-grid[data-card-mode="activity"] .agent-sharedenv-banner,
+.agents-grid[data-card-mode="activity"] .agent-tmux-cmds { display: none; }
+.agents-grid[data-card-mode="activity"] .agent-card-activity { display: block; margin-top: 14px; }
+/* Cards that carry no live state: the add button and federated (remote-system)
+   agents, which the activity endpoint does not know about. */
+.agents-grid[data-card-mode="activity"] .add-card,
+.agents-grid[data-card-mode="activity"] .federated-agent-card { display: none; }
+.agent-act-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.agent-act-head-right { display: flex; align-items: center; gap: 8px; }
+/* State colour, mirroring the Activity page's left border. Only in activity
+   mode -- in profile mode these classes are present but must not paint. */
+.agents-grid[data-card-mode="activity"] .agent-card { border-left-width: 4px; }
+.agents-grid[data-card-mode="activity"] .agent-card.act-working { border-left-color: #22c55e; }
+.agents-grid[data-card-mode="activity"] .agent-card.act-idle    { border-left-color: #9ca3af; }
+/* Main thread idle, sub-agents working: a different green (teal, dashed) so it
+   never reads as the main thread's own solid green. */
+.agents-grid[data-card-mode="activity"] .agent-card.act-subagents { border-left-color: #14b8a6; border-left-style: dashed; }
+.agents-grid[data-card-mode="activity"] .agent-card.act-error   { border-left-color: #ef4444; }
+.agents-grid[data-card-mode="activity"] .agent-card.act-dead    { border-left-color: #b91c1c; }
+.agents-grid[data-card-mode="activity"] .agent-card.act-unknown { border-left-color: #eab308; }
+.agents-grid[data-card-mode="activity"] .agent-card.act-stopped { border-left-color: #6b7280; opacity: 0.7; }
+/* A stopped agent has no session to open, so its card is not clickable -- same
+   rule the Activity page used. */
+.agents-grid[data-card-mode="activity"] .agent-card { cursor: default; }
+.agents-grid[data-card-mode="activity"] .agent-card.agent-card-act-clickable { cursor: pointer; }
+.agents-grid[data-card-mode="activity"] .agent-card:not(.agent-card-act-clickable):hover {
+  background: var(--bg-card);
+  border-color: var(--border);
+  box-shadow: none;
 }
 
 /* === Agent Card === */
@@ -1498,6 +1942,10 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
   display: flex;
   align-items: center;
   gap: 8px;
+  /* A long .agent-nickname must wrap or shrink, never push out of the card. */
+  flex-wrap: wrap;
+  row-gap: 2px;
+  min-width: 0;
 }
 
 .agent-desc {
@@ -1532,6 +1980,22 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
 .agent-model-badge.opus { background: rgba(217,119,87,0.12); color: var(--accent); }
 .agent-model-badge.sonnet { background: var(--info-soft); color: var(--info); }
 .agent-model-badge.haiku { background: var(--success-soft); color: var(--success); }
+/* The agent's custom provider was deleted: it will not start until it gets another model. */
+.agent-model-badge.provider-missing { background: var(--danger-soft); color: var(--danger); }
+
+/* Context-window-used badge (Agents grid card). Tiers mirror context-guard's
+   own default actPct/hardPct (90%/97%) -- see contextPctBadgeHtml in app.js. */
+.agent-ctx-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.agent-ctx-badge.ok { background: var(--success-soft); color: var(--success); }
+.agent-ctx-badge.warning { background: rgba(212,165,44,0.12); color: var(--warning, #d4a52c); }
+.agent-ctx-badge.danger { background: var(--danger-soft); color: var(--danger); }
 
 /* === Per-agent tmux attach copy buttons (running agents only) === */
 .agent-tmux-cmds {
@@ -2350,6 +2814,23 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
 }
 .hint { font-weight: 400; color: var(--text-muted); }
 
+/* Base look for a .input field outside a styled container: without it the field
+   was the browser's unstyled white box (the Vault add forms, the Background
+   tasks and Ideas filters, the idea detail selects). No width, so nothing moves;
+   the container rules (.form-group input, .notes-form .input, ...) are more
+   specific and keep their own look. */
+.input {
+  padding: 6px 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--text);
+  outline: none;
+}
+.input:focus { border-color: var(--accent); }
+
 .form-group input,
 .form-group textarea,
 .form-group select {
@@ -2600,6 +3081,16 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
   background: rgba(217, 119, 87, 0.12);
   color: var(--accent);
 }
+.badge-not-firing {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.schedule-not-firing {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--danger);
+  overflow-wrap: anywhere;
+}
 .badge-heartbeat {
   background: rgba(200, 80, 120, 0.12);
   color: #c85078;
@@ -2816,6 +3307,21 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
   color: var(--text);
 }
 .approvals-pending-banner[hidden] { display: none; }
+
+/* Settings -> Claude plans: rotation is on but something keeps it inert.
+   Same warning token set as .approvals-pending-banner. */
+.claude-plans-readiness-banner {
+  padding: 10px 14px;
+  margin-bottom: 14px;
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--warning, #d4a52c) 12%, transparent);
+  border: 1px solid var(--warning, #d4a52c);
+  font-size: 13px;
+  color: var(--text);
+}
+.claude-plans-readiness-banner[hidden] { display: none; }
+.claude-plans-readiness-banner ul { margin: 6px 0 0; padding-left: 18px; }
+.claude-plans-readiness-title { font-weight: 600; }
 
 /* Wizard step 3: the agent was created but its personality is a placeholder.
    Warning tone, not danger: nothing failed for the operator to undo, the agent
@@ -3167,6 +3673,15 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
   font-size: 13px;
   color: var(--text-secondary);
   line-height: 1.5;
+}
+/* Card 3ddb2b1d (#572): the title line above the one-line snippet. */
+.mem-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.4;
+  margin-bottom: 2px;
+  overflow-wrap: anywhere;
 }
 .mem-content-short {
   white-space: nowrap;
@@ -4132,6 +4647,23 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
   color: var(--text-muted);
   font-family: inherit;
 }
+
+/* Adopted open-source inventory (connectors page) */
+.oss-inv-note { font-size: 12px; color: var(--text-muted); margin-bottom: 8px; line-height: 1.45; }
+.oss-inv-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 10px; font-size: 12px; }
+.oss-inv-meta { color: var(--text-muted); flex: 1 1 220px; min-width: 0; }
+.oss-inv-check { display: inline-flex; align-items: center; gap: 4px; color: var(--text-muted); cursor: pointer; }
+.oss-inv-agent { margin-bottom: 12px; }
+.oss-inv-agent-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+.oss-inv-agent-counts { font-weight: 400; font-size: 11px; color: var(--text-muted); }
+.oss-inv-item { flex-direction: column; align-items: stretch; gap: 2px; font-family: inherit; }
+.oss-inv-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; min-width: 0; }
+.oss-inv-name { font-family: monospace; font-weight: 500; overflow-wrap: anywhere; color: var(--text); text-decoration: none; }
+a.oss-inv-name:hover { text-decoration: underline; }
+.oss-inv-type { font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; padding: 1px 6px; border-radius: 8px; border: 1px solid var(--border); color: var(--text-muted); }
+.oss-inv-version { font-family: monospace; font-size: 12px; color: var(--text-muted); }
+.oss-inv-sub { font-size: 11px; color: var(--text-muted); overflow-wrap: anywhere; }
+.oss-inv-effect { font-size: 12px; overflow-wrap: anywhere; }
 .github-repo-actions {
   display: flex;
   gap: 4px;
@@ -4153,6 +4685,8 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
   padding: 6px 10px;
   border-radius: var(--radius-sm);
   font-size: 13px;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
 }
 .github-repo-status.loading { background: var(--bg-card); color: var(--accent); border: 1px solid var(--accent); }
 .github-repo-status.error { background: var(--bg-card); color: var(--danger); border: 1px solid var(--danger); }
@@ -4328,14 +4862,33 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
   margin-left: 6px;
 }
 
+/* The inputs take a full row each and the buttons wrap under them, right
+   aligned: in one row an input's intrinsic width pushed Save/Cancel out past
+   the card's right edge. */
 .vault-card-edit-form {
-  padding: 10px 12px;
+  padding-top: 10px;
   border-top: 1px solid var(--border);
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 6px;
   align-items: center;
 }
-.vault-card-edit-form .input { flex: 1; }
+.vault-card-edit-form .input { flex: 1 1 100%; }
+/* .input has no base style, so these fields were the browser's white box. */
+.vault-card-edit-form .input,
+.connector-external-add .input {
+  min-width: 0;
+  padding: 6px 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-family: inherit;
+  color: var(--text);
+  outline: none;
+}
+.vault-card-edit-form .input:focus,
+.connector-external-add .input:focus { border-color: var(--accent); }
 
 /* === SSH Vault Section === */
 .ssh-section {
@@ -4344,6 +4897,7 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
   border-top: 1px solid var(--border);
 }
 .ssh-key-store-section { margin-top: 28px; }
+.vault-secrets-header { margin-top: 28px; }
 
 /* Key assign select in card/table */
 .ssh-key-select {
@@ -4759,6 +5313,8 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
 }
 .modal-close:hover { color: var(--text); }
 .modal-body { padding: 16px 20px; }
+/* The class's display:flex outranks the browser's [hidden] default; the keygen and scan modals hide their footer. */
+.modal-footer[hidden] { display: none; }
 .modal-desc { font-size: 13px; color: var(--text-muted); margin: 0 0 12px; }
 .modal-footer {
   display: flex;
@@ -5548,7 +6104,7 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
 }
 
 .skill-health-label.skill-health-ok   { background: var(--success-soft, rgba(34,197,94,.15)); color: var(--success); }
-.skill-health-label.skill-health-warn { background: rgba(245,158,11,.15); color: var(--warning, #f59e0b); }
+.skill-health-label.skill-health-warn { background: rgba(245,158,11,.15); color: var(--accent); }
 .skill-health-label.skill-health-err  { background: var(--danger-soft, rgba(239,68,68,.15)); color: var(--danger); }
 
 .skill-keyword-tag {
@@ -5607,6 +6163,13 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
   margin-top: 10px;
 }
 
+/* The skill detail modal hides these by the hidden attribute (no keywords, no
+   agents, not editing); the display rules above would otherwise keep them on
+   screen, and the edit row's Cancel would look dead. */
+.skill-detail-keywords[hidden] { display: none; }
+.skill-detail-agents-coverage[hidden] { display: none; }
+.skill-detail-edit-actions[hidden] { display: none; }
+
 .skill-detail-rendered {
   white-space: normal;
   font-family: var(--font-sans, inherit);
@@ -5638,6 +6201,33 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
 .md-rendered pre code { background: none; padding: 0; }
 .md-rendered :not(pre) > code { border-radius: 3px; padding: 1px 5px; }
 
+/* MARVEENGAPS1020 (b): skills waiting for approval */
+.skills-pending {
+  margin: 0 0 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--warning, #d4a52c);
+  border-left-width: 3px;
+  border-radius: 8px;
+  background: var(--bg-card);
+}
+.skills-pending-title { font-size: 15px; margin: 0 0 6px; }
+.skills-pending-intro { font-size: 13px; color: var(--text-secondary); margin: 0 0 12px; line-height: 1.5; }
+.skills-pending-card { border-top: 1px solid var(--border); padding: 12px 0 4px; }
+.skills-pending-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+.skills-pending-meta { font-size: 12px; color: var(--text-muted); }
+.skills-pending-sub { font-size: 12px; font-weight: 600; margin: 10px 0 4px; color: var(--text-secondary); }
+.skills-pending-findings { margin: 0; padding-left: 18px; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.skills-pending-pattern { display: inline-block; min-width: 150px; font-weight: 600; color: var(--danger); margin-right: 6px; }
+.skills-pending-excerpt { display: block; color: var(--text-muted); white-space: pre-wrap; }
+.skills-pending-warn { font-size: 12px; color: var(--danger); margin-top: 6px; }
+.skills-pending-target { font-size: 13px; font-weight: 600; margin: 6px 0 2px; }
+.skills-pending-target.is-global { color: var(--danger); }
+.skills-pending-sub.is-flagged { color: var(--danger); }
+.skills-pending-file { font-size: 12px; margin: 2px 0; overflow-wrap: anywhere; }
+.skills-pending-file summary.is-flagged { color: var(--danger); }
+.skills-pending-file pre { max-height: 360px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--bg-code); padding: 10px; border-radius: 6px; font-size: 12px; }
+.skills-pending-sha { font-family: monospace; font-size: 11px; color: var(--text-muted); overflow-wrap: anywhere; }
+.skills-pending-actions { display: flex; gap: 8px; margin: 10px 0 6px; flex-wrap: wrap; }
 .skills-stats {
   display: flex;
   gap: 12px;
@@ -6122,6 +6712,87 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
 /* === Settings page === */
 .settings-group { margin-bottom: 28px; }
 .settings-group:last-child { margin-bottom: 0; }
+.confirm-dialog p {
+  margin: 0 0 14px;
+  font-size: 14px;
+  line-height: 1.5;
+  white-space: pre-line;
+}
+.confirm-dialog-token {
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0 0 18px;
+  padding: 8px 10px;
+  font-family: var(--font-mono, monospace);
+  font-size: 13px;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.settings-reset-confirm-keys {
+  list-style: none;
+  margin: 0 0 20px;
+  padding: 4px 14px;
+  max-height: 40vh;
+  overflow-y: auto;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+}
+.settings-reset-confirm-keys li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+.settings-reset-confirm-keys li:last-child { border-bottom: none; }
+.settings-reset-confirm-key {
+  font-family: var(--font-mono, monospace);
+  font-weight: 600;
+}
+.settings-reset-confirm-change {
+  font-family: var(--font-mono, monospace);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+.confirm-dialog-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0 0 18px;
+  font-size: 13px;
+  line-height: 1.45;
+  cursor: pointer;
+}
+.confirm-dialog-check input { margin-top: 2px; flex: none; }
+.confirm-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: stretch;
+  gap: 8px;
+}
+/* .btn-primary is a full-width block by default; here the confirm button must
+   not outweigh Cancel, which is the safe choice and holds the focus. */
+.confirm-dialog-actions .btn-primary,
+.confirm-dialog-actions .btn-danger,
+.confirm-dialog-actions .btn-secondary {
+  width: auto;
+  min-width: 120px;
+  /* Same box for both: .btn-primary alone carries a top margin, a larger
+     padding and font, which left the two buttons on different baselines. */
+  margin: 0;
+  padding: 10px 20px;
+  font-size: 14px;
+}
+.settings-group-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin: 0 0 10px;
+}
 .settings-group-title {
   font-size: 13px;
   font-weight: 600;
@@ -6199,6 +6870,142 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
   color: var(--danger);
   flex-basis: 100%;
 }
+
+/* === Claude plans (PR2b) === */
+.claude-plan-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 8px;
+}
+.claude-plan-row-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 14px;
+}
+.claude-plan-row-meta {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 4px;
+  font-family: var(--font-mono, monospace);
+}
+.claude-plan-active-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--success);
+  flex-shrink: 0;
+}
+.claude-plan-badge {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 6px;
+  white-space: nowrap;
+}
+.claude-plan-badge-muted { color: var(--text-muted); }
+.claude-plan-delete {
+  background: none;
+  border: none;
+  color: var(--danger);
+  cursor: pointer;
+  font-size: 16px;
+  padding: 2px 6px;
+  flex-shrink: 0;
+}
+.claude-plan-delete:hover { opacity: 0.7; }
+.claude-plan-usage { margin-top: 10px; }
+.claude-plan-usage .quota-bar { grid-template-columns: 56px minmax(60px, 1fr) auto; }
+.claude-plan-usage-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.claude-plan-usage-error { color: var(--danger); }
+.claude-plan-status-ok { color: var(--success); border-color: var(--success); }
+.claude-plan-status-warn { color: var(--accent); border-color: var(--accent); }
+.claude-plan-status-exhausted { color: var(--danger); border-color: var(--danger); }
+.claude-plans-add-form {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+.claude-plans-checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.claude-plans-checkbox-row input { width: auto; }
+.claude-plans-form-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 12px;
+}
+.claude-plans-add-form .input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.claude-plans-form-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 6px;
+}
+
+/* "Log in to add a plan" (SETUPTOKENWIZ1022): link, code field, submit. */
+.claude-plans-login-step {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 8px;
+}
+/* display:flex would override the hidden attribute without this. */
+.claude-plans-login-step[hidden] {
+  display: none;
+}
+.claude-plans-login-step .form-row {
+  width: 100%;
+  align-items: center;
+}
+.claude-plans-form-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+.claude-plan-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.claude-plan-edit {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 2px 6px;
+}
+.claude-plan-edit:hover { color: var(--text); }
+.claude-plan-switch-btn { margin-right: 4px; white-space: nowrap; }
 
 /* === connectors.hu cross-promo banner === */
 .cxhu-banner {
@@ -6447,7 +7254,9 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
 }
 .activity-card.act-working { border-left-color: #22c55e; }
 .activity-card.act-idle    { border-left-color: #9ca3af; }
+.activity-card.act-subagents { border-left-color: #14b8a6; border-left-style: dashed; }
 .activity-card.act-error   { border-left-color: #ef4444; }
+.activity-card.act-dead    { border-left-color: #b91c1c; }
 .activity-card.act-unknown { border-left-color: #eab308; }
 .activity-card.act-stopped { border-left-color: #6b7280; opacity: 0.7; }
 .activity-card.act-clickable { cursor: pointer; transition: background 0.15s, box-shadow 0.15s; }
@@ -6473,7 +7282,9 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
   animation: badge-breathe 2s ease-in-out infinite;
 }
 .activity-badge.act-idle    { background: rgba(156,163,175,0.18); color: #6b7280; }
+.activity-badge.act-subagents { background: rgba(20,184,166,0.15); color: #0d9488; }
 .activity-badge.act-error   { background: rgba(239,68,68,0.15); color: #dc2626; }
+.activity-badge.act-dead    { background: rgba(185,28,28,0.18); color: #b91c1c; font-weight: 600; }
 .activity-badge.act-unknown { background: rgba(234,179,8,0.18); color: #ca8a04; }
 .activity-badge.act-stopped { background: rgba(107,114,128,0.15); color: #6b7280; }
 
@@ -6482,6 +7293,33 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
 @keyframes badge-breathe {
   0%, 100% { background: rgba(34,197,94,0.12); box-shadow: 0 0 0 0 rgba(34,197,94,0); }
   50%      { background: rgba(34,197,94,0.32); box-shadow: 0 0 8px 1px rgba(34,197,94,0.40); }
+}
+
+/* Thinking orb: a tiny animated sphere inside the "working" activity badge, so a
+   live agent reads as *thinking* at a glance (inspired by the "thinking orb"
+   pattern in AI chat UIs). Pure CSS, no JS lifecycle: the badge markup is
+   re-rendered every few seconds via innerHTML, and a CSS-only orb survives that
+   for free. Colors stay in the same green family as .act-working. */
+.activity-badge.act-working { display: inline-flex; align-items: center; gap: 6px; }
+.act-orb {
+  position: relative; width: 13px; height: 13px; border-radius: 50%;
+  overflow: hidden; flex-shrink: 0;
+  background: #15803d;
+  box-shadow: 0 0 6px rgba(34,197,94,0.55);
+}
+.act-orb::before {
+  content: ''; position: absolute; inset: -30%; border-radius: 50%;
+  background: conic-gradient(from 0deg, #166534, #22c55e, #86efac, #16a34a, #166534);
+  animation: orb-swirl 2.8s linear infinite;
+}
+.act-orb::after {
+  /* fixed specular highlight over the swirling core sells the "sphere" */
+  content: ''; position: absolute; inset: 0; border-radius: 50%;
+  background: radial-gradient(circle at 32% 28%, rgba(255,255,255,0.85), rgba(255,255,255,0) 46%);
+}
+@keyframes orb-swirl { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .act-orb::before { animation: none; }
 }
 .activity-tail {
   margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
@@ -6621,6 +7459,11 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
 }
 .bubble-out .bubble-id-chip { background: rgba(255,255,255,0.25); color: #fff; }
 .bubble-in .bubble-id-chip { background: var(--bg-hover); color: var(--text-muted); }
+/* Status/reply badges keep their theme colours on the neutral incoming bubble, but on the
+   accent-filled outgoing bubble those colours vanish (measured: green "reply" badge 1.14:1,
+   accent "failed" badge 1.0:1). A dark tint, not the id chip's white one: white on a
+   white-tinted accent is only 2.3:1, on a 20% black tint it is 4.6:1 (AA). */
+.bubble-out .badge { background: rgba(0,0,0,0.2); color: #fff; }
 .bubble-text { font-size: 13px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
 .bubble-out .bubble-text { color: #fff; }
 .bubble-time { font-size: 10px; opacity: 0.55; text-align: right; margin-top: 2px; }
@@ -6687,6 +7530,14 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
   margin: 8px 0 0;
 }
 .agent-reauth-reason { font-size: 11px; color: #ef4444; font-weight: 600; flex: 1; }
+.agent-sharedenv-banner {
+  background: color-mix(in srgb, var(--warning, #d4a52c) 12%, transparent);
+  border: 1px solid var(--warning, #d4a52c);
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin: 8px 0 0;
+}
+.agent-sharedenv-text { font-size: 11px; color: var(--warning, #d4a52c); font-weight: 600; overflow-wrap: anywhere; }
 .btn-danger {
   background: #ef4444;
   color: #fff;
@@ -6850,13 +7701,31 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
 .conv-bubble { max-width: 78%; padding: 8px 12px; border-radius: 12px; font-size: 13.5px; line-height: 1.45; }
 .conv-in .conv-bubble { background: var(--info-soft); border-bottom-left-radius: 3px; }
 .conv-out .conv-bubble { background: var(--success-soft); border-bottom-right-radius: 3px; }
-.conv-meta { font-size: 10.5px; opacity: .6; margin-bottom: 3px; }
+/* GH #426: these four lines used to dim with `opacity`, which is theme-blind.
+   Opacity composites the text toward whatever is BEHIND it, so the same value
+   that stays legible on the dark background washes near-black text out toward
+   the page in light mode. Measured on the real tokens:
+
+     rule                opacity   light      dark
+     .conv-action-text     .5      3.45:1     5.07:1
+     .conv-action-ts       .3*     1.97:1     2.63:1
+     .conv-note-text       .55     4.03:1     5.91:1
+     .conv-meta            .6      4.72:1     6.80:1
+     (* .6 nested inside the parent's .5)
+
+   Three of four fail 4.5:1 in light mode and the timestamp fails in BOTH, which
+   is why the reporter could only read these rows by selecting them: the
+   selection highlight paints a solid background behind the text. A dimmed COLOUR
+   is the same visual intent without the theme dependence. */
+.conv-meta { font-size: 10.5px; color: var(--text-dim); margin-bottom: 3px; }
 .conv-text { white-space: normal; word-break: break-word; }
 .conv-row.conv-note { justify-content: center; }
-.conv-note-text { font-size: 12px; opacity: .55; font-style: italic; max-width: 88%; }
+.conv-note-text { font-size: 12px; color: var(--text-dim); font-style: italic; max-width: 88%; }
 .conv-row.conv-action { justify-content: flex-start; }
-.conv-action-text { font-size: 11.5px; opacity: .5; font-family: 'JetBrains Mono', monospace; display: flex; gap: 8px; align-items: baseline; }
-.conv-action-ts { opacity: .6; font-size: 10px; }
+.conv-action-text { font-size: 11.5px; color: var(--text-dim); font-family: 'JetBrains Mono', monospace; display: flex; gap: 8px; align-items: baseline; }
+/* No second dimming step here: nesting one opacity inside another is what took
+   the timestamp to 1.97:1. It is separated by size, not by fading. */
+.conv-action-ts { font-size: 10px; }
 /* === Mobile login QR modal === */
 .mobile-login-qr {
   width: 240px;
@@ -6879,6 +7748,30 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
   line-height: 1.4;
 }
 
+/* === Gromzo card (GROMZOOWNERQR1030; its owner QR moved to the Bridge, GROMZOBRIDGEWIZARD1107 D5a) === */
+.gromzo-card .gromzo-status { font-size: 13px; color: var(--text-muted); margin: 6px 0 12px; }
+.gromzo-card .mobile-login-warn { text-align: left; margin-top: 10px; }
+.gromzo-owner-info { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; margin: 4px 0 14px; padding: 12px 14px; border: 1px solid var(--accent); border-radius: 8px; background: var(--bg-card); }
+.gromzo-owner-info[hidden] { display: none; }
+.gromzo-owner-info-text { margin: 0; font-size: 13px; color: var(--text); }
+.gromzo-agents { margin-top: 18px; border-top: 1px solid var(--border); padding-top: 14px; }
+.gromzo-agents-title { font-size: 14px; font-weight: 600; margin: 0 0 6px; }
+.gromzo-agents-limit { font-size: 12px; color: var(--text-muted); margin: 4px 0 10px; }
+.gromzo-agent-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.gromzo-agent-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; min-height: 44px; }
+.gromzo-agent-main { flex: 1 1 180px; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.gromzo-agent-name { font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+.gromzo-agent-state { font-size: 12px; color: var(--text-muted); }
+.gromzo-agent-state.is-on { color: var(--success); }
+.gromzo-agent-state.is-pending { color: var(--accent); }
+.gromzo-agent-state.is-error { color: var(--danger); }
+.gromzo-agent-state.is-warn { color: var(--accent); }
+.gromzo-agent-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; flex-shrink: 0; }
+.gromzo-agent-row .btn-compact { min-height: 36px; }
+/* GROMZONAMETAKEN1106: the agent's name on Gromzo, shown on a row after a name refusal. */
+.gromzo-agent-namefield { display: flex; flex-direction: column; gap: 3px; margin-top: 4px; font-size: 12px; color: var(--text-muted); max-width: 360px; }
+.gromzo-agent-namefield input { width: 100%; }
+
 /* === Docs viewer: content toolbar (.md download) === */
 .docs-content-toolbar { display: flex; justify-content: flex-end; margin: 0 0 12px; }
 .docs-content-toolbar .btn-compact { font-size: 12px; }
@@ -6899,7 +7792,7 @@ main.kanban-active { padding-left: 16px; padding-right: 16px; }
 .naplo-search { flex: 1; min-width: 160px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-card); color: var(--text); font-size: 13px; }
 .naplo-summary { font-size: 13px; color: var(--text-muted); margin-bottom: 10px; }
 .naplo-empty { color: var(--text-muted); font-size: 14px; text-align: center; margin-top: 40px; }
-.naplo-empty.error { color: var(--danger, #ef4444); }
+.naplo-empty.error { color: var(--danger); }
 .naplo-timeline { display: flex; flex-direction: column; gap: 1px; }
 .naplo-entry { display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border-radius: 6px; background: var(--bg-card); border: 1px solid var(--border); font-size: 13px; }
 .naplo-entry-meta { display: flex; align-items: center; gap: 8px; }
@@ -7260,6 +8153,16 @@ body {
 }
 .mv-auth-card button:hover { background: var(--accent-hover); }
 .mv-auth-card button:disabled { opacity: 0.6; cursor: default; }
+/* The overlay's second button (Cancel, or Later on the Bridge offer) reads as the shared secondary button, centered;
+   the rule above would otherwise paint it as a second primary. */
+.mv-auth-card button.btn-secondary {
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  font-weight: 500;
+  justify-content: center;
+}
+.mv-auth-card button.btn-secondary:hover { background: var(--bg-input); border-color: var(--accent); color: var(--accent); }
 .mv-auth-err {
   color: var(--danger);
   font-size: 13px;
@@ -7375,3 +8278,346 @@ body {
   vertical-align: middle;
 }
 
+
+/* === Card blockers ("blocked by") ============================================
+   Rows rather than pills: a blocker carries a whole card title, which a pill
+   would truncate to uselessness. The cleared state keeps a finished blocker
+   visible (the link is history) while making it obvious it no longer holds
+   anything up. */
+.blocker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 22px;
+}
+.blocker-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  font-size: 13px;
+}
+.blocker-link {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.blocker-link:hover { text-decoration: underline; }
+.blocker-state {
+  flex: none;
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: lowercase;
+}
+.blocker-remove {
+  flex: none;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 0 2px;
+  opacity: 0.7;
+}
+.blocker-remove:hover { opacity: 1; color: var(--danger, #dc2626); }
+.blocker-cleared .blocker-link { text-decoration: line-through; color: var(--text-muted); }
+.blocker-empty { font-size: 12px; color: var(--text-muted); padding: 2px 0; }
+
+/* Board badge. Sits in the card footer next to assignee/due, so a blocked card
+   is readable without opening it. */
+.kanban-card-blocked {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: auto;
+  padding: 1px 6px;
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #b45309;
+  background: color-mix(in srgb, #f59e0b 18%, transparent);
+  border: 1px solid color-mix(in srgb, #f59e0b 45%, transparent);
+}
+
+/* Live agent state on an in_progress card. The colour is the AGENT's state, not
+   the card's: green working, yellow possibly stuck, red stopped/dead, grey idle. */
+.kanban-card-agent-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+  border: 1px solid color-mix(in srgb, currentColor 35%, transparent);
+}
+.kanban-agent-live-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.kanban-agent-live-ok { color: #15803d; }
+.kanban-agent-live-warn { color: #b45309; }
+.kanban-agent-live-bad { color: #b91c1c; font-weight: 600; }
+.kanban-card[data-agent-live="bad"] { box-shadow: inset 3px 0 0 #dc2626; }
+/* Evidence on done: the closing agent said what it checked. Neutral colour on
+   purpose: the agent writes this itself, so the chip must not read as a check. */
+.kanban-card-evidence {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+  border: 1px solid color-mix(in srgb, currentColor 35%, transparent);
+}
+
+/* MEMKERESVAK917: the memory search is forgiving -- when nothing matches the
+   query as asked it answers with the rescued near-misses, and in the LIST those
+   are indistinguishable from real hits. The endpoint says which it was in the
+   X-Memory-Search header; this is where the viewer gets told. */
+.mem-search-label {
+  margin: 0 0 10px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.45;
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  color: var(--text, inherit);
+}
+.mem-search-label code { font-size: 11px; opacity: .85; }
+
+/* === Team notes ("Jegyzetek") === */
+.notes-form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 0 0 16px; }
+.notes-form .input { min-width: 0; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-card); color: var(--text); font-size: 14px; font-family: inherit; }
+.notes-form .input:focus { outline: none; border-color: var(--accent); }
+.notes-form-content { flex: 1 1 280px; }
+.notes-table-wrap { margin-bottom: 16px; }
+.notes-table td { vertical-align: top; }
+.notes-content { white-space: pre-wrap; word-break: break-word; }
+.notes-assignee { font-weight: 600; white-space: nowrap; }
+.notes-muted { color: var(--text-muted, #888); font-size: 0.9em; overflow-wrap: anywhere; }
+.notes-actions { text-align: right; white-space: nowrap; }
+.notes-empty { text-align: center; color: var(--text-muted, #888); padding: 16px; }
+.notes-row-overdue td { background: var(--danger-soft); }
+.notes-row-today td { background: var(--accent-soft); }
+.notes-due-tag { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 8px; font-size: 0.8em; font-weight: 600; background: var(--danger); color: #fff; }
+.notes-row-today .notes-due-tag { background: var(--accent); }
+.notes-deleted > summary { cursor: pointer; color: var(--text-muted, #888); margin-bottom: 8px; }
+@media (max-width: 768px) {
+  .notes-table thead { display: none; }
+  .notes-table tr { display: block; padding: 8px 0; border-bottom: 1px solid var(--border, #333); }
+  .notes-table td { display: block; border: none; padding: 2px 8px; }
+  .notes-table td[data-label]::before { content: attr(data-label) ": "; color: var(--text-muted, #888); font-size: 0.85em; }
+  .notes-actions { text-align: left; }
+  .notes-assignee { white-space: normal; overflow-wrap: anywhere; }
+}
+
+/* KILLSWITCH1022: the fleet's red button and its banner. */
+.fleet-freeze-btn {
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+  text-align: left;
+}
+.fleet-freeze-btn:hover:not(:disabled) { background: var(--danger); color: #fff; }
+.fleet-freeze-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.fleet-freeze-banner {
+  border-left-color: var(--danger);
+  background: var(--danger-soft);
+  font-weight: 600;
+}
+
+/* === Owner strip: "what is waiting on YOU" ===
+   A single row, ordered by priority, of the cards the process is blocked on
+   until the person acts. It sits ABOVE the filter row and deliberately ignores every filter: it is a
+   personal queue, not a view of the board, and a queue that a stray filter can
+   empty is worse than no queue at all. */
+.kanban-owner-strip {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: linear-gradient(var(--accent-soft), var(--accent-soft)), var(--bg-card);
+}
+.kanban-owner-strip-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+}
+.kanban-owner-strip-count {
+  font-size: 12px;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 10px;
+  background: var(--accent);
+  color: var(--bg-card);
+}
+.kanban-owner-strip-toggle { margin-left: auto; font-size: 11px; color: var(--text-muted); }
+.kanban-owner-strip-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 9px;
+}
+.kanban-owner-strip.collapsed .kanban-owner-strip-groups { display: none; }
+/* Three colour-coded tiers: red = urgent on top, yellow = "when I have time",
+   green = can wait. The colour is on the whole group, not only on a dot, so
+   the urgent block is visible without reading the chips. The colours are the
+   palette's own: --danger, the --warning fallback used elsewhere in this
+   file, and --success. Head text is mixed toward --text so it stays readable
+   on the tinted background in both themes. */
+.kanban-owner-strip-groups { display: flex; flex-direction: column; gap: 8px; margin-top: 9px; }
+.kanban-owner-strip-group { --tier: var(--border); padding: 6px 8px 8px; border-left: 4px solid var(--tier); border-radius: var(--radius-sm); background: color-mix(in srgb, var(--tier) 14%, transparent); }
+.kanban-owner-strip-group .kanban-owner-strip-items { margin-top: 5px; }
+.kanban-owner-strip-group .kanban-owner-strip-item { border-color: var(--tier); }
+.kanban-owner-strip-group .kanban-owner-strip-item:hover { border-color: var(--accent); }
+.kanban-owner-strip-group-head { font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: color-mix(in srgb, var(--tier) 70%, var(--text)); }
+.kanban-owner-strip-group.tier-urgent { --tier: var(--danger); }
+.kanban-owner-strip-group.tier-later  { --tier: var(--warning, #d4a52c); }
+.kanban-owner-strip-group.tier-parked { --tier: var(--success); }
+.kanban-owner-strip-group.tier-later  .kanban-owner-strip-item .dot.normal { background: var(--tier); }
+.kanban-owner-strip-group.tier-parked .kanban-owner-strip-item .dot.low    { background: var(--tier); }
+.kanban-owner-strip-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 4px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-card);
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color var(--transition);
+}
+.kanban-owner-strip-item:hover { border-color: var(--accent); }
+.kanban-owner-strip-item .seq { font-family: monospace; font-size: 11px; color: var(--text-muted); }
+.kanban-owner-strip-item .title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 320px;
+}
+.kanban-owner-strip-item .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.kanban-owner-strip-item .dot.urgent { background: var(--danger); }
+.kanban-owner-strip-item .dot.high   { background: var(--accent); }
+.kanban-owner-strip-item .dot.normal { background: var(--info); }
+.kanban-owner-strip-item .dot.low    { background: var(--border); }
+/* Whose card it is, when it reached the strip through the "Rád vár" label. */
+.kanban-owner-strip-item .who {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding-left: 6px;
+  border-left: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.kanban-owner-strip-who-avatar { width: 18px; height: 18px; font-size: 10px; }
+
+/* Character nickname beside a team member's name on the Team page. It may
+   shrink and ellipsise, but not wrap. */
+.agent-nickname {
+  font-size: 12px;
+  font-weight: 500;
+  font-style: italic;
+  color: var(--text-muted);
+  white-space: nowrap;
+  min-width: 0;
+  flex-shrink: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.gromzo-card > summary.gromzo-summary { cursor: pointer; font-size: 14px; font-weight: 600; color: var(--text-muted); user-select: none; }
+.gromzo-card[open] > summary.gromzo-summary { margin-bottom: 8px; color: var(--text); }
+
+/* Card ca046c9a (#570): hot memories with no write for N days. */
+.mem-stale-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 0 0 10px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  border: 1px solid #dc3c3c;
+  background: rgba(220, 60, 60, 0.06);
+}
+.mem-stale-banner button { margin-left: auto; }
+/* display:flex above would beat the hidden attribute: an empty red strip on every other tab. */
+.mem-stale-banner[hidden] { display: none; }
+/* Card f9242cd3 (#571): the FELULIRJA chain. */
+.mem-chain { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 6px; }
+.mem-chain-chip {
+  font: inherit;
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  cursor: pointer;
+  background: transparent;
+  color: #6a9bcc;
+  border: 1px solid rgba(106, 155, 204, 0.5);
+}
+.mem-chain-chip.partial { border-style: dashed; }
+.mem-chain-chip.replaced { color: #b07a1e; border-color: rgba(176, 122, 30, 0.5); }
+.mem-ref-preview {
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border-left: 3px solid rgba(106, 155, 204, 0.6);
+  background: rgba(106, 155, 204, 0.06);
+  border-radius: 4px;
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.mem-ref-preview-head { font-weight: 600; margin-bottom: 4px; opacity: .8; }
+.mem-use-badge {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  color: var(--text-secondary, #888);
+  border: 1px solid rgba(128, 128, 128, 0.35);
+}
+.mem-use-badge.none {
+  opacity: 0.6;
+  font-style: italic;
+}
+.mem-stale-badge {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  color: #dc3c3c;
+  border: 1px solid rgba(220, 60, 60, 0.45);
+}

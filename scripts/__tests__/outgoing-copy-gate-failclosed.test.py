@@ -48,6 +48,107 @@ for name, payload, want in CASES:
         failed.append(name)
     print(f"  [{'PASS' if ok else 'FAIL'}] {name}: exit={got} want={want}")
 
+# --- THE SHARED RULE'S OWN IMPORT MUST FAIL CLOSED TOO -----------------------
+# MSGGATE924: the mixed-script rule moved to scripts/lib/mixed_script.py so both
+# gates share it. That import fires during MODULE LOAD, so a bare ImportError
+# escapes the __main__ net above and exits 1 -- which PreToolUse reads as
+# NON-blocking. An extraction that turns "checked" into "ran unchecked" is a
+# worse bug than the duplication it removed, so the failure mode is pinned here.
+#
+# The rule file is removed while email_extract stays, otherwise the block could
+# come from the email stub and this case would measure nothing.
+import shutil
+import tempfile
+
+with tempfile.TemporaryDirectory() as _tmp:
+    _root = os.path.join(_tmp, "scripts")
+    shutil.copytree(os.path.join(os.path.dirname(HERE), "hooks"), os.path.join(_root, "hooks"))
+    shutil.copytree(os.path.join(os.path.dirname(HERE), "lib"), os.path.join(_root, "lib"))
+    os.remove(os.path.join(_root, "lib", "mixed_script.py"))
+    _gate = os.path.join(_root, "hooks", "outgoing-copy-gate.py")
+    _payload = json.dumps({
+        "tool_name": "Bash",
+        "tool_input": {"command": "curl -s -X POST http://localhost:3420/api/messages "
+                                  "-d '{\"from\":\"igor\",\"to\":\"hex\",\"content\":\"tiszta szoveg\"}'"},
+    })
+    _proc = subprocess.run([sys.executable, _gate], input=_payload.encode(), capture_output=True)
+    _err = _proc.stderr.decode("utf-8", "replace")
+    _name = "a missing mixed_script.py BLOCKS (was: exit 1, i.e. NON-blocking)"
+    _ok = _proc.returncode == 2
+    failed.append(_name) if not _ok else None
+    print(f"  [{'PASS' if _ok else 'FAIL'}] {_name}: exit={_proc.returncode} want=2")
+
+    _name2 = "  ...and it says the RULE could not load, not that a homoglyph was found"
+    _ok2 = ("NEM TOLTHETO BE" in _err) and ("mixed_script" in _err)
+    failed.append(_name2) if not _ok2 else None
+    print(f"  [{'PASS' if _ok2 else 'FAIL'}] {_name2}: stderr={_err[:120]!r}")
+
+# --- A FAIL-OPEN PASS MUST REACH THE SENDING AGENT ---------------------------
+# HOOKWARNCTX1108 follow-up: the channel paths fail OPEN by design, but three of
+# those exit-0 arms wrote only to stderr and the gate log. On exit 0 neither
+# reaches the model; only hookSpecificOutput.additionalContext does. So the
+# agent never learned that its message went out unchecked. Each arm must stay a
+# pass (exit 0, no permissionDecision) AND carry the warning to the agent.
+# The internal error is forced by replacing audit() in a child process, on a
+# copy of the gate, so the gate log lands in a temp store.
+_CHILD = r"""
+import importlib.util, io, sys
+spec = importlib.util.spec_from_file_location("ocg", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+if sys.argv[3] == "1":
+    def boom(*a, **k): raise RuntimeError("forced-internal-error REPRMARKER-szoveg")
+    m.audit = boom
+sys.stdin = io.StringIO(sys.argv[2])
+m.main()
+"""
+
+
+def _reaches_agent(code, out):
+    try:
+        j = json.loads(out.strip().splitlines()[-1])
+    except Exception:
+        return False
+    return (code == 0 and "NELKUL ment ki" in j.get("systemMessage", "")
+            and j.get("hookSpecificOutput") == {"hookEventName": "PreToolUse",
+                                                "additionalContext": j["systemMessage"]})
+
+
+_FAILOPEN = [
+    ("channel_gate, Telegram: an internal error", "1",
+     {"tool_name": "mcp__plugin_telegram_telegram__reply", "tool_input": {"chat_id": "1", "text": "Szia."}}),
+    ("channel_gate, Discord: an internal error", "1",
+     {"tool_name": "mcp__plugin_discord_discord__reply", "tool_input": {"chat_id": "1", "text": "Szia."}}),
+    ("http_channel_gate: an internal error", "1",
+     {"tool_name": "Bash", "tool_input": {"command":
+      "curl -s -X POST https://discord.com/api/v10/channels/1/messages -d '{\"content\":\"Szia.\"}'"}}),
+    ("Telegram reply with a non-dict tool_input", "0",
+     {"tool_name": "mcp__plugin_telegram_telegram__reply", "tool_input": 42}),
+]
+with tempfile.TemporaryDirectory() as _tmp:
+    _root = os.path.join(_tmp, "scripts")
+    shutil.copytree(os.path.join(os.path.dirname(HERE), "hooks"), os.path.join(_root, "hooks"))
+    shutil.copytree(os.path.join(os.path.dirname(HERE), "lib"), os.path.join(_root, "lib"))
+    os.makedirs(os.path.join(_tmp, "store"))
+    # A valid rules file, so the missing-rules warning cannot be what the check sees.
+    with open(os.path.join(_tmp, "store", "outgoing-copy-gate-rules.json"), "w") as _fh:
+        json.dump({"bad_name_patterns": ["Xyzzyq"], "correction": "Plugh"}, _fh)
+    _gate = os.path.join(_root, "hooks", "outgoing-copy-gate.py")
+    for _label, _force, _payload in _FAILOPEN:
+        _p = subprocess.run([sys.executable, "-c", _CHILD, _gate, json.dumps(_payload), _force],
+                            capture_output=True, text=True)
+        _name = f"{_label}: fail-open (exit 0) and the agent is told it went out unchecked"
+        _ok = _reaches_agent(_p.returncode, _p.stdout)
+        failed.append(_name) if not _ok else None
+        print(f"  [{'PASS' if _ok else 'FAIL'}] {_name}: exit={_p.returncode} stdout={_p.stdout[:100]!r}")
+        if _force == "1":
+            # The exception repr can quote the processed text, so the model gets
+            # the type name only; the full repr stays on stderr (and the log).
+            _name = f"{_label}: the agent gets the exception type, never its repr text"
+            _ok = ("RuntimeError" in _p.stdout and "REPRMARKER" not in _p.stdout
+                   and "REPRMARKER" in _p.stderr)
+            failed.append(_name) if not _ok else None
+            print(f"  [{'PASS' if _ok else 'FAIL'}] {_name}: stdout={_p.stdout[:160]!r}")
+
 print()
 if failed:
     print(f"{len(failed)} FAILED: {failed}", file=sys.stderr)

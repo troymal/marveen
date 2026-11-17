@@ -21,6 +21,9 @@ import { tmpdir } from 'node:os'
 
 const ROOT = join(__dirname, '..', '..')
 const UPDATE = readFileSync(join(ROOT, 'update.sh'), 'utf-8')
+// DOCKERSEEDREFRESH1108: the refresh rules moved to scripts/lib/seed-refresh.sh (update.sh sources it); the functions
+// are sliced from both, the update.sh-only checks below still read UPDATE.
+const SHELL_SRC = UPDATE + '\n' + readFileSync(join(ROOT, 'scripts', 'lib', 'seed-refresh.sh'), 'utf-8')
 
 function sliceShellFn(src: string, name: string): string {
   const start = src.indexOf(`${name}() {`)
@@ -30,8 +33,12 @@ function sliceShellFn(src: string, name: string): string {
   return src.slice(start, end + 2)
 }
 
-const FUNCS = ['render_seed_template', 'seed_copy_is_untouched', 'refresh_untouched_seeds', 'run_seed_refresh']
-  .map((n) => sliceShellFn(UPDATE, n))
+// The scheduled-task registry hooks are called from the refresh
+// loop; with no built CLI in the fixture they only print a warning.
+const FUNCS = ['render_seed_template', 'render_seeded_task_config', 'render_seed_stream', 'seed_copy_is_untouched', 'render_seed_file', 'seed_en_file', 'seed_copy_is_untouched_any', 'seed_refresh_dir_lang', 'sched_pre_verify_once',
+  'refresh_one_seed_file', 'refresh_untouched_seeds', 'run_seed_refresh', 'seed_refresh_groups', 'seed_tracked_files',
+  'register_seeded_schedules', 'sched_task_verified_ok', 'sched_task_all_shipped', 'register_refreshed_schedule']
+  .map((n) => sliceShellFn(SHELL_SRC, n))
   .join('\n')
 
 function git(dir: string, args: string[]): void {
@@ -70,7 +77,7 @@ function runRefresh(install: string, home: string): { out: string; code: number 
   const script = join(install, 'probe.sh')
   writeFileSync(script, [
     'set -u',
-    'GREEN=""; NC=""',
+    'GREEN=""; NC=""; ORANGE=""',
     `INSTALL_DIR="${install}"`,
     `HOME="${home}"`,
     'MAIN_AGENT_ID=""; BOT_NAME=""; OWNER_NAME=""; WEB_PORT=""',
@@ -157,6 +164,26 @@ describe('seed refresh touches only provably untouched copies', () => {
     }
   })
 
+  it('without MAIN_AGENT_ID the templated groups are skipped, the verbatim skills are still refreshed', () => {
+    // DOCKERSEEDREFRESH1108 (a mutant of the gate survived): a copy rendered with an EMPTY agent id would compare equal
+    // to an empty-id render, so only the gate keeps it from being rewritten.
+    const f = makeFixture()
+    try {
+      writeFileSync(join(f.install, '.env'), 'BOT_NAME=Marveen\nOWNER_NAME=Szabolcs\nWEB_PORT=3420\n')
+      const dir = join(f.home, '.claude', 'scheduled-tasks', 'demo-task')
+      mkdirSync(dir, { recursive: true })
+      writeFileSync(join(dir, 'SKILL.md'), 'task v1 \n')
+      const skill = join(f.home, '.claude', 'skills', 'demo')
+      mkdirSync(skill, { recursive: true })
+      writeFileSync(join(skill, 'SKILL.md'), f.versions[0])
+      runRefresh(f.install, f.home)
+      expect(readFileSync(join(dir, 'SKILL.md'), 'utf-8')).toBe('task v1 \n')
+      expect(readFileSync(join(skill, 'SKILL.md'), 'utf-8')).toBe(f.versions[2])
+    } finally {
+      rmSync(f.base, { recursive: true, force: true })
+    }
+  })
+
   it('leaves a modified TEMPLATED copy alone too', () => {
     const f = makeFixture()
     try {
@@ -225,9 +252,48 @@ describe('the refresh runs where it can reach an already-current machine', () =>
   })
 
   it('does not touch CLAUDE.md -- that refresh stays behind its own flag', () => {
-    const fn = sliceShellFn(UPDATE, 'run_seed_refresh') + sliceShellFn(UPDATE, 'refresh_untouched_seeds')
+    const fn = sliceShellFn(SHELL_SRC, 'run_seed_refresh') + sliceShellFn(SHELL_SRC, 'seed_refresh_groups') + sliceShellFn(SHELL_SRC, 'refresh_untouched_seeds')
     expect(fn).not.toMatch(/CLAUDE\.md/)
     expect(UPDATE).toMatch(/REGEN_CLAUDEMD/)   // the flag still exists, unchanged
+  })
+})
+
+// DOCKERSEEDREFRESH1108: the rules live in scripts/lib/seed-refresh.sh. update.sh loads it BEFORE the pull, so the run
+// that pulls keeps the old update.sh with the old lib (the pull-run invariant of seed-lang-en); a torn checkout without
+// the lib skips the refresh only, with one line, instead of dying under set -e.
+describe('the shared seed-refresh lib (DOCKERSEEDREFRESH1108)', () => {
+  it('update.sh sources the lib before the pull, guarded, and the lib defines functions only', () => {
+    const lines = UPDATE.split('\n')
+    const src = lines.findIndex((l) => l.trim() === '. "$INSTALL_DIR/scripts/lib/seed-refresh.sh" || true')
+    const guard = lines.findIndex((l) => l === 'if [ -f "$INSTALL_DIR/scripts/lib/seed-refresh.sh" ]; then')
+    const pull = lines.findIndex((l) => l.includes('git pull --ff-only origin "$CURRENT_BRANCH"'))
+    expect(guard).toBeGreaterThan(0)
+    expect(src).toBe(guard + 2)
+    expect(pull).toBeGreaterThan(src)
+    // Sourcing it sets no variable and prints nothing, under set -eu (measured by execution, not by reading the text).
+    const lib = join(ROOT, 'scripts', 'lib', 'seed-refresh.sh')
+    const probe = `set -eu\nb="$(compgen -v | grep -v '^_$' | sort)"\n. ${JSON.stringify(lib)}\na="$(compgen -v | grep -v '^_$' | grep -vx 'b' | sort)"\n[ "$a" = "$b" ] && echo same\ndeclare -F | awk '{print $3}' | sort | tr '\\n' ' '`
+    const out = execFileSync('bash', ['-c', probe], { encoding: 'utf-8' })
+    expect(out.split('\n')[0]).toBe('same')
+    expect(out.split('\n')[1].trim().split(' ')).toEqual(['refresh_one_seed_file', 'refresh_untouched_seeds', 'register_refreshed_schedule', 'render_persona_file', 'render_seed_file', 'render_seed_stream',
+      'render_seed_template', 'render_seeded_task_config', 'sched_pre_verify_once', 'sched_task_all_shipped', 'seed_copy_is_untouched_any', 'seed_en_file',
+      'seed_refresh_dir_lang', 'seed_refresh_groups'])
+  })
+
+  it('without the lib run_seed_refresh prints one line and returns 0; nothing under ~/.claude changes', () => {
+    const f = makeFixture()
+    try {
+      mkdirSync(join(f.home, '.claude', 'skills', 'demo'), { recursive: true })
+      writeFileSync(join(f.home, '.claude', 'skills', 'demo', 'SKILL.md'), f.versions[0])
+      const before = readFileSync(join(f.home, '.claude', 'skills', 'demo', 'SKILL.md'), 'utf-8')
+      const fn = sliceShellFn(UPDATE, 'run_seed_refresh')
+      const out = execFileSync('bash', ['-c', `set -eu\nGREEN=""; NC=""; ORANGE=""\nINSTALL_DIR=${JSON.stringify(f.install)}\n${fn}\nrun_seed_refresh\necho rc=$?`],
+        { env: { ...process.env, HOME: f.home }, encoding: 'utf-8' })
+      expect(out).toBe(`  seed refresh skipped: ${f.install}/scripts/lib/seed-refresh.sh is missing\nrc=0\n`)
+      expect(readFileSync(join(f.home, '.claude', 'skills', 'demo', 'SKILL.md'), 'utf-8')).toBe(before)
+    } finally {
+      rmSync(f.base, { recursive: true, force: true })
+    }
   })
 })
 
@@ -268,7 +334,7 @@ describe('top-level scheduled-tasks/ refresh (SEEDREFRESH826)', () => {
     const script = join(install, 'probe-top.sh')
     writeFileSync(script, [
       'set -u',
-      'GREEN=""; NC=""',
+      'GREEN=""; NC=""; ORANGE=""',
       `INSTALL_DIR="${install}"`,
       `HOME="${home}"`,
       'MAIN_AGENT_ID="marveen"; BOT_NAME="Bot"; OWNER_NAME="Owner"; WEB_PORT="3420"',
@@ -314,5 +380,99 @@ describe('top-level scheduled-tasks/ refresh (SEEDREFRESH826)', () => {
     // The pre-fix run_seed_refresh listed only seed-skills + seed-scheduled-tasks;
     // this pins that the fix is the source line, not an accident of the fixture.
     expect(FUNCS).toContain('refresh_untouched_seeds "scheduled-tasks"')
+  })
+})
+
+// #2285: the dashboard seeder (copyTaskConfigWithAgentRewrite) writes a top-level
+// task-config.json with "agent" set to MAIN_AGENT_ID, re-serialised, and no
+// placeholder substitution. The refresh compared against the placeholder render,
+// which kept the shipped literal "agent": "marveen": on any other MAIN_AGENT_ID an
+// untouched config never matched, so a shipped config fix never arrived while its
+// SKILL.md did.
+describe('top-level task-config.json on a non-default MAIN_AGENT_ID (#2285)', () => {
+  const v1 = { name: 'demo-cfg', type: 'dream-engine', schedule: '7 2 * * *', agent: 'marveen', note: '{{PROJECT_ROOT}}/x' }
+  const v2 = { ...v1, type: 'heartbeat' }
+  // Exactly what copyTaskConfigWithAgentRewrite writes.
+  const seeded = (cfg: Record<string, unknown>, agent: string) => JSON.stringify({ ...cfg, agent }, null, 2) + '\n'
+
+  function makeCfgFixture() {
+    const base = mkdtempSync(join(tmpdir(), 'seedrefresh-cfg-'))
+    const install = join(base, 'install')
+    const home = join(base, 'home')
+    const src = join(install, 'scheduled-tasks', 'demo-cfg')
+    mkdirSync(src, { recursive: true })
+    git(install, ['init', '-q'])
+    git(install, ['config', 'user.email', 'test@example.invalid'])
+    git(install, ['config', 'user.name', 'test'])
+    for (const [i, cfg] of [v1, v2].entries()) {
+      // The shipped files are 2-space JSON with the literal default agent.
+      writeFileSync(join(src, 'task-config.json'), JSON.stringify(cfg, null, 2) + '\n')
+      git(install, ['add', 'scheduled-tasks/demo-cfg/task-config.json'])
+      git(install, ['commit', '-q', '-m', `cfg v${i + 1}`])
+    }
+    const liveDir = join(home, '.claude', 'scheduled-tasks', 'demo-cfg')
+    mkdirSync(liveDir, { recursive: true })
+    return { base, install, home, livePath: join(liveDir, 'task-config.json') }
+  }
+
+  function runAs(install: string, home: string, agent: string): { out: string; code: number } {
+    const script = join(install, 'probe-cfg.sh')
+    writeFileSync(script, [
+      'set -u',
+      'GREEN=""; NC=""; ORANGE=""',
+      `INSTALL_DIR="${install}"`,
+      `HOME="${home}"`,
+      `MAIN_AGENT_ID="${agent}"; BOT_NAME="Bot"; OWNER_NAME="Owner"; WEB_PORT="3420"`,
+      FUNCS,
+      'run_seed_refresh',
+    ].join('\n') + '\n')
+    try {
+      return { out: execFileSync('bash', [script], { encoding: 'utf-8' }).trim(), code: 0 }
+    } catch (e) {
+      const err = e as { stdout?: string; stderr?: string; status?: number }
+      return { out: `${String(err.stdout ?? '')}${String(err.stderr ?? '')}`.trim(), code: err.status ?? -1 }
+    }
+  }
+
+  for (const agent of ['jarvis', 'marveen']) {
+    it(`an untouched seeded config is refreshed on MAIN_AGENT_ID=${agent}, agent kept, nothing substituted`, () => {
+      const f = makeCfgFixture()
+      try {
+        writeFileSync(f.livePath, seeded(v1, agent))
+        const r = runAs(f.install, f.home, agent)
+        expect(r.code).toBe(0)
+        const after = readFileSync(f.livePath, 'utf-8')
+        expect(after).toBe(seeded(v2, agent))
+        expect(JSON.parse(after).agent).toBe(agent)
+        expect(after).toContain('{{PROJECT_ROOT}}/x') // the node seeder substitutes nothing in a config
+      } finally {
+        rmSync(f.base, { recursive: true, force: true })
+      }
+    })
+  }
+
+  it('a hand-edited config (schedule changed) stays byte-for-byte on a non-default MAIN_AGENT_ID', () => {
+    const f = makeCfgFixture()
+    try {
+      const edited = seeded({ ...v1, schedule: '30 3 * * *' }, 'jarvis')
+      writeFileSync(f.livePath, edited)
+      const r = runAs(f.install, f.home, 'jarvis')
+      expect(r.code).toBe(0)
+      expect(readFileSync(f.livePath, 'utf-8')).toBe(edited)
+    } finally {
+      rmSync(f.base, { recursive: true, force: true })
+    }
+  })
+
+  it('an already-current config is not rewritten (idempotent, no refresh counted)', () => {
+    const f = makeCfgFixture()
+    try {
+      writeFileSync(f.livePath, seeded(v2, 'jarvis'))
+      const r = runAs(f.install, f.home, 'jarvis')
+      expect(r.code).toBe(0)
+      expect(r.out).not.toMatch(/frissitve: [1-9]/)
+    } finally {
+      rmSync(f.base, { recursive: true, force: true })
+    }
   })
 })

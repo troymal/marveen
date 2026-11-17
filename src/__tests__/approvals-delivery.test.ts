@@ -40,6 +40,8 @@ function approval(over: Partial<Approval> = {}): Approval {
     requested_at: Math.floor(NOW_MS / 1000),
     resolved_at: null,
     resolved_by: null,
+    content_hash: null,
+    consumed_at: null,
     ...over,
   }
 }
@@ -86,7 +88,7 @@ describe('buildOwnerApprovalText (leg 1: what the owner reads)', () => {
 describe('wiring contracts on the route source', () => {
   it('the POST handler notifies the OWNER, not only the main agent', () => {
     const post = ROUTE.slice(ROUTE.indexOf("path === '/api/approvals' && method === 'POST'"))
-    const owner = post.indexOf('notifyOwner(approval)')
+    const owner = post.indexOf('notifyOwner(approval, chatApprovedMessageId)')
     const main = post.indexOf('notifyMainAgent(approval)')
     expect(owner).toBeGreaterThan(0)
     expect(main).toBeGreaterThan(owner)

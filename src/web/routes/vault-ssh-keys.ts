@@ -1,4 +1,5 @@
-import { execFileSync } from 'node:child_process'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -14,6 +15,27 @@ import {
 } from '../../db.js'
 import { setSecret, getSecret, deleteSecret } from '../vault.js'
 import type { RouteContext } from './types.js'
+import { mayActAsOwner, refuseOwner } from './auth.js'
+
+// VAULTSSHOWNER1109: an SSH server entry decides where a connection goes, and an SSH key is a private credential;
+// creating, changing, generating, importing or deleting one is an owner action (mayActAsOwner: a session, or the
+// access token beside the owner's session cookie), checked before the request body is read. Reading stays as it was.
+function sshWriteRefused(ctx: RouteContext, what: string): boolean {
+  if (mayActAsOwner(ctx.auth, ctx.req)) return false
+  refuseOwner(ctx.res, `${what} needs the dashboard login (an owner session).`)
+  return true
+}
+
+const execFileAsync = promisify(execFile)
+
+// ssh-keygen runs off the event loop; stdin is closed at once, as the
+// synchronous call with stdio 'pipe' did.
+async function sshKeygen(args: string[]): Promise<string> {
+  const pending = execFileAsync('ssh-keygen', args, { encoding: 'utf-8' })
+  pending.child.stdin?.end()
+  const { stdout } = await pending
+  return stdout
+}
 
 function fingerprintFromPubKey(authorizedKeyLine: string): string {
   const parts = authorizedKeyLine.trim().split(' ')
@@ -22,11 +44,11 @@ function fingerprintFromPubKey(authorizedKeyLine: string): string {
   return 'SHA256:' + createHash('sha256').update(raw).digest('base64').replace(/=+$/, '')
 }
 
-export function generateSshKeyPair(comment: string): { privateKey: string; publicKey: string; fingerprint: string } {
+export async function generateSshKeyPair(comment: string): Promise<{ privateKey: string; publicKey: string; fingerprint: string }> {
   const tmpDir = mkdtempSync(join(tmpdir(), 'marveen-ssh-'))
   const keyPath = join(tmpDir, 'key')
   try {
-    execFileSync('ssh-keygen', ['-t', 'ed25519', '-f', keyPath, '-N', '', '-C', comment], { stdio: 'pipe' })
+    await sshKeygen(['-t', 'ed25519', '-f', keyPath, '-N', '', '-C', comment])
     const privateKey = readFileSync(keyPath, 'utf-8')
     const publicKey = readFileSync(`${keyPath}.pub`, 'utf-8').trim()
     return { privateKey, publicKey, fingerprint: fingerprintFromPubKey(publicKey) }
@@ -35,7 +57,7 @@ export function generateSshKeyPair(comment: string): { privateKey: string; publi
   }
 }
 
-export function extractPublicKeyFromVault(vaultKeyId: string): string | null {
+export async function extractPublicKeyFromVault(vaultKeyId: string): Promise<string | null> {
   const privateKeyPem = getSecret(vaultKeyId)
   if (!privateKeyPem) return null
   const tmpDir = mkdtempSync(join(tmpdir(), 'marveen-ssh-'))
@@ -43,10 +65,32 @@ export function extractPublicKeyFromVault(vaultKeyId: string): string | null {
   try {
     writeFileSync(keyPath, privateKeyPem, { mode: 0o600 })
     chmodSync(keyPath, 0o600)
-    return execFileSync('ssh-keygen', ['-y', '-f', keyPath], { stdio: 'pipe' }).toString().trim()
+    return (await sshKeygen(['-y', '-f', keyPath])).trim()
   } finally {
     rmSync(tmpDir, { recursive: true, force: true })
   }
+}
+
+// A label names one key: two keys under the same label look alike in a server's
+// key dropdown ("label (username)") and in the delete question. Compared without
+// case, so "Alma" and "alma" count as the same.
+export function sshKeyLabelTaken(label: string): boolean {
+  const wanted = label.toLocaleLowerCase()
+  return listVaultSshKeys().some(k => k.label.toLocaleLowerCase() === wanted)
+}
+
+// For a label the server makes up itself (generate-key): the first free one of
+// "base", "base 2", "base 3", ...
+export function uniqueSshKeyLabel(base: string): string {
+  if (!sshKeyLabelTaken(base)) return base
+  for (let n = 2; ; n++) {
+    const label = `${base} ${n}`
+    if (!sshKeyLabelTaken(label)) return label
+  }
+}
+
+function labelTakenReply(res: RouteContext['res'], label: string) {
+  json(res, { error: `An SSH key named "${label}" already exists`, code: 'label_taken' }, 409)
 }
 
 function toApiShape(key: VaultSshKey) {
@@ -74,6 +118,7 @@ export async function tryHandleVaultSshKeys(ctx: RouteContext): Promise<boolean>
 
   // POST /api/vault/ssh-keys
   if (path === '/api/vault/ssh-keys' && method === 'POST') {
+    if (sshWriteRefused(ctx, 'Creating an SSH key')) return true
     try {
       const body = await readBody(req)
       const data = JSON.parse(body.toString())
@@ -85,10 +130,11 @@ export async function tryHandleVaultSshKeys(ctx: RouteContext): Promise<boolean>
         json(res, { error: 'label and username are required' }, 400)
         return true
       }
+      if (sshKeyLabelTaken(label)) { labelTakenReply(res, label); return true }
 
       const id = randomBytes(8).toString('hex')
       const comment = `${username} (${label})`
-      const { privateKey, publicKey, fingerprint } = generateSshKeyPair(comment)
+      const { privateKey, publicKey, fingerprint } = await generateSshKeyPair(comment)
 
       const vaultKeyId = `ssh-key-${id}`
       setSecret(vaultKeyId, `SSH private key: ${label}`, privateKey)
@@ -105,6 +151,7 @@ export async function tryHandleVaultSshKeys(ctx: RouteContext): Promise<boolean>
 
   // POST /api/vault/ssh-keys/import
   if (path === '/api/vault/ssh-keys/import' && method === 'POST') {
+    if (sshWriteRefused(ctx, 'Importing an SSH key')) return true
     try {
       const body = await readBody(req)
       const data = JSON.parse(body.toString())
@@ -117,6 +164,7 @@ export async function tryHandleVaultSshKeys(ctx: RouteContext): Promise<boolean>
         json(res, { error: 'label, username and privateKey are required' }, 400)
         return true
       }
+      if (sshKeyLabelTaken(label)) { labelTakenReply(res, label); return true }
 
       // Restore the closing newline ONCE, before validation, and use this
       // normalized value for BOTH validation and storage -- ssh-keygen needs
@@ -132,9 +180,15 @@ export async function tryHandleVaultSshKeys(ctx: RouteContext): Promise<boolean>
       try {
         writeFileSync(keyPath, privateKey, { mode: 0o600 })
         chmodSync(keyPath, 0o600)
-        publicKey = execFileSync('ssh-keygen', ['-y', '-f', keyPath], { stdio: 'pipe' }).toString().trim()
+        publicKey = (await sshKeygen(['-y', '-f', keyPath])).trim()
       } catch (err: any) {
-        json(res, { error: 'Invalid private key: ' + (err?.stderr?.toString().trim() ?? err?.message ?? String(err)) }, 400)
+        // With the promisified execFile, a missing ssh-keygen rejects with
+        // err.stderr === '' (empty string, not undefined), and '' is not
+        // nullish -- ?? would pick it and the error would name no reason at
+        // all. Only a non-empty stderr wins; then a non-empty message.
+        const stderr = err?.stderr?.toString().trim() ?? ''
+        const reason = stderr || (err?.message ?? '') || String(err)
+        json(res, { error: 'Invalid private key: ' + reason }, 400)
         return true
       } finally {
         rmSync(tmpDir, { recursive: true, force: true })
@@ -174,6 +228,7 @@ export async function tryHandleVaultSshKeys(ctx: RouteContext): Promise<boolean>
   // DELETE /api/vault/ssh-keys/:id
   const delMatch = path.match(/^\/api\/vault\/ssh-keys\/([^/]+)$/)
   if (delMatch && method === 'DELETE') {
+    if (sshWriteRefused(ctx, 'Deleting an SSH key')) return true
     const id = decodeURIComponent(delMatch[1])
     const key = getVaultSshKey(id)
     if (!key) { json(res, { error: `Key "${id}" not found` }, 404); return true }

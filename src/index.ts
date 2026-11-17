@@ -13,20 +13,32 @@ import { execFileSync } from 'node:child_process'
 import { runLsof } from './lsof.js'
 import type { Server as HttpServer } from 'node:http'
 import { PROJECT_ROOT, STORE_DIR, PID_FILENAME, WEB_PORT, MAIN_AGENT_ID, RESPAWN_ENABLED, HEARTBEAT_AGENT_ENABLED } from './config.js'
-import { resolveOwnerChatId } from './owner-chat.js'
+import { getEffectiveSettingValue } from './settings-store.js'
+import { parseStoreWatchExclude } from './config-registry.js'
+import { ownerAlertChatOverride, resolveOwnerChatId } from './owner-chat.js'
 import { initDatabase, backfillEmbeddings } from './db.js'
 import { runDecaySweep, runDailyDigest } from './memory.js'
+import { scheduleDecaySweep } from './decay-schedule.js'
+import { DECAY_SWEEP_INTERVAL_MS } from './db.js'
 import { initHeartbeat, stopHeartbeat, ensureHeartbeatWorkerHidden } from './heartbeat.js'
 import { ensureHeartbeatAgent, shouldBootHeartbeatAgent, HEARTBEAT_AGENT_NAME } from './web/heartbeat-agent-scaffold.js'
 import { startAgentProcess } from './web/agent-process.js'
+import { runLogRotationSweep, LOG_ROTATION_SWEEP_MS } from './web/log-rotation.js'
+import { sweepScheduledRunSnapshots } from './web/scheduled-run-snapshot.js'
 import { renameSharedCredentialsIfSafe, fleetTokenBootPass } from './web/claude-credentials-guard.js'
 import { startWebServer } from './web.js'
+import { removeCredentialTmpLeftovers } from './web/agent-package/remote.js'
+import { endAllDetachedGroups } from './web/detached-groups.js'
 import { logger } from './logger.js'
 import { startInviteMonitor, stopInviteMonitor } from './web/channel-invites.js'
 import { ensureDiscordChannelGroup } from './web/discord-group-bootstrap.js'
 import { startChannelRequestWatcher, stopChannelRequestWatcher } from './web/channel-request-watcher.js'
 import { startStoreWatcher, stopStoreWatcher } from './store-watcher.js'
-import { AGENTS_BASE_DIR } from './web/agent-config.js'
+import { startSettingsHealth } from './settings-health.js'
+import { noticeNetTargetDrift } from './net-target-notice.js'
+import { AGENTS_BASE_DIR, agentDir, listAgentNames, readFileOr } from './web/agent-config.js'
+import { migrateSenderRoleGates } from './web/sender-role-gate-store.js'
+import { mergeAutonomyConfigAtBoot } from './web/autonomy-config-boot.js'
 import {
   acquirePortLock,
   acquirePidfileLock,
@@ -173,6 +185,17 @@ function buildProcessLockContext(): ProcessLockContext {
         return execFileSync('/bin/ps', ['-p', String(pid), '-o', 'comm='], { timeout: 2000, encoding: 'utf-8' }).trim() || null
       } catch {
         return null
+      }
+    },
+    processBelongsToThisInstall(pid: number): boolean {
+      // The same attribution the binary-pattern path applies in
+      // listOwnProcessesMatching: argv under PROJECT_ROOT, or cwd under it.
+      // A PID that is gone (no argv) is not ours to signal.
+      try {
+        const argv = execFileSync('/bin/ps', ['-p', String(pid), '-o', 'args='], { timeout: 2000, encoding: 'utf-8' }).trim()
+        return argv !== '' && argvBelongsToThisInstall(argv, pid)
+      } catch {
+        return false
       }
     },
     getProcessUid(pid: number): number | null {
@@ -396,9 +419,11 @@ function releaseLock(): void {
 // after partial state was already wired up (e.g. initDatabase throws after
 // acquireLock wrote the pidfile -- we still need to drop the heartbeat /
 // digest timers and release the pidfile on the way out).
-let decayInterval: NodeJS.Timeout | null = null
+let stopDecaySweep: (() => void) | null = null
 let digestTimer: NodeJS.Timeout | null = null
 let digestInterval: NodeJS.Timeout | null = null
+let logRotationInterval: NodeJS.Timeout | null = null
+let scheduledRunSnapshotSweepInterval: NodeJS.Timeout | null = null
 let heartbeatStarted = false
 let webServer: HttpServer | null = null
 let shuttingDown = false
@@ -409,15 +434,21 @@ const shutdown = (): void => {
   try {
     shuttingDown = true
     logger.info('Leallitas...')
+    // DETACHEDSHUTDOWN1007: the command-task and pre-check groups run DETACHED
+    // (outside our process group), so neither launchd nor our own exit ends
+    // them, and their timeout timers die with us. End them first.
+    try { endAllDetachedGroups('dashboard shutdown') } catch (err) { logger.warn({ err }, 'endAllDetachedGroups threw during shutdown') }
     if (heartbeatStarted) {
       try { stopHeartbeat() } catch (err) { logger.warn({ err }, 'stopHeartbeat threw during shutdown') }
     }
     try { stopInviteMonitor() } catch (err) { logger.warn({ err }, 'stopInviteMonitor threw during shutdown') }
     try { stopChannelRequestWatcher() } catch (err) { logger.warn({ err }, 'stopChannelRequestWatcher threw during shutdown') }
     try { stopStoreWatcher() } catch (err) { logger.warn({ err }, 'stopStoreWatcher threw during shutdown') }
-    if (decayInterval) clearInterval(decayInterval)
+    if (stopDecaySweep) stopDecaySweep()
     if (digestTimer) clearTimeout(digestTimer)
     if (digestInterval) clearInterval(digestInterval)
+    if (logRotationInterval) clearInterval(logRotationInterval)
+    if (scheduledRunSnapshotSweepInterval) clearInterval(scheduledRunSnapshotSweepInterval)
 
     const hardKill = setTimeout(() => {
       logger.warn({ timeoutMs: SHUTDOWN_HARD_KILL_MS }, 'Graceful shutdown timeout, hard exit')
@@ -471,16 +502,57 @@ async function main(): Promise<void> {
   initDatabase()
   logger.info('Adatbazis inicializalva')
 
+  // MIOAGENTINSTALL1114 T3: an atomic write of the agent package credential interrupted between write and rename
+  // leaves its tmp file (holding the token) in the store; nothing else ever removes it.
+  try {
+    const removed = removeCredentialTmpLeftovers()
+    if (removed > 0) logger.info({ removed }, 'agent package credential: interrupted-write leftovers removed')
+  } catch (err) {
+    logger.warn({ err }, 'agent package credential leftover cleanup did not run')
+  }
+
+  // GROMZOGATECONF1030 (c): the sub-agents' sender-role gates move from their own agent-config.json (which the agent
+  // can write) into the store, which only the dashboard writes. Once: an existing store file means it is done.
+  try {
+    const moved = migrateSenderRoleGates(listAgentNames(), (n) => JSON.parse(readFileOr(join(agentDir(n), 'agent-config.json'), '{}')))
+    if (moved) logger.info({ agents: moved }, 'sender-role gates moved to store/agent-sender-role-gates.json (once)')
+  } catch (err) {
+    logger.error({ err }, 'sender-role gate migration failed')
+  }
+
+  // EMAILMAX3-1115: the autonomy-config seed merge (new categories; email_send ceiling 2 -> 3 only from the
+  // factory 2, the level untouched), the same script update.sh runs. Here it lands on the restart that
+  // brings the new dist. Idempotent; a failure is logged and the config stays as it was.
+  try {
+    const merged = await mergeAutonomyConfigAtBoot()
+    if (merged?.wrote) logger.info({ merge: merged.line }, 'autonomy-config.json merged from the seed')
+  } catch (err) {
+    logger.warn({ err }, 'autonomy-config seed merge did not run; the file is unchanged')
+  }
+
   // Backfill embeddings for memories saved before Ollama was available.
   // Fire-and-forget: a missing or slow Ollama instance must not block startup.
-  backfillEmbeddings().then(count => {
-    if (count > 0) logger.info({ count }, 'Embedding backfill befejezve')
+  backfillEmbeddings().then(({ embedded, attempted, failed }) => {
+    if (embedded > 0) logger.info({ count: embedded, attempted, failed }, 'Embedding backfill befejezve')
   }).catch(err => logger.warn({ err }, 'Embedding backfill hiba (Ollama nem elerheto)'))
 
-  // Memory decay (24h cycle)
-  runDecaySweep()
-  decayInterval = setInterval(runDecaySweep, 24 * 60 * 60 * 1000)
-  logger.info('Memoria leepulesi ciklus beallitva (24 oras)')
+  // Memory decay (24h cycle). The first sweep is deferred: it is synchronous
+  // database work (prune + checkpoint, possibly VACUUM) and used to hold the
+  // dashboard port closed for seconds on every start.
+  stopDecaySweep = scheduleDecaySweep(runDecaySweep, DECAY_SWEEP_INTERVAL_MS)
+  logger.info('Memoria leepulesi ciklus beallitva (24 oras, az elso sopres 60 mp mulva)')
+
+  // Log rotation (LOGROTATE910): copytruncate on the launcher-redirected
+  // logs, size-capped, hourly check. Runs inside the dashboard so every
+  // platform gets it without launchd/systemd/cron wiring.
+  runLogRotationSweep()
+  logRotationInterval = setInterval(runLogRotationSweep, LOG_ROTATION_SWEEP_MS)
+
+  // Scheduled-task run snapshot retention (SCHEDPROMPTREF917): same hourly
+  // cadence as log rotation, 7-day age cutoff with a per-task floor of the
+  // most recent 20 (see scheduled-run-snapshot.ts).
+  sweepScheduledRunSnapshots()
+  scheduledRunSnapshotSweepInterval = setInterval(() => sweepScheduledRunSnapshots(), LOG_ROTATION_SWEEP_MS)
 
   // Daily digest at 23:00. Timer handles kept so shutdown can drop them.
   function scheduleDailyDigest() {
@@ -493,7 +565,7 @@ async function main(): Promise<void> {
     // so a value read at startup would stay the placeholder for the life of
     // the process and the first digest would go nowhere.
     const runDigest = () => {
-      const chatId = resolveOwnerChatId()
+      const chatId = ownerAlertChatOverride('telegram') ?? resolveOwnerChatId()
       if (!chatId) {
         logger.warn('Napi naplo kihagyva: nincs gazda-chat (nincs ALLOWED_CHAT_ID es nincs parositott csatorna)')
         return
@@ -577,7 +649,13 @@ async function main(): Promise<void> {
   startChannelRequestWatcher()
 
   // Store file audit watcher
-  startStoreWatcher()
+  startStoreWatcher({ exclude: parseStoreWatchExclude(String(getEffectiveSettingValue('STORE_WATCH_EXCLUDE'))) })
+
+  // ENVRELAXGATE1104 step 2: name the ignored .env security lines, and tell the owner (once per state change) when
+  // config-overrides.json turns unreadable.
+  startSettingsHealth()
+  // NETTARGETENV1104: tell the owner once when a network target's host changed since the last boot.
+  void noticeNetTargetDrift()
 
   // Web dashboard
   webServer = startWebServer(WEB_PORT)

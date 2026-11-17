@@ -65,6 +65,17 @@ CONFIG = {
     "claude_authoritative_cache_max_age_min": 90,  # reuse last authoritative Claude snapshot
                                                     # on a transient failure (429/5xx/timeout)
                                                     # if it's younger than this
+    # The statusLine side file (store/.claude-rate-limits.json, written by
+    # scripts/statusline-ratelimit.sh on every main-agent render) is only used
+    # when it is younger than this. It is token-free and carries the same
+    # rate_limits block the official endpoint does, but it is only rewritten
+    # while the main agent renders, so it goes stale when that session idles.
+    # 10 min: the collector runs every 15 min and the gate (quota-gate.ts)
+    # counts a snapshot older than 20 min as unknown, so a reading that was
+    # already 10 min old when collected is at most ~25 min old when the gate
+    # last sees it; anything older would let the gate act on a number that
+    # has had a long time to move. Older -> not used, fall through (fail open).
+    "claude_statusline_max_age_min": 10,
 }
 
 # Window length in seconds, keyed by the Claude window's dict key. Codex
@@ -93,9 +104,66 @@ STORE_DIR = os.path.join(REPO_ROOT, "store")
 HISTORY_PATH = os.path.join(STORE_DIR, "usage-history.jsonl")
 LATEST_PATH = os.path.join(STORE_DIR, "usage-latest.json")
 STATE_PATH = os.path.join(STORE_DIR, "usage-alert-state.json")
+STATUSLINE_PATH = os.path.join(STORE_DIR, ".claude-rate-limits.json")
 ENV_PATH = os.path.join(REPO_ROOT, ".env")
 
-BUDAPEST = ZoneInfo("Europe/Budapest")
+# Display timezone for reset stamps: MARVEEN_TZ when set, else the install zone
+# (SCHEDULER_TZ, config-overrides.json over .env, the same rule as APP_TZ in
+# src/config.ts), else the host zone. ISSUE1895 / #1895: it used to default to
+# Europe/Budapest whatever the install's zone was.
+def _install_zone():
+    explicit = (os.environ.get("MARVEEN_TZ") or "").strip()
+    if explicit:
+        return explicit
+    value = ""
+    try:
+        with open(os.path.join(STORE_DIR, "config-overrides.json"), encoding="utf-8") as f:
+            ov = json.load(f)
+        if isinstance(ov, dict) and ov.get("SCHEDULER_TZ"):
+            value = str(ov["SCHEDULER_TZ"]).strip()
+    except Exception:
+        pass
+    if not value:
+        try:
+            with open(ENV_PATH, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("SCHEDULER_TZ="):
+                        value = line.split("=", 1)[1].strip()
+                        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                            value = value[1:-1]
+        except Exception:
+            pass
+    return value
+
+
+def _host_zone_name():
+    # The host's zone by NAME (a ZoneInfo keeps the DST rules); a fixed offset
+    # from datetime.now().astimezone() would render a reset time on the other
+    # side of a DST switch one hour off.
+    tz = (os.environ.get("TZ") or "").lstrip(":").strip()
+    if tz and "/" in tz:
+        return tz
+    try:
+        target = os.path.realpath("/etc/localtime")
+        if "/zoneinfo/" in target:
+            return target.split("/zoneinfo/", 1)[1]
+    except Exception:
+        pass
+    return ""
+
+
+def _local_tz():
+    for zone in (_install_zone(), _host_zone_name()):
+        if zone:
+            try:
+                return ZoneInfo(zone)
+            except Exception:
+                pass  # a misspelled zone: the next candidate, like config.ts does
+    return datetime.now().astimezone().tzinfo
+
+
+LOCAL_TZ = _local_tz()
 
 TOKEN_FIELDS = (
     "input_tokens",
@@ -118,7 +186,7 @@ def fmt_reset(resets_at, now_utc=None):
     except (ValueError, OSError, OverflowError, TypeError):
         return "unknown", "unknown"
     now_utc = now_utc or datetime.now(timezone.utc)
-    local_str = dt_utc.astimezone(BUDAPEST).strftime("%Y-%m-%d %H:%M %Z")
+    local_str = dt_utc.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M %Z")
     secs = (dt_utc - now_utc).total_seconds()
     if secs <= 0:
         rel = "now"
@@ -140,8 +208,12 @@ def _parse_iso_to_epoch(value):
     resets_at fields) into a unix epoch float. Returns None on failure."""
     if not isinstance(value, str):
         return None
+    # Python < 3.11's fromisoformat rejects a trailing 'Z' (Codex event
+    # timestamps use it, e.g. "2026-04-26T12:03:04.051Z"); normalise it so the
+    # parse works across interpreter versions, not just the host's 3.14.
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
     try:
-        dt = datetime.fromisoformat(value)
+        dt = datetime.fromisoformat(normalized)
     except ValueError:
         return None
     if dt.tzinfo is None:
@@ -258,10 +330,18 @@ def collect_codex():
     try:
         files = glob.glob(os.path.expanduser("~/.codex/sessions/*/*/*/rollout-*.jsonl"))
         if not files:
-            raise FileNotFoundError("no ~/.codex/sessions rollout files found")
+            # Not a measurement failure: Codex has simply never run on this
+            # host, which is the normal case on most installs. A separate,
+            # stable field says so (reason="no_sessions"), so consumers do not
+            # have to match the English error text.
+            result["ok"] = False
+            result["reason"] = "no_sessions"
+            result["error"] = "no ~/.codex/sessions rollout files found"
+            return result
         newest = max(files, key=os.path.getmtime)
 
         rate_limits = None
+        rate_limits_ts = None
         with open(newest, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 if '"rate_limits"' not in line:
@@ -273,6 +353,12 @@ def collect_codex():
                 rl = obj.get("payload", {}).get("rate_limits")
                 if rl:
                     rate_limits = rl  # keep the LAST match
+                    # ...and the event's own timestamp, so the summary can say
+                    # HOW OLD these numbers are (USAGE401DIAG910). The Codex
+                    # rollout is read from disk, not a live call: the newest
+                    # file can be months old, and a bare percentage then reads
+                    # as current when it is not.
+                    rate_limits_ts = obj.get("timestamp")
 
         if rate_limits is None:
             raise ValueError("no rate_limits entries in newest rollout file")
@@ -298,6 +384,17 @@ def collect_codex():
         result["plan_type"] = rate_limits.get("plan_type")
         result["windows"] = windows
         result["source_file"] = newest
+        # Freshness of the numbers (USAGE401DIAG910). snapshot_at is the ISO
+        # timestamp of the rate_limits event; snapshot_age_hours is relative to
+        # now. Both may be None if the event carried no timestamp -- the summary
+        # then says the freshness is unknown rather than showing the % alone.
+        result["snapshot_at"] = rate_limits_ts
+        result["snapshot_age_hours"] = None
+        if rate_limits_ts:
+            snap_epoch = _parse_iso_to_epoch(rate_limits_ts)
+            if snap_epoch is not None:
+                age_h = (datetime.now(timezone.utc).timestamp() - snap_epoch) / 3600.0
+                result["snapshot_age_hours"] = round(age_h, 1)
     except Exception as e:
         result["ok"] = False
         result["error"] = str(e)
@@ -389,7 +486,13 @@ def _collect_claude_authoritative():
     """Return (windows_dict, None, None) on success.
     On failure: (None, error_str, error_kind) where error_kind is one of:
       'no_token'  -- no credentials at all, never worth a cache/retry
-      'permanent' -- HTTP 403 (real scope/auth problem, not transient)
+      'permanent' -- HTTP 401/403: an expired/invalid token (401) or a real
+                     scope problem (403). NOT transient, and crucially NOT
+                     cache-servable: a retry from the last authoritative
+                     snapshot would hand back a stale number and hide the fact
+                     that the token needs refreshing (USAGE401DIAG910). 401 was
+                     previously misclassified as transient, so an expired token
+                     kept reporting the last good numbers as if current.
       'transient' -- 429 / 5xx / timeout / network error / unparseable
                      response -- safe to serve from cache if fresh enough
     """
@@ -409,7 +512,10 @@ def _collect_claude_authoritative():
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        kind = "permanent" if e.code == 403 else "transient"
+        # 401 (expired/invalid token) and 403 (scope) are both no-retry: serving
+        # the stale authoritative cache would mask the auth problem. 401 needs a
+        # token refresh, 403 a scope fix -- the HTTP code below tells them apart.
+        kind = "permanent" if e.code in (401, 403) else "transient"
         return None, f"HTTP {e.code} ({token_source} token)", kind
     except Exception as e:
         return None, f"{type(e).__name__}: {e}", "transient"
@@ -492,7 +598,77 @@ def _read_cached_claude_authoritative(max_age_minutes, now_utc=None):
     return windows, age_minutes
 
 
-def _collect_claude_estimate():
+def _read_claude_statusline(max_age_minutes, now_utc=None, path=None):
+    """Return (windows_dict, age_minutes) from the statusLine side file
+    (store/.claude-rate-limits.json, see scripts/statusline-ratelimit.sh), or
+    (None, None) when there is nothing trustworthy in it.
+
+    Used only when the official endpoint gave nothing (the setup-token is
+    rejected with 403). The file holds the rate_limits block Claude Code hands
+    the statusLine command: {"five_hour": {"used_percentage", "resets_at"},
+    "seven_day": {...}}, resets_at in epoch seconds. Rejected when:
+      - the file is missing/unparseable or written_at is missing/in the future
+      - written_at is older than max_age_minutes (see CONFIG)
+      - a window has no numeric percentage, or its resets_at is already past:
+        that percentage belongs to the window that just ended, not the current
+        one (such a window is dropped, the others are kept)."""
+    try:
+        with open(path or STATUSLINE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+
+    written_at = data.get("written_at")
+    if not isinstance(written_at, (int, float)) or isinstance(written_at, bool):
+        return None, None
+    now_utc = now_utc or datetime.now(timezone.utc)
+    now_ts = now_utc.timestamp()
+    age_minutes = (now_ts - written_at) / 60.0
+    if age_minutes < 0 or age_minutes > max_age_minutes:
+        return None, None
+
+    rl = data.get("rate_limits")
+    if not isinstance(rl, dict):
+        return None, None
+    windows = {}
+    for key in CLAUDE_WINDOW_SECONDS:
+        w = rl.get(key)
+        if not isinstance(w, dict):
+            continue
+        used = w.get("used_percentage")
+        if not isinstance(used, (int, float)) or isinstance(used, bool):
+            continue
+        resets_raw = w.get("resets_at")
+        resets_epoch = resets_raw if isinstance(resets_raw, (int, float)) else _parse_iso_to_epoch(resets_raw)
+        if not isinstance(resets_epoch, (int, float)) or resets_epoch <= now_ts:
+            continue
+        windows[key] = {"used_percent": used, "resets_at": resets_epoch}
+    if not windows:
+        return None, None
+    return windows, age_minutes
+
+
+def _claude_transcript_globs():
+    """Every place Claude Code transcripts live on this install. A glob over
+    ~/.claude/projects alone finds nothing when the main agent and the
+    sub-agents run with their own config roots:
+      - $CLAUDE_CONFIG_DIR/projects (the root this process runs under)
+      - ~/.claude/projects (shared default)
+      - <repo>/.channels-config/projects (isolated main agent)
+      - <repo>/agents/*/.claude-config/projects (sub-agents)"""
+    roots = []
+    cfg_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if cfg_dir:
+        roots.append(os.path.join(os.path.expanduser(cfg_dir), "projects"))
+    roots.append(os.path.expanduser("~/.claude/projects"))
+    roots.append(os.path.join(REPO_ROOT, ".channels-config", "projects"))
+    roots.append(os.path.join(REPO_ROOT, "agents", "*", ".claude-config", "projects"))
+    return [os.path.join(r, "*", "*.jsonl") for r in roots]
+
+
+def _collect_claude_estimate(patterns=None):
     now = datetime.now(timezone.utc)
     five_h_cutoff = now - timedelta(hours=5)
     seven_d_cutoff = now - timedelta(days=7)
@@ -502,7 +678,16 @@ def _collect_claude_estimate():
     seven_day_opus_tokens = 0
     files_scanned = 0
 
-    files = glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl"))
+    # De-duplicate by real path: a projects dir that is a symlink to another
+    # root would otherwise be counted twice.
+    files = []
+    seen = set()
+    for pattern in (patterns or _claude_transcript_globs()):
+        for path in glob.glob(pattern):
+            real = os.path.realpath(path)
+            if real not in seen:
+                seen.add(real)
+                files.append(path)
     for path in files:
         files_scanned += 1
         try:
@@ -532,8 +717,12 @@ def _collect_claude_estimate():
                     if total == 0:
                         continue
 
-                    seven_day_tokens += total
+                    # Claude subscription quota only: sub-agents can run on
+                    # other providers' models (deepseek-*, "<synthetic>").
                     model = (msg.get("model") or "").lower()
+                    if not model.startswith("claude-"):
+                        continue
+                    seven_day_tokens += total
                     if "opus" in model:
                         seven_day_opus_tokens += total
                     if ts >= five_h_cutoff:
@@ -558,6 +747,16 @@ def collect_claude():
         return result
 
     result["auth_error"] = err
+
+    # The official endpoint gave nothing (no token, 401/403, outage). The
+    # statusLine side file is the same rate_limits block, token-free, and
+    # fresher than the 90-min cache below, so it goes first.
+    sl_windows, sl_age = _read_claude_statusline(CONFIG["claude_statusline_max_age_min"])
+    if sl_windows is not None:
+        result["source"] = "statusline"
+        result["windows"] = sl_windows
+        result["statusline_age_minutes"] = round(sl_age, 1)
+        return result
 
     # A transient failure (429/5xx/timeout/unparseable) must not throw away
     # real numbers -- reuse the last authoritative snapshot if it's fresh
@@ -589,7 +788,7 @@ def build_snapshot():
     now = datetime.now(timezone.utc)
     return {
         "generated_at": now.isoformat(),
-        "generated_at_local": now.astimezone(BUDAPEST).strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "generated_at_local": now.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S %Z"),
         "codex": collect_codex(),
         "claude": collect_claude(),
     }
@@ -622,6 +821,24 @@ def render_summary(snapshot):
     else:
         plan = codex.get("plan_type") or "?"
         windows = codex.get("windows", {})
+        # Freshness FIRST, so no % is read without its age (USAGE401DIAG910).
+        # The Codex numbers come from a rollout file on disk, which can be
+        # hours or months old; a bare percentage would read as current.
+        snap_at = codex.get("snapshot_at")
+        age_h = codex.get("snapshot_age_hours")
+        if snap_at:
+            local_str, _ = fmt_reset(_parse_iso_to_epoch(snap_at))
+            if isinstance(age_h, (int, float)):
+                if age_h >= 24:
+                    age_desc = f"{age_h / 24:.1f} days old"
+                else:
+                    age_desc = f"{age_h:.1f} h old"
+                stale = "  [STALE]" if age_h >= 24 else ""
+                lines.append(f"  snapshot: {local_str} ({age_desc}){stale}")
+            else:
+                lines.append(f"  snapshot: {local_str} (age unknown)")
+        else:
+            lines.append("  snapshot: freshness unknown -- the rollout event carried no timestamp; the numbers below may be stale")
         if not windows:
             lines.append("  no rate_limits data available")
         for label, w in windows.items():
@@ -640,7 +857,11 @@ def render_summary(snapshot):
     lines.append(f"Claude (source: {claude.get('source')}):")
     if not claude.get("ok"):
         lines.append(f"  error: {claude.get('error')}")
-    elif claude.get("source") in ("authoritative", "authoritative_cached"):
+    elif claude.get("source") in ("authoritative", "authoritative_cached", "statusline"):
+        if claude.get("source") == "statusline":
+            age = claude.get("statusline_age_minutes")
+            age_str = f"{age:.0f}" if isinstance(age, (int, float)) else "?"
+            lines.append(f"  (from the statusLine side file, {age_str} min ago -- live endpoint error: {claude.get('auth_error')})")
         if claude.get("source") == "authoritative_cached":
             age = claude.get("cache_age_minutes")
             age_str = f"{age:.0f}" if isinstance(age, (int, float)) else "?"

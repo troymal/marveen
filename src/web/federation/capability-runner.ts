@@ -16,6 +16,7 @@
 import { logger } from '../../logger.js'
 import { runAgent } from '../../agent.js'
 import { getEffectiveSettingValue } from '../../settings-store.js'
+import { agentFacingLang } from '../agent-text-lang.js'
 import { getFederationConfig } from './config.js'
 import { catalogAgentNames } from './local-catalog.js'
 import {
@@ -27,6 +28,7 @@ import {
   readSummarySource,
   summarySourceHash,
 } from './capabilities.js'
+import { whileNotFrozen } from '../fleet-freeze.js'
 
 export const CAPABILITY_RUNNER_INITIAL_DELAY_MS = 65_000 // free slot (5/10/20/25/30/35/40/45/50/55/90 taken)
 export const CAPABILITY_RUNNER_INTERVAL_MS = 5 * 60_000
@@ -37,12 +39,9 @@ const COLD_START_BATCH = 3
 
 let inflight: Promise<void> | null = null
 
+// PERSONAESC1107: AGENT_TEXT_LANG when set, else DASHBOARD_LANG as before (agent-text-lang.ts agentFacingLang).
 function resolveLang(): 'hu' | 'en' {
-  try {
-    return getEffectiveSettingValue('DASHBOARD_LANG') === 'en' ? 'en' : 'hu'
-  } catch {
-    return 'hu'
-  }
+  return agentFacingLang(() => getEffectiveSettingValue('DASHBOARD_LANG'))
 }
 
 async function runOnce(): Promise<void> {
@@ -78,8 +77,8 @@ function tick(): void {
 }
 
 export function startCapabilitySummaryRunner(): NodeJS.Timeout {
-  setTimeout(tick, CAPABILITY_RUNNER_INITIAL_DELAY_MS).unref()
-  return setInterval(tick, CAPABILITY_RUNNER_INTERVAL_MS)
+  setTimeout(whileNotFrozen('capability-runner', tick), CAPABILITY_RUNNER_INITIAL_DELAY_MS).unref()
+  return setInterval(whileNotFrozen('capability-runner', tick), CAPABILITY_RUNNER_INTERVAL_MS)
 }
 
 /** Test seam. */

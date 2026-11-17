@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import {
   renderFederationBlock,
   renderRoutingDirective,
@@ -53,7 +55,7 @@ describe('renderFederationBlock', () => {
     expect(block).toContain('`teodor` (https://teodor.example)')
     expect(block).toContain('párosítás folyamatban') // unpaired peer marked
     expect(block).toContain('NEM')                    // explicit exception to the tmux/agents-list rule
-    expect(block).toContain('Authorization: Bearer')  // curl example carries auth (fix-agent-auth-headers.sh hazard)
+    expect(block).toContain('marveen-api.sh message')  // the recipe goes through the helper (the message verb's agent-msg.sh argv exception is named)
     expect(block).toContain('SAJÁT csatornádon')      // binary-results rule
   })
 
@@ -130,7 +132,7 @@ describe('renderSubAgentFederationBlock', () => {
       const block = renderSubAgentFederationBlock({ ...ID, lang })
       expect(block.startsWith(FEDERATION_BLOCK_BEGIN)).toBe(true)
       expect(block.endsWith(FEDERATION_BLOCK_END)).toBe(true)
-      expect(block).toContain('Authorization: Bearer')       // reply curl carries auth
+      expect(block).toMatch(/marveen-api\.sh'? message/)       // the reply recipe goes through the helper (a quoted path puts a ' before the space)
       expect(block).not.toContain(FEDERATION_POLICY_ANCHOR)  // owner policy is the main agent's
       expect(Buffer.byteLength(block, 'utf-8')).toBeLessThan(2048)
     }
@@ -155,6 +157,22 @@ describe('applyFederationBlock (line-exact surgery)', () => {
     const nextHeading = lines.findIndex((l) => l.startsWith('## Öntanulás'))
     expect(begin).toBeGreaterThan(interagent)
     expect(begin).toBeLessThan(nextHeading)
+  })
+
+  // PERSONAESC1107: the English persona names the section "## Inter-agent communication"; the block goes after it too,
+  // in the real English template (it fell to EOF before).
+  it('inserts after the English Inter-agent section of the English persona template', () => {
+    const EN = readFileSync(join(__dirname, '..', '..', 'templates', 'en', 'CLAUDE.md.template'), 'utf8')
+    const next = applyFederationBlock(EN, block)
+    expect(next).not.toBeNull()
+    const lines = next!.split('\n')
+    const begin = lines.indexOf(FEDERATION_BLOCK_BEGIN)
+    const interagent = lines.findIndex((l) => l.trim() === '## Inter-agent communication')
+    const nextHeading = lines.findIndex((l, i) => i > interagent && l.startsWith('## '))
+    expect(interagent).toBeGreaterThan(-1)
+    expect(begin).toBeGreaterThan(interagent)
+    expect(begin).toBeLessThan(nextHeading)
+    expect(next!.trimEnd().endsWith(FEDERATION_BLOCK_END)).toBe(false)
   })
 
   it('appends at EOF when the heading is missing (hand-edited persona)', () => {

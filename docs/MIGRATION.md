@@ -25,12 +25,21 @@ the Docker volumes (3) are **separate** and must be moved on their own.
 - `assets/meetings/**` — meeting transcripts/memos
 - `agents/*/CLAUDE.md`, `SOUL.md`, `.mcp.json` — per-agent identity
 - `agents/*/.claude/channels/*/.env`, `access.json` — sub-agent channel tokens + pairing
+- `agents/*/agent-config.json`, `.claude/settings.local.json`, `.claude/skills/` -- per-agent model/permission profile, deny rules and agent-private skills. Credential-like files inside a skill folder are left out unless `MARVEEN_BACKUP_AGENT_SECRETS=1` is set, but the filter is a deny-list by file name (`.env`, `.env.*`, `*.env`, `*.key`, `*.pem`, `*.p12`, `*.pfx`, `id_rsa*`, `id_ed25519*`, `credentials*`, `*token*`, `*secret*`, `.netrc`, `.npmrc`): a credential file whose name is not on the list is still archived. Keep credentials under `agents/<name>/secrets/` (covered by the opt-in below), not inside a skill folder
+- `agents/*/secrets/` -- per-agent credentials kept outside the channel dirs (SSH keys, CLI logins, mailbox config). **Opt-in, off by default:** only taken when `MARVEEN_BACKUP_AGENT_SECRETS=1` is set. For a manual run, put it in the environment (`MARVEEN_BACKUP_AGENT_SECRETS=1 bash scripts/backup.sh`); for a systemd unit that runs the backup, add `Environment=MARVEEN_BACKUP_AGENT_SECRETS=1` to the `[Service]` section. Any other value (`0`, `yes`, `true`) leaves it out. Same trust level as the channel `.env` files above: the archive is created 0600, so keep it (and any second copy) off cloud-synced folders
+- `agents/*/.claude-config/projects/*/memory/` and `.channels-config/projects/*/memory/` -- file memory of agents (and of the main agent) that run with their own `CLAUDE_CONFIG_DIR`; transcripts next to it are not taken
+- `local-commits.bundle`: every local git branch that `origin` does not have
+  (the source itself is NOT in the archive; it is expected on the remote). Restore:
+  clone the upstream repo, then
+  `git fetch <restored>/repo/local-commits.bundle 'refs/heads/*:refs/heads/*'`.
+  Absent when everything is already pushed.
 
 **(2) Home-relative — under `$HOME` (`home/` group in the archive)**
 - `~/.claude/skills/**` — the self-built skill library
 - `~/.claude/scheduled-tasks/**` — file-based scheduled tasks (SKILL.md + task-config.json)
 - `~/.claude/channels/*/.env` — MAIN orchestrator channel token
 - `~/.claude/channels/*/access.json`, `invites.json`, `approved/**` — pairing allowlist + approvals
+- `~/.config/systemd/user/<SERVICE_ID>-*` -- this fleet's systemd `--user` units (Linux): the services that start the dashboard and the channel session, with their drop-ins and enable links. `SERVICE_ID` is `MAIN_AGENT_ID` unless `.env` sets it apart. Other applications' units are not taken
 - `~/Library/LaunchAgents/com.<MAIN_AGENT_ID>.*.plist` -- launchd jobs (the prefix is your `MAIN_AGENT_ID`, `marveen` by default)
 
 **(3) Docker volumes — NOT in the tarball, migrate separately**
@@ -56,6 +65,11 @@ the Docker volumes (3) are **separate** and must be moved on their own.
    tar -tzf backups/claudeclaw-*.tar.gz | sed -E 's,(^[^/]+/[^/]+/).*,\1...,' | sort -u
    ```
    Confirm both `repo/...` and `home/...` groups and the `MANIFEST.txt` are present.
+   For a nightly run with an optional second copy of the newest archive, use
+   `scripts/backup-nightly.sh`. The second copy is off unless `MARVEEN_BACKUP_COPY_DIR`
+   is set (`MARVEEN_BACKUP_COPY_KEEP`, default 7, is how many archives stay there). The
+   archive holds live secrets, so point it at a location that is not cloud-synced; a
+   requested copy that cannot be made makes the wrapper exit non-zero.
 3. Export the Docker volumes (time-series + dashboards):
    ```bash
    cd <repo>/projects/loxonTSDB && docker compose down   # quiesce writers first
@@ -184,3 +198,100 @@ the Docker volumes (3) are **separate** and must be moved on their own.
       matches the old machine; Grafana dashboards render.
 - [ ] All your launchd jobs are loaded: `launchctl list | grep com.<MAIN_AGENT_ID>`.
 - [ ] Old machine's pollers are fully stopped (no 409).
+
+---
+
+## 7. Frissítési jegyzetek (meglévő telepítés frissítése)
+
+A fenti útmutató a gépváltásról szól. Az alábbi jegyzetek a migráció másik
+fajtájáról: amikor egy meglévő telepítést helyben frissítesz. Minden tétel
+megmondja, mit lát egy kliens, egy szkript vagy a telepítés a frissítés után,
+és mi a teendő.
+
+### v1.45.0
+
+A v1.45.0 nyolc változása módosítja, mit csinál egy meglévő telepítés a
+frissítés után (bejelentve: #2299). Kettőt a kiadás után újra módosítottunk;
+ezeknél a tétel megmondja, mit csinál a v1.45.0, és mit a következő kiadás.
+
+1. **Ha egy ügynök `evidence` nélkül zár `done`-ra egy kártyát, az `testing`-ben marad.**
+   A `POST /api/kanban/:id/move` és a `PUT /api/kanban/:id` `status: done`-nal,
+   ügynöktől, `evidence` nélkül a kártyát `testing`-be teszi, és HTTP 200-zal
+   válaszol, benne `"status": "testing"` és `"evidence_required": true`. A
+   v1.45.0-ban a válaszban `"ok": true` is áll, ezért egy kliens, amely csak az
+   `ok`-ot nézi, lezártnak jelenti a kártyát. A következő kiadástól (#2296) ilyenkor
+   `ok` értéke `false`; a HTTP-kód és a többi mező nem változik. Teendő: küldj
+   `evidence`-t, és a `status`-t vagy az `evidence_required`-et olvasd, ne csak az `ok`-ot.
+
+2. **A vault-feloldó szkriptek először a dashboardot kérdezik.** A v1.45.0-ban a
+   feloldó kérésenként 10 mp-ig vár, ugyanannyit, mint az ütemezett feladat
+   `preCheck`-korlátja, ezért lassú dashboardnál a `preCheck`-et leállítják,
+   mielőtt a tartalék útig érne, és a feladat ettől függetlenül elindul. A
+   következő kiadástól (#2297) az alapértelmezett várakozás az egész hívásra 5 mp,
+   és a `VAULT_RESOLVE_TIMEOUT_MS` (egész ezredmásodperc, 0-nál nagyobb) felülírja.
+   Szintén a következő kiadástól (#2308): a `VAULT_RESOLVE_URL` csak erre a gépre
+   mutathat (`http` vagy `https`, hoszt `127.0.0.1`, `::1` vagy `localhost`,
+   felhasználó-adat nélkül). Minden más URL-t úgy utasít el, mint egy elérhetetlen
+   dashboardot (audit mód: helyi tartalék figyelmeztetéssel; enforce mód: exit 5),
+   mert a kérés a dashboard-tokent viszi.
+
+3. **Egy ütemezett feladat csak akkor fut, ha a fájljai egyeznek a nyilvántartással.**
+   A futtató csak akkor indít el egy feladatot, ha a `scheduled_task_registry`
+   bejegyzésében ugyanaz a `sha256` áll, mint a lemezen lévő feladaté. A hash a
+   `SKILL.md`-t, a `task-config.json`-t, a `preCheck` szkriptet és a feladat
+   mappájának minden más fájlját lefedi, rekurzívan. Egy naplófájl, mentés vagy
+   jegyzet a feladat mappájában megváltoztatja a hasht: a következő futás
+   `hash-mismatch`-csel kimarad, a mappa érintetlen marad, és a napló feladatonként
+   és hashenként egyszer figyelmeztet. Az 500-nál több bejegyzést vagy 16 MiB-nál
+   többet tartalmazó feladat-mappának nincs hashe, és soha nem fut. A kézzel (nem a
+   dashboard API-n át) létrehozott feladat-mappa `unregistered`, és nem fut.
+   A frissítés utáni első induláskor egy egyszeri visszamenőleges felvétel
+   nyilvántartásba veszi a lemezen már meglévő összes feladatot. Teendő: a naplót
+   és a kimenetet a feladat mappáján kívül tartsd; egy átnézett kézi szerkesztés
+   után nézd meg a `node dist/web/schedule-registry-cli.js status` kimenetét, és a
+   feladat mostani fájljait a `register <név>` paranccsal fogadd el. Lásd:
+   `docs/scheduled-tasks.md`.
+
+4. **A jóváhagyáshoz a gazda dashboard-belépése kell.** A `PATCH /api/approvals/:id`
+   `status: approved`-dal és a `POST /api/approvals` `owner_approved_message_id`-vel
+   403-at ad a közös dashboard-tokenre és az eszközkulcsra is, a hatókörétől
+   függetlenül. Az elutasítás és a lejárat tokennel továbbra is megy. A token
+   egymagában csak olyan telepítésen hagy jóvá, ahol még nincs dashboard-belépés.
+   Így megszakad minden integráció, amely a közös tokennel hagyott jóvá, és egy
+   jóváhagyást már nem zár le az ügynök által továbbított chat-válasz
+   (`IGEN <id>` / `YES <id>`): a gazda a dashboardon hagy jóvá. Lásd:
+   `docs/security-hardening.md`.
+
+5. **Emlék törléséhez jóváhagyás kell.** Ha a `data_delete` 3-as szint alatt van
+   (hiányzó konfig vagy kulcs 1-es szintnek számít), a `DELETE /api/memories/:id`
+   409 `approval_required`-et ad egy `approval_id`-vel, és a jóváhagyást a szerver
+   maga kéri. A törlés csak `?approval_id=<id>`-vel fut, egy jóváhagyott, fel nem
+   használt, ehhez az emlékhez és a mostani tartalmához kötött jóváhagyással; a
+   jóváhagyás utáni szerkesztés érvényteleníti. A frissítés előtt a törlés azonnal lefutott.
+
+6. **A generált és importált skillek a gazdára várnak.** A `POST /api/skills`, a
+   `POST /api/skills/import` és az ügynökönkénti párjaik a `store/skills-pending/<id>/`
+   alá írnak, és `{ ok: true, name, pending: true, id }`-vel válaszolnak (import:
+   `imported`, plusz `pending: true, ids`). Az `ok: true` már nem jelenti, hogy a
+   skill él. A `POST /api/skills/pending/:id/approve` és a `.../reject` a gazda
+   dashboard-belépését kéri; a közös token csak belépés létrehozása előtt működik,
+   az eszközkulcs nem.
+
+7. **A gyanús üzenetet a feladó-sor jelöli.** Ha egy nem megbízható vagy föderált
+   ügynökközi üzenet illeszkedik egy prompt-injekciós szabályra (`src/skill-scan.ts`),
+   a feladó-sorba a frissesség-címke után `[!INJEKCIO-GYANU: <szabályok> ...]` kerül.
+   A 262 144 karakternél (UTF-16 egység) hosszabb üzenet, ha az átnézett részben
+   nincs találat, ehelyett `[!INJEKCIO-VIZSGALAT: ...]`-t kap. A tartalom ettől
+   még kézbesül. A feladó-sort szigorúan olvasó feldolgozónak ezeket a címkéket
+   el kell fogadnia.
+
+8. **A Bash egress-elemző tiltja a `$változót` futtató `while IFS= read` ciklust.**
+   A minden sub-ügynökön futó elemző-hook tiltja azt a parancsszót, amely `$`-ral
+   kezdődik, ha a parancs bárhol `IFS=`-t állít, így a
+   `while IFS= read -r line; do $c "$line"; done < lista` hálózati hívásnak számít,
+   és tiltva van (`ifs-expanded-command` szabály). A javítás a #2298-ban nyitott,
+   még nem kész. Addig a ciklusban a parancs nevét írd ki szó szerint a `$c` helyett
+   (például `echo "$line"`); az átmegy a kapun. Szintén új: a `BASH_EGRESS_HOST_ALLOW` (alapból kikapcsolva).
+   Kikapcsolva a `curl https://` és a `wget` minden ügynökön tiltva marad, mint
+   eddig; bekapcsolva az elemző hoszt szerint dönt (a localhost, a helyi hálózat és
+   a `store/egress-vendor-hosts.json` hosztjai átmennek). Lásd: `docs/bash-sandbox.md`.

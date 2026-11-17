@@ -14,15 +14,80 @@ import {
   unlinkSync,
   mkdirSync,
   statSync,
+  lstatSync,
   existsSync,
   chmodSync,
+  realpathSync,
+  type Stats,
 } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { mergeAuthorizedKeys, removeAuthorizedKey, rewriteServicePorts, type MergeAction } from './remote-enroll-core.js'
+import { isTestRun } from './test-run-marker.js'
+import { realSshDir, describeTestRunSignal, SshDirGuardError } from './ssh-dir.js'
+
+/**
+ * ENROLL813 CHOKEPOINT -- the last line, and the only one every writer shares.
+ *
+ * All three exported writers below take `sshDir` as a PARAMETER, so whether the
+ * real ~/.ssh gets touched is decided by the caller. That is the right shape,
+ * but it means a single caller that forgets the seam can mutate the operator's
+ * authorized_keys -- and one did: `POST /api/security/bridge-enroll` calls
+ * bridgeEnroll() without deps, so the route's default resolver used
+ * homedir()/.ssh, and a plain suite run enrolled a REAL key on every pass. The
+ * test stayed GREEN throughout, because its only assertion
+ * (`not.toMatch(/Invalid host/)`) is satisfied by a SUCCESSFUL enrollment too.
+ * 62 keys accumulated across the fleet before anyone looked (cleaned 2026-09-15).
+ *
+ * The check is deliberately narrow on BOTH axes, so it cannot misfire:
+ *   - only under a test runner (VITEST / NODE_ENV=test -- see test-run-marker.ts,
+ *     the one definition of that question in this repo), and
+ *   - only when the target IS the real ~/.ssh. A scratch directory always passes,
+ *     which is every legitimate test.
+ * So the guard has no production behaviour to get wrong; what it forbids is the
+ * one combination that is always a mistake.
+ *
+ * Why here and not only in the resolvers: this is the single funnel that both
+ * the HTTP routes and the CLI pass through. A guard in a resolver protects the
+ * callers that USE that resolver; a guard here protects the file.
+ */
+function assertSafeSshDir(sshDir: string, operation: string): void {
+  if (!isTestRun()) return
+  if (!isRealSshDir(sshDir)) return
+  throw new SshDirGuardError(
+    `ENROLL813: refusing to ${operation} the REAL ${realSshDir()}/${AUTH_KEYS_NAME} ` +
+      `from a test run (${describeTestRunSignal()}). Pass a scratch sshDir (the suite ` +
+      'sets MARVEEN_SSH_DIR per worker in src/__tests__/setup/default-ssh-dir-seam.ts). ' +
+      'This guard exists because a route test silently enrolled real keys for weeks.',
+  )
+}
+
+/** Path identity, not string equality: ~/.ssh may be reached through a symlink
+ * or a non-normalised path. realpath when it exists, resolve() otherwise (a
+ * to-be-created scratch dir must not be mistaken for the real one). */
+function isRealSshDir(sshDir: string): boolean {
+  return canonical(sshDir) === canonical(realSshDir())
+}
+
+/** SCOPE, stated on purpose (ENROLL813): this compares the DIRECTORY, not the
+ * target file. If some scratch directory's `authorized_keys` were itself a
+ * symlink to the operator's real one, the two directories would differ, the
+ * guard would pass, and the write would still land in the real file. Not
+ * reachable from the suite -- every test directory comes from mkdtemp and
+ * nothing creates such a link -- and canonicalising the FILE instead would mean
+ * realpath-ing a path that usually does not exist yet on the enroll path. A
+ * chosen boundary, not an oversight; widen it here if that ever stops holding. */
+function canonical(p: string): string {
+  try {
+    return realpathSync(p)
+  } catch {
+    return resolve(p)
+  }
+}
 
 const SSH_DIR_MODE = 0o700
 const AUTH_KEYS_MODE = 0o600
 const AUTH_KEYS_NAME = 'authorized_keys'
+const SECOND_KEYS_NAME = 'authorized_keys2'
 const LOCK_NAME = 'authorized_keys.lock'
 
 export interface EnrollOptions {
@@ -46,6 +111,31 @@ export interface EnrollResult {
   action: MergeAction
   authorizedKeysPath: string
   warnings: string[]
+}
+
+/** The lock could not be taken: another writer holds it. A caller can tell this
+ * apart from an I/O error without reading the message (the message is unchanged). */
+export class AuthorizedKeysLockError extends Error {
+  readonly code = 'AUTHORIZED_KEYS_LOCKED'
+  constructor(message: string) {
+    super(message)
+    this.name = 'AuthorizedKeysLockError'
+  }
+}
+
+/** A guarded rewrite refused to write, or could not prove what it wrote. */
+export class AuthorizedKeysRewriteError extends Error {
+  readonly code:
+    | 'AUTHORIZED_KEYS_SYMLINK'
+    | 'AUTHORIZED_KEYS_READBACK'
+    | 'AUTHORIZED_KEYS_ASYNC_TRANSFORM'
+    | 'AUTHORIZED_KEYS_NOT_BYTES'
+    | 'AUTHORIZED_KEYS_FILE_NAME'
+  constructor(code: AuthorizedKeysRewriteError['code'], message: string) {
+    super(message)
+    this.name = 'AuthorizedKeysRewriteError'
+    this.code = code
+  }
 }
 
 const defaultSleep = (ms: number): Promise<void> =>
@@ -120,7 +210,7 @@ async function acquireLock(
       await sleep(delayMs)
     }
   }
-  throw new Error(
+  throw new AuthorizedKeysLockError(
     `could not acquire ${lockPath} after ${retries} attempts; another enrollment may be running`,
   )
 }
@@ -154,6 +244,7 @@ export async function enrollAuthorizedKey(opts: EnrollOptions): Promise<EnrollRe
     staleLockMs = 15000,
     sleep = defaultSleep,
   } = opts
+  assertSafeSshDir(sshDir, 'enroll a key into')
   const warnings: string[] = []
   const authPath = join(sshDir, AUTH_KEYS_NAME)
   const lockPath = join(sshDir, LOCK_NAME)
@@ -184,11 +275,16 @@ export async function enrollAuthorizedKey(opts: EnrollOptions): Promise<EnrollRe
 
 /** Atomic write: temp file in the same directory (same filesystem), 0600,
  * fsync, then rename over the target. */
-function writeAtomic(sshDir: string, authPath: string, content: string): void {
+function writeAtomic(
+  sshDir: string,
+  authPath: string,
+  content: string,
+  encoding: 'utf8' | 'latin1' = 'utf8',
+): void {
   const tmpPath = join(sshDir, `.${AUTH_KEYS_NAME}.${process.pid}.${Date.now()}.tmp`)
   const tfd = openSync(tmpPath, 'wx', AUTH_KEYS_MODE)
   try {
-    writeSync(tfd, content)
+    writeSync(tfd, content, null, encoding)
     fsyncSync(tfd)
   } finally {
     closeSync(tfd)
@@ -246,6 +342,7 @@ export async function updateEnrolledServicePorts(
     staleLockMs = 15000,
     sleep = defaultSleep,
   } = opts
+  assertSafeSshDir(sshDir, 'rewrite service ports in')
   const authPath = join(sshDir, AUTH_KEYS_NAME)
   const lockPath = join(sshDir, LOCK_NAME)
 
@@ -292,6 +389,7 @@ export async function removeEnrolledKey(opts: RemoveEnrolledOptions): Promise<Re
     staleLockMs = 15000,
     sleep = defaultSleep,
   } = opts
+  assertSafeSshDir(sshDir, 'remove a key from')
   const authPath = join(sshDir, AUTH_KEYS_NAME)
   const lockPath = join(sshDir, LOCK_NAME)
 
@@ -306,5 +404,180 @@ export async function removeEnrolledKey(opts: RemoveEnrolledOptions): Promise<Re
     return { removed, authorizedKeysPath: authPath }
   } finally {
     releaseLock(fd, lockPath)
+  }
+}
+
+/** The two files of a `.ssh` directory the stock sshd setting reads keys from. */
+export type AuthorizedKeysFileName = 'authorized_keys' | 'authorized_keys2'
+
+export interface LockedRewriteOptions {
+  sshDir: string
+  /** Which of the two files; `authorized_keys` when left out. The LOCK is the
+   * same file for both, so no two writers of either file interleave. Any
+   * other name is refused: this helper writes nowhere else. */
+  fileName?: AuthorizedKeysFileName
+  /** Words for the ENROLL813 refusal message, e.g. "write a support line into". */
+  operation: string
+  /** Create the .ssh directory (0700) when it is missing. A removal leaves this off. */
+  createDir?: boolean
+  /** Refuse when authorized_keys, or the .ssh directory itself, is a symbolic
+   * link. For ADDING access only: a removal must never be refused, because a
+   * refused removal leaves the key in. */
+  refuseSymlink?: boolean
+  /** Read and write the file one byte per character, so every byte the
+   * transform does not touch comes back as it was, whatever encoding the file
+   * is in. Without it the file is read as UTF-8, and a byte that is not valid
+   * UTF-8 is replaced. The new content may then hold only characters up to
+   * U+00FF; anything else is refused before the write. */
+  preserveBytes?: boolean
+  lockRetries?: number
+  lockRetryDelayMs?: number
+  staleLockMs?: number
+  sleep?: (ms: number) => Promise<void>
+}
+
+export interface LockedRewriteOutcome<T> {
+  result: T
+  /** True when the file content changed and was replaced. */
+  wrote: boolean
+  authorizedKeysPath: string
+  warnings: string[]
+}
+
+/**
+ * The shared read-transform-write of <sshDir>/authorized_keys for writers that
+ * are not the Bridge's own three: the SAME lock file, the same ENROLL813 guard
+ * and the same atomic replace, so two kinds of writer can never interleave.
+ *
+ * `transform` gets the current content ('' when the file does not exist) and
+ * returns the new content, or null to leave the file alone. It must be
+ * SYNCHRONOUS: the lock is given up after 20 x 100 ms by default and treated as
+ * stale after 15 s, so anything slow (measuring sshd, a network call) belongs
+ * BEFORE this call, never inside it. A transform that returns a promise is
+ * refused before anything is written.
+ *
+ * After the replace the file is read back and must equal what was written.
+ */
+export async function rewriteAuthorizedKeysLocked<T>(
+  opts: LockedRewriteOptions,
+  transform: (existing: string) => { content: string | null; result: T },
+): Promise<LockedRewriteOutcome<T>> {
+  const {
+    operation,
+    fileName = AUTH_KEYS_NAME,
+    createDir = false,
+    refuseSymlink = false,
+    preserveBytes = false,
+    lockRetries = 20,
+    lockRetryDelayMs = 100,
+    staleLockMs = 15000,
+    sleep = defaultSleep,
+  } = opts
+  // ONE spelling of the directory for the link check, the lock and the file.
+  // resolve() is lexical: it drops a trailing slash and a `.` segment and does
+  // not follow a link. lstat on `<dir>/.ssh/` or `<dir>/.ssh/.` FOLLOWS the
+  // link and reports a directory, so without this the refusal below would
+  // depend on how the caller happened to write the path.
+  const sshDir = resolve(opts.sshDir)
+  assertSafeSshDir(sshDir, operation)
+  // A caller that forces a value past the type must not turn this into a writer of any file.
+  if (fileName !== AUTH_KEYS_NAME && fileName !== SECOND_KEYS_NAME) {
+    throw new AuthorizedKeysRewriteError('AUTHORIZED_KEYS_FILE_NAME', 'only authorized_keys and authorized_keys2 can be rewritten')
+  }
+  const warnings: string[] = []
+  const authPath = join(sshDir, fileName)
+  const lockPath = join(sshDir, LOCK_NAME)
+  const encoding = preserveBytes ? 'latin1' : 'utf8'
+
+  // Before the directory is created or locked: nothing may be written through
+  // a linked directory by an operation that adds access.
+  if (refuseSymlink && lstatOrNull(sshDir)?.isSymbolicLink()) {
+    throw new AuthorizedKeysRewriteError(
+      'AUTHORIZED_KEYS_SYMLINK',
+      `${sshDir} is a symbolic link; refusing to add access through it`,
+    )
+  }
+  if (createDir) ensureSshDir(sshDir, warnings)
+  else if (!existsSync(sshDir)) {
+    // Nothing to read and nowhere to lock: the file cannot exist either.
+    const out = transform('')
+    assertSyncTransform(out)
+    if (out.content !== null && out.content !== '') {
+      throw new Error(`${sshDir} does not exist; refusing to create it for this operation`)
+    }
+    return { result: out.result, wrote: false, authorizedKeysPath: authPath, warnings }
+  }
+
+  const fd = await acquireLock(lockPath, lockRetries, lockRetryDelayMs, staleLockMs, sleep)
+  try {
+    let existing = ''
+    const link = lstatOrNull(authPath)
+    if (link !== null) {
+      if (link.isSymbolicLink() && refuseSymlink) {
+        throw new AuthorizedKeysRewriteError(
+          'AUTHORIZED_KEYS_SYMLINK',
+          `${authPath} is a symbolic link; refusing to add access through it`,
+        )
+      }
+      if (existsSync(authPath)) {
+        const st = statSync(authPath)
+        if (looserThan(st.mode, AUTH_KEYS_MODE)) {
+          warnings.push(
+            `${authPath} permissions were ${fmtMode(st.mode)} (looser than 0600); the rewritten file is 0600`,
+          )
+        }
+        existing = readFileSync(authPath, encoding)
+      }
+    }
+    const out = transform(existing)
+    assertSyncTransform(out)
+    if (out.content === null || out.content === existing) {
+      return { result: out.result, wrote: false, authorizedKeysPath: authPath, warnings }
+    }
+    // Only an ADDITION can trip this: a removal's content is the decoded file
+    // minus some lines, and every character of that is already one byte. So
+    // this refusal never stands in the way of taking access out.
+    if (preserveBytes && /[^\u0000-\u00ff]/.test(out.content)) {
+      throw new AuthorizedKeysRewriteError(
+        'AUTHORIZED_KEYS_NOT_BYTES',
+        `the new content of ${authPath} holds a character that is not one byte; nothing was written`,
+      )
+    }
+    writeAtomic(sshDir, authPath, out.content, encoding)
+    if (readFileSync(authPath, encoding) !== out.content) {
+      throw new AuthorizedKeysRewriteError(
+        'AUTHORIZED_KEYS_READBACK',
+        `${authPath} does not hold what was just written`,
+      )
+    }
+    if (link !== null && link.isSymbolicLink()) {
+      // The rename replaced the LINK. sshd now reads the new regular file; the
+      // file the link pointed at was not opened for writing and is as it was.
+      warnings.push(
+        `${authPath} was a symbolic link; it is now a regular file. The file the link pointed at was not ` +
+          'changed and still holds its old lines: linking it back would bring them back',
+      )
+    }
+    return { result: out.result, wrote: true, authorizedKeysPath: authPath, warnings }
+  } finally {
+    releaseLock(fd, lockPath)
+  }
+}
+
+function lstatOrNull(path: string): Stats | null {
+  try {
+    return lstatSync(path)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw err
+  }
+}
+
+function assertSyncTransform(out: unknown): void {
+  if (out !== null && typeof out === 'object' && typeof (out as { then?: unknown }).then === 'function') {
+    throw new AuthorizedKeysRewriteError(
+      'AUTHORIZED_KEYS_ASYNC_TRANSFORM',
+      'the transform returned a promise; nothing slow may run while the lock is held',
+    )
   }
 }

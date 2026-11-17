@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""Tests for the memoria-heartbeat preCheck (PRECHECKSZURO1004).
+
+Each test builds a throwaway state file, transcript folder, log and mode file,
+runs the REAL wrapper (`bash memoria-heartbeat-precheck.sh`, as runPreCheck
+does) with the paths pointed at them, and reads stdout, the exit code and the
+log line. Nothing touches the live store or the main agent's transcripts.
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from datetime import datetime, timezone
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+WRAPPER = os.path.join(os.path.dirname(HERE), 'prechecks', 'memoria-heartbeat-precheck.sh')
+
+
+def iso(epoch):
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        d = self.tmp.name
+        self.state = os.path.join(d, 'state.json')
+        self.tdir = os.path.join(d, 'transcripts')
+        os.makedirs(self.tdir)
+        self.logp = os.path.join(d, 'log', 'precheck.jsonl')
+        self.mode = os.path.join(d, 'mode')
+        self.now = time.time()
+        self.last = int(self.now - 900)
+        self.write_state(self.last)
+        self.rows = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write_state(self, last):
+        with open(self.state, 'w') as fh:
+            json.dump({'last_run_at': last, 'outcome': 'quiet'}, fh)
+
+    def set_mode(self, mode):
+        with open(self.mode, 'w') as fh:
+            fh.write(mode + '\n')
+
+    def add(self, row):
+        self.rows.append(row)
+
+    def tool(self, at, command='ls'):
+        self.add({'type': 'assistant', 'timestamp': iso(at), 'message': {
+            'content': [{'type': 'tool_use', 'name': 'Bash', 'input': {'command': command}}]}})
+
+    def user(self, at, text, meta=False):
+        row = {'type': 'user', 'timestamp': iso(at), 'message': {'content': text}}
+        if meta:
+            row['isMeta'] = True
+        self.add(row)
+
+    def stamp_result(self):
+        # In a live transcript the round that wrote the stamp keeps writing after
+        # it (the stamp's own tool_result, the closing text), so a real window
+        # always holds rows newer than the stamp. Not activity by itself.
+        return {'type': 'user', 'timestamp': iso(self.last + 1), 'message': {
+            'content': [{'type': 'tool_result', 'content': ''}]}}
+
+    def write_transcript(self, fresh_tail=True):
+        rows = self.rows + ([self.stamp_result()] if fresh_tail else [])
+        path = os.path.join(self.tdir, 'main.jsonl')
+        with open(path, 'w') as fh:
+            for r in rows:
+                fh.write(json.dumps(r) + '\n')
+        return path
+
+    def run_check(self, env_extra=None, fresh_tail=True):
+        self.write_transcript(fresh_tail)
+        return self.invoke(env_extra)
+
+    def invoke(self, env_extra=None):
+        env = dict(os.environ, MHP_STATE_PATH=self.state, MHP_TRANSCRIPT_DIR=self.tdir,
+                   MHP_LOG_PATH=self.logp, MHP_MODE_PATH=self.mode)
+        if env_extra:
+            env.update(env_extra)
+        r = subprocess.run(['/bin/bash', WRAPPER], env=env, capture_output=True, text=True, timeout=10)
+        log = None
+        if os.path.exists(self.logp):
+            with open(self.logp) as fh:
+                log = json.loads(fh.read().splitlines()[-1])
+        return r.returncode, r.stdout.strip(), log
+
+class DecisionTest(Base):
+    # --- the decision ---------------------------------------------------
+
+    def test_empty_window_live_skips(self):
+        self.set_mode('live')
+        self.tool(self.last - 60)  # before the stamp: not this window
+        code, out, log = self.run_check()
+        self.assertEqual((code, out), (0, 'SKIP'))
+        self.assertEqual(log['reason'], 'empty-window')
+        self.assertTrue(log['skipped'])
+
+    def test_shadow_never_skips_but_logs_would_skip(self):
+        self.set_mode('shadow')
+        code, out, log = self.run_check()
+        self.assertEqual((code, out), (0, ''))
+        self.assertTrue(log['would_skip'])
+        self.assertFalse(log['skipped'])
+        self.assertEqual(log['mode'], 'shadow')
+
+    def test_no_mode_file_is_the_shipped_default_live(self):
+        code, out, log = self.run_check()
+        self.assertEqual((code, out), (0, 'SKIP'))
+        self.assertTrue(log['skipped'])
+        self.assertEqual(log['mode'], 'live')
+
+    def test_a_tool_call_after_the_stamp_runs_the_round(self):
+        self.set_mode('live')
+        self.tool(self.last + 30)
+        code, out, log = self.run_check()
+        self.assertEqual(out, '')
+        self.assertEqual(log['tool_uses'], 1)
+        self.assertFalse(log['would_skip'])
+
+    def test_an_inbox_nudge_runs_the_round(self):
+        self.set_mode('live')
+        self.user(self.last + 30, '[Inbox] Ha fent uj bejovo blokk van...')
+        code, out, log = self.run_check()
+        self.assertEqual(out, '')
+        self.assertEqual(log['inbox'], 1)
+
+    def test_a_channel_message_runs_the_round(self):
+        self.set_mode('live')
+        self.user(self.last + 30, '<channel source="plugin:telegram:telegram" chat_id="1">szia</channel>')
+        code, out, _ = self.run_check()
+        self.assertEqual(out, '')
+
+    def test_a_direct_prompt_runs_the_round(self):
+        self.set_mode('live')
+        self.user(self.last + 30, 'nezd meg a kartyat')
+        code, out, log = self.run_check()
+        self.assertEqual(out, '')
+        self.assertEqual(log['prompts'], 1)
+
+    def test_the_stamp_itself_scheduled_notices_and_meta_rows_are_not_activity(self):
+        self.set_mode('live')
+        self.tool(self.last + 1, "python3 -c \"json.dump({'last_run_at': 1, 'outcome': 'quiet'}, "
+                                 "open('/x/store/memoria-heartbeat-state.json','w'))\"")
+        self.user(self.last + 30, 'SCHEDULED TASK NOTICE -- the next <scheduled-task ...')
+        self.user(self.last + 31, '<system-reminder>x</system-reminder>', meta=True)
+        code, out, log = self.run_check()
+        self.assertEqual(out, 'SKIP')
+        self.assertEqual(log['tool_uses'], 0)
+
+    def test_max_silence_runs_the_round_even_with_an_empty_window(self):
+        self.set_mode('live')
+        self.write_state(int(self.now - 5 * 3600))
+        code, out, log = self.run_check()
+        self.assertEqual(out, '')
+        self.assertEqual(log['reason'], 'max-silence')
+
+    def test_a_stamp_in_the_future_runs_the_round(self):
+        # The window [last, now] is empty by construction and the max-silence net
+        # cannot fire on a negative silence, so without the guard this SKIPs forever.
+        self.set_mode('live')
+        self.write_state(int(self.now + 86400))
+        self.tool(self.now - 60)
+        code, out, log = self.run_check()
+        self.assertEqual((code, out), (0, ''))
+        self.assertEqual(log['reason'], 'future-stamp')
+        self.assertFalse(log['would_skip'])
+        self.assertLess(log['silence_s'], 0)
+
+    def test_a_millisecond_stamp_runs_the_round(self):
+        self.set_mode('live')
+        self.write_state(int(self.now * 1000))
+        code, out, log = self.run_check()
+        self.assertEqual((code, out), (0, ''))
+        self.assertEqual(log['reason'], 'future-stamp')
+
+    def test_a_stamp_within_the_clock_skew_tolerance_is_not_an_error(self):
+        # #1765: a stamp up to FUTURE_TOLERANCE_S ahead is not 'future-stamp'.
+        # The transcript here is written after the stamp, so the window is judged
+        # on its rows and an empty one skips.
+        self.set_mode('live')
+        self.write_state(int(self.now + 60))
+        self.last = int(self.now + 60)
+        path = self.write_transcript()
+        os.utime(path, (self.last + 2, self.last + 2))
+        code, out, log = self.invoke()
+        self.assertEqual((code, out), (0, 'SKIP'))
+        self.assertEqual(log['reason'], 'empty-window')
+
+    def test_a_skewed_stamp_with_only_real_time_rows_runs_the_round(self):
+        # PRECHECKRES1008 changes this case on purpose: when the stamp is ahead
+        # of the clock that wrote the rows, every row of the round predates it,
+        # nothing is fresh, and the round runs ('no-fresh-transcript') instead
+        # of being judged empty. A cost (one extra round), never a missed one.
+        self.set_mode('live')
+        self.write_state(int(self.now + 60))
+        self.tool(self.now - 30)
+        code, out, log = self.run_check(fresh_tail=False)
+        self.assertEqual((code, out), (0, ''))
+        self.assertEqual(log['reason'], 'no-fresh-transcript')
+        self.assertEqual(log['fresh_rows'], 0)
+
+    def test_a_failed_log_append_says_so_on_stderr(self):
+        self.set_mode('live')
+        blocker = os.path.join(self.tmp.name, 'blocker')
+        with open(blocker, 'w') as fh:
+            fh.write('x')
+        self.write_transcript()
+        env = dict(os.environ, MHP_STATE_PATH=self.state, MHP_TRANSCRIPT_DIR=self.tdir,
+                   MHP_LOG_PATH=os.path.join(blocker, 'p.jsonl'), MHP_MODE_PATH=self.mode)
+        r = subprocess.run([sys.executable, os.path.join(os.path.dirname(WRAPPER), 'memoria_heartbeat_precheck.py')],
+                           env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(r.stdout.strip(), '')
+        self.assertIn('log append failed', r.stderr)
+
+    # --- a window the check did not actually see (PRECHECKRES1008) ------
+
+    def test_a_transcript_untouched_since_the_stamp_runs_the_round(self):
+        # The folder exists but nothing in it was written after the stamp (a
+        # stale config root, a renamed project folder): files == 0 is not an
+        # empty window, it is a window nobody looked at.
+        self.set_mode('live')
+        self.tool(self.last - 60)
+        path = self.write_transcript(fresh_tail=False)
+        old = self.last - 600
+        os.utime(path, (old, old))
+        code, out, log = self.invoke()
+        self.assertEqual((code, out), (0, ''))
+        self.assertEqual(log['reason'], 'no-fresh-transcript')
+        self.assertEqual(log['files'], 0)
+        self.assertFalse(log['would_skip'])
+
+    def test_a_fresh_file_holding_only_old_rows_runs_the_round(self):
+        # A touched or copied archive: the mtime is new, every row predates the stamp.
+        self.set_mode('live')
+        self.tool(self.last - 60)
+        code, out, log = self.run_check(fresh_tail=False)
+        self.assertEqual((code, out), (0, ''))
+        self.assertEqual(log['reason'], 'no-fresh-transcript')
+        self.assertEqual(log['files'], 1)
+        self.assertEqual(log['fresh_rows'], 0)
+
+    def test_a_decision_that_could_not_be_logged_does_not_skip(self):
+        # The log's parent is a regular file, so the append fails: an unlogged
+        # SKIP would be a missed round nobody can account for.
+        self.set_mode('live')
+        blocker = os.path.join(self.tmp.name, 'blocker')
+        with open(blocker, 'w') as fh:
+            fh.write('x')
+        code, out, _ = self.run_check({'MHP_LOG_PATH': os.path.join(blocker, 'precheck.jsonl')})
+        self.assertEqual((code, out), (0, ''))
+
+    def test_the_same_window_with_a_working_log_still_skips(self):
+        # Control for the test above: only the log failure changes the outcome.
+        self.set_mode('live')
+        code, out, log = self.run_check()
+        self.assertEqual(out, 'SKIP')
+        self.assertGreaterEqual(log['fresh_rows'], 1)
+
+    # --- failing open ---------------------------------------------------
+
+    def test_missing_state_fails_open(self):
+        self.set_mode('live')
+        os.remove(self.state)
+        code, out, log = self.run_check()
+        self.assertEqual((code, out), (0, ''))
+        self.assertIn('error', log)
+
+    def test_corrupt_state_fails_open(self):
+        self.set_mode('live')
+        with open(self.state, 'w') as fh:
+            fh.write('{not json')
+        code, out, _ = self.run_check()
+        self.assertEqual((code, out), (0, ''))
+
+    def test_unknown_mode_is_shadow(self):
+        self.set_mode('turbo')
+        code, out, log = self.run_check()
+        self.assertEqual(out, '')
+        self.assertEqual(log['mode'], 'shadow')
+
+    def test_python_that_cannot_start_still_exits_zero_with_no_output(self):
+        code, out, _ = self.run_check({'PATH': '/nonexistent'})
+        self.assertEqual((code, out), (0, ''))
+
+
+class ResolutionTest(Base):
+    """The install-agnostic path resolution: no override of the transcript
+    folder, a fake HOME and a fake install root with a dot in its path."""
+
+    def setUp(self):
+        super().setUp()
+        d = self.tmp.name
+        self.home = os.path.join(d, 'home')
+        self.root = os.path.join(d, 'inst.all', 'install-root')
+        os.makedirs(os.path.join(self.root, 'store'))
+        self.enc = self.root.replace('/', '-').replace('.', '-').replace('_', '-')
+
+    def place(self, config_root, rows):
+        pdir = os.path.join(config_root, 'projects', self.enc)
+        os.makedirs(pdir, exist_ok=True)
+        with open(os.path.join(pdir, 's.jsonl'), 'w') as fh:
+            for r in rows:
+                fh.write(json.dumps(r) + '\n')
+
+    def run_resolved(self, extra=None):
+        env = dict(os.environ, HOME=self.home, MHP_ROOT=self.root, MHP_STATE_PATH=self.state,
+                   MHP_LOG_PATH=self.logp, MHP_MODE_PATH=self.mode)
+        env.pop('MHP_TRANSCRIPT_DIR', None)
+        env.pop('MAIN_AGENT_CONFIG_DIR', None)
+        if extra:
+            env.update(extra)
+        r = subprocess.run(['/bin/bash', WRAPPER], env=env, capture_output=True, text=True, timeout=10)
+        with open(self.logp) as fh:
+            log = json.loads(fh.read().splitlines()[-1])
+        return r.stdout.strip(), log
+
+    def activity(self):
+        return [{'type': 'assistant', 'timestamp': iso(self.last + 30), 'message': {
+            'content': [{'type': 'tool_use', 'name': 'Bash', 'input': {'command': 'ls'}}]}}]
+
+    def test_the_folder_name_turns_every_non_alnum_into_a_dash(self):
+        self.set_mode('live')
+        self.place(os.path.join(self.root, '.channels-config'), self.activity())
+        out, log = self.run_resolved()
+        self.assertEqual(out, '')
+        self.assertEqual(log['tool_uses'], 1)
+
+    def test_activity_in_any_candidate_root_counts(self):
+        self.set_mode('live')
+        self.place(os.path.join(self.home, '.claude'), [])  # empty main candidate
+        self.place(os.path.join(self.root, '.channels-config'), self.activity())
+        out, log = self.run_resolved()
+        self.assertEqual(out, '')
+        self.assertEqual(log['tool_uses'], 1)
+        self.assertEqual(log['files'], 2)
+
+    def test_main_agent_config_dir_from_the_env_file_is_a_candidate(self):
+        self.set_mode('live')
+        own = os.path.join(self.tmp.name, 'botlogin')
+        with open(os.path.join(self.root, '.env'), 'w') as fh:
+            fh.write(f'OTHER=1\nMAIN_AGENT_CONFIG_DIR={own}\n')
+        self.place(own, self.activity())
+        out, log = self.run_resolved()
+        self.assertEqual(out, '')
+        self.assertEqual(log['tool_uses'], 1)
+
+    def test_an_empty_window_in_the_resolved_folder_skips_in_live(self):
+        self.set_mode('live')
+        self.place(os.path.join(self.home, '.claude'), [self.stamp_result()])
+        out, log = self.run_resolved()
+        self.assertEqual(out, 'SKIP')
+
+    def test_a_symlinked_projects_folder_is_read_once(self):
+        self.set_mode('live')
+        self.place(os.path.join(self.home, '.claude'), self.activity())
+        os.makedirs(os.path.join(self.root, '.channels-config'))
+        os.symlink(os.path.join(self.home, '.claude', 'projects'),
+                   os.path.join(self.root, '.channels-config', 'projects'))
+        out, log = self.run_resolved()
+        self.assertEqual(log['files'], 1)
+        self.assertEqual(log['tool_uses'], 1)
+
+    def test_no_transcript_folder_anywhere_runs_the_round(self):
+        self.set_mode('live')
+        out, log = self.run_resolved()
+        self.assertEqual(out, '')
+        self.assertIn('error', log)
+
+
+if __name__ == '__main__':
+    unittest.main()

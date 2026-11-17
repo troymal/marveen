@@ -142,6 +142,9 @@ function mainAgentId() {
       }
     }
     const res = await originalFetch(input, init)
+    // An owner action refused for want of the owner's session: offer the password login (Samu 65968). Not awaited:
+    // the caller gets its answer as before.
+    if (res.status === 403) void maybeOfferOnOwnerRefusal(res, isSameOriginApi)
     if (res.status === 401 && isSameOriginApi) {
       // Token missing, wrong, or revoked. Wipe and prompt once per page load.
       // Keep a URL-provided session token so a transient 401 does not lock out
@@ -179,16 +182,45 @@ function mainAgentId() {
     if (isStandalone) {
       showStandaloneTokenPrompt(TOKEN_KEY)
     } else {
-      alert(
-        'Dashboard authentication failed. Check the server log for the access URL ' +
-        '(look for "Dashboard access URL" with ?token=...), then reopen it in your browser.'
-      )
+      showAuthFailedNotice()
     }
+  }
+
+  // No password login and no PWA: the only way in is the startup URL with ?token=. A closable notice in the page's
+  // language instead of the hard-coded English alert().
+  function showAuthFailedNotice() {
+    if (document.getElementById('mv-auth-failed-overlay')) return
+    const tr = (k, fallback) => (typeof window.t === 'function' ? window.t(k) : fallback) || fallback
+    const overlay = document.createElement('div')
+    overlay.id = 'mv-auth-failed-overlay'
+    overlay.setAttribute('role', 'alertdialog')
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:#1a1917;color:#faf9f5;' +
+      'display:flex;align-items:center;justify-content:center;padding:24px;' +
+      'font-family:system-ui,-apple-system,sans-serif'
+    const box = document.createElement('div')
+    box.style.cssText = 'max-width:420px;width:100%;display:flex;flex-direction:column;gap:14px'
+    const title = document.createElement('h2')
+    title.style.cssText = 'margin:0;font-size:18px;text-align:center'
+    title.textContent = tr('auth.failed.title', 'The dashboard did not accept the access')
+    const desc = document.createElement('p')
+    desc.style.cssText = 'margin:0;font-size:14px;opacity:0.8;line-height:1.5;text-align:center'
+    desc.textContent = tr('auth.failed.desc', 'The access token stored in this browser is missing, wrong or revoked. Find the "Dashboard access URL" line in the server log and open its link, with the ?token= part, again.')
+    const close = document.createElement('button')
+    close.style.cssText = 'padding:12px;border:0;border-radius:8px;background:#3a3936;color:#faf9f5;font-size:15px;font-weight:600'
+    close.textContent = tr('auth.failed.close', 'Close')
+    close.addEventListener('click', () => overlay.remove())
+    box.append(title, desc, close)
+    overlay.appendChild(box)
+    document.body.appendChild(overlay)
+    setTimeout(() => close.focus(), 50)
   }
 
   // Full-screen username+password login overlay. Posts to /api/auth/login; on
   // success the browser has the mv_session cookie and we reload authenticated.
-  function showLoginOverlay() {
+  // opts.cancellable: opened on purpose from a page that already works (the Bridge, whose
+  // device key authenticates every call: a Gromzo owner action needs the password login on
+  // top of it, GROMZOAGENTPICK1101), so it gets a Cancel button.
+  function showLoginOverlay(opts) {
     if (document.getElementById('mv-login-overlay')) return
     const tr = (k, fallback) => (typeof window.t === 'function' ? window.t(k) : fallback) || fallback
     const overlay = document.createElement('div')
@@ -204,6 +236,24 @@ function mainAgentId() {
         '<div class="mv-auth-err" id="mv-login-err"></div>' +
       '</form>'
     document.body.appendChild(overlay)
+    if (opts && opts.later) {
+      // BRIDGEPWLOGIN1101: the offer on opening the Bridge says what the login is for.
+      const desc = overlay.querySelector('.mv-auth-desc')
+      if (desc) desc.textContent = tr('auth.login.bridge_desc', 'Sign in with your dashboard password to approve, decide and change settings from here.')
+    }
+    if (opts && opts.cancellable) {
+      const cancel = document.createElement('button')
+      cancel.type = 'button'
+      cancel.id = 'mv-login-cancel'
+      cancel.className = 'btn-secondary btn-compact'
+      cancel.textContent = opts.later ? tr('auth.login.later', 'Later') : tr('auth.login.cancel', 'Cancel')
+      cancel.addEventListener('click', () => {
+        // "Later" quiets the offer for this run of the window (sessionStorage), not for good.
+        if (opts.later) { try { sessionStorage.setItem(LOGIN_LATER_KEY, '1') } catch { /* storage blocked */ } }
+        overlay.remove()
+      })
+      overlay.querySelector('#mv-login-form').appendChild(cancel)
+    }
     const form = overlay.querySelector('#mv-login-form')
     const userEl = overlay.querySelector('#mv-login-user')
     const passEl = overlay.querySelector('#mv-login-pass')
@@ -238,6 +288,58 @@ function mainAgentId() {
     })
     setTimeout(() => userEl.focus(), 50)
   }
+
+  window.mvShowLogin = (opts) => showLoginOverlay(opts)
+
+  // ONBOARDOWNERPW1107: the onboarding wizard's own sign-in (its first step). On the unwrapped fetch, like the overlay
+  // above: through the wrapper a wrong password's 401 would wipe the stored token or Bridge key and open the full-screen
+  // login. Returns only the outcome; the caller clears its password fields.
+  window.mvPasswordLogin = async (username, password) => {
+    try {
+      const r = await originalFetch('api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      })
+      let retryAfter = 0
+      if (r.status === 429) { try { retryAfter = (await r.json()).retry_after_s || 0 } catch { /* ignore */ } }
+      return { ok: r.ok, status: r.status, retryAfter }
+    } catch {
+      return { ok: false, status: 0, retryAfter: 0 }
+    }
+  }
+
+  // BRIDGEPWLOGIN1101 (Samu 64763, plan A; the moment: Samu 65968): the Bridge opens the dashboard with its device key,
+  // which never makes the owner. Most Bridge use needs no owner session, so nothing is offered on load: the offer comes
+  // when an owner action is first refused (403 owner_session_required, maybeOfferOnOwnerRefusal in the fetch wrapper),
+  // once per page, and only when a password login exists and no owner session rides on this window. "Later" quiets it
+  // for this run. The key stays: the overlay's login adds the cookie beside it, and the owner gates take the pair. Only
+  // a full key gets owner_session in the status at all, so an operator key is never offered this. The refusal's own
+  // toast still shows, the fallback when the overlay does not open.
+  const LOGIN_LATER_KEY = 'mv-login-later'
+  const ownerOffer = { seen: false }
+  function maybeOfferOnOwnerRefusal(res, isApi) {
+    if (ownerOffer.seen || !isApi || !res || res.status !== 403) return Promise.resolve()
+    return res.clone().json().then((b) => {
+      if (ownerOffer.seen || !b || b.code !== 'owner_session_required') return
+      ownerOffer.seen = true
+      return offerOwnerLoginOnce()
+    }).catch(() => { /* not JSON, or the offer failed: the caller's toast stands */ })
+  }
+  async function offerOwnerLoginOnce() {
+    try { if (sessionStorage.getItem(LOGIN_LATER_KEY) === '1') return } catch { /* storage blocked: offer it */ }
+    // ONBOARDOWNERPW1107: while the onboarding wizard is open, its first step is the sign-in; no second form over it.
+    if (typeof document !== 'undefined' && document.getElementById('onboardingOverlay')?.classList.contains('active')) return
+    if (!sessionToken) return
+    let s = null
+    try {
+      const r = await originalFetch('api/auth/status', { headers: { Authorization: 'Bearer ' + sessionToken }, cache: 'no-store' })
+      if (r.ok) s = await r.json()
+    } catch { return }
+    if (!s || s.method !== 'device' || !s.login_available || s.owner_session !== false) return
+    showLoginOverlay({ cancellable: true, later: true })
+  }
+  window.mvOfferOwnerLogin = offerOwnerLoginOnce
 
   // Full-screen, one-time token paste for installed PWAs (see the 401 handler).
   // The user pastes the access token (the value after ?token= in the server's
@@ -363,21 +465,21 @@ function switchPage(pageId) {
   openSidebarGroupForPage(pageId)
   // Kanban needs full-width layout (overrides main's max-width: 1200px)
   document.querySelector('main').classList.toggle('kanban-active', pageId === 'kanban')
-  // Activity page runs a live poll; stop it whenever we navigate away.
-  if (pageId !== 'activity') stopActivityPoll()
-  if (pageId === 'activity') startActivityPoll()
   // Agents page tints each Terminal button green while that agent is working;
-  // same 3s poll + source as Activity. Stop it when we leave the page.
-  if (pageId !== 'agents') stopAgentsBusyPoll()
+  // same 3s poll + source as Activity. The overview's team graph uses the same
+  // poll for its green "working" border. Stop it when we leave both pages.
+  if (pageId !== 'agents' && pageId !== 'overview') stopAgentsBusyPoll()
   // Kanban auto-refresh: start on enter, stop on leave.
   if (pageId !== 'kanban') stopKanbanRefresh()
-  if (pageId === 'overview') loadOverview()
+  if (pageId === 'overview') { loadOverview(); startAgentsBusyPoll() }
+  if (pageId === 'projects') loadProjects()
   if (pageId === 'kanban') { if (typeof _initGanttViewSwitcher === 'function') _initGanttViewSwitcher(); loadKanban(); startKanbanRefresh() }
   if (pageId === 'tasks') loadSchedules()
   if (pageId === 'agents') { loadAgents().then(() => _setAgentsView(_agentsActiveView || 'grid')); startAgentsBusyPoll() }
   if (pageId === 'memories') { loadMemAgents(); loadMemStats(); loadMemories() }
   if (pageId === 'skills') loadGlobalSkills()
   if (pageId === 'connectors') loadConnectors()
+  if (pageId === 'clitools') loadCliTools()
   if (pageId === 'migrate') loadMigrateAgents()
   if (pageId === 'docs') loadDocs()
   if (pageId === 'research') loadResearch()
@@ -393,6 +495,7 @@ function switchPage(pageId) {
   if (pageId === 'tokenUsage') loadTokenUsage()
   if (pageId === 'costs') loadCosts()
   if (pageId === 'ideas') loadIdeasPage()
+  if (pageId === 'notes') loadNotesPage()
   if (pageId === 'archived') loadArchivedPage()
   if (pageId === 'naplo') loadNaplo()
   if (pageId === 'federation') loadFederationPage()
@@ -434,11 +537,13 @@ const SIDEBAR_GROUPS_LS_KEY = 'marveen.sidebarGroups'
 // into their group containers per this map, so regrouping a page (say, moving
 // naplo under system) or relabeling a group is a one-line change right here.
 const SIDEBAR_GROUPS = [
-  { key: 'team',        labelKey: 'nav.group.team',        pages: ['agents', 'activity', 'messages', 'tasks', 'bgTasks'] },
+  // 'activity' is gone: the live per-agent status is now the Agents page's
+  // "Aktivitás" card mode, so it has no page, no nav entry and no URL.
+  { key: 'team',        labelKey: 'nav.group.team',        pages: ['agents', 'messages', 'tasks', 'bgTasks'] },
   { key: 'knowledge',   labelKey: 'nav.group.knowledge',   pages: ['memories', 'skills', 'research', 'ideas'] },
   { key: 'stats',       labelKey: 'nav.group.stats',       pages: ['costs', 'tokenUsage'] },
   { key: 'system',      labelKey: 'nav.group.system',      pages: ['status', 'naplo', 'updates', 'settings', 'vault'] },
-  { key: 'connections', labelKey: 'nav.group.connections', pages: ['connectors', 'federation', 'migrate'] },
+  { key: 'connections', labelKey: 'nav.group.connections', pages: ['connectors', 'clitools', 'federation', 'migrate'] },
 ]
 const sidebarGroupEls = document.querySelectorAll('.sb-group[data-group]')
 // data-page -> group key, derived from the map (not the DOM) so the map wins.
@@ -447,14 +552,14 @@ SIDEBAR_GROUPS.forEach((def) => def.pages.forEach((p) => { PAGE_SIDEBAR_GROUP[p]
 // Re-parent the 23 static links to match the map. Moving an existing DOM node
 // does not invalidate the navLinks refs captured by querySelectorAll at boot.
 SIDEBAR_GROUPS.forEach((def) => {
-  const group = document.querySelector(`.sb-group[data-group="${def.key}"]`)
+  const group = document.querySelector(`.sb-group[data-group="${CSS.escape(String(def.key))}"]`)
   if (!group) return
   const label = group.querySelector('.sb-group-label')
   if (label) label.dataset.i18n = def.labelKey
   const items = group.querySelector('.sb-group-items')
   if (!items) return
   def.pages.forEach((p) => {
-    const link = document.querySelector(`.sb-link[data-page="${p}"]`)
+    const link = document.querySelector(`.sb-link[data-page="${CSS.escape(String(p))}"]`)
     if (link) items.appendChild(link)
   })
 })
@@ -511,11 +616,11 @@ const NAV_I18N = {
   agents: 'nav.agents', activity: 'nav.activity', team: 'nav.team',
   messages: 'nav.messages', tasks: 'nav.tasks', memories: 'nav.memories',
   recall: 'nav.recall', naplo: 'nav.recall', bgTasks: 'nav.bgTasks',
-  skills: 'nav.skills', connectors: 'nav.connectors', migrate: 'nav.migrate',
+  skills: 'nav.skills', connectors: 'nav.connectors', clitools: 'nav.clitools', migrate: 'nav.migrate',
   approvals: 'nav.approvals',
   docs: 'nav.docs', research: 'nav.research', status: 'nav.status',
   settings: 'nav.settings', vault: 'nav.vault', tokenUsage: 'nav.tokenUsage',
-  ideas: 'nav.ideas', federation: 'nav.federation', updates: 'nav.updates', costs: 'nav.costs',
+  ideas: 'nav.ideas', notes: 'nav.notes', federation: 'nav.federation', updates: 'nav.updates', costs: 'nav.costs',
 }
 
 function renderNav() {
@@ -539,7 +644,6 @@ const STATIC_I18N_MAP = {
 // Page id -> { title key, subtitle key (or null) }
 const PAGE_HEADER_I18N = {
   agentsPage:     { title: 'agents.page_title',     sub: 'agents.page_subtitle' },
-  activityPage:   { title: 'activity.page_title',   sub: 'activity.page_subtitle' },
   tasksPage:      { title: 'tasks.page_title',       sub: 'tasks.page_subtitle' },
   skillsPage:     { title: 'skills.page_title',      sub: 'skills.page_subtitle' },
   memoriesPage:   { title: 'memories.page_title',    sub: 'memories.page_subtitle' },
@@ -559,6 +663,7 @@ const PAGE_HEADER_I18N = {
   updatesPage:    { title: 'updates.page_title',     sub: null },
   naploPage:      { title: 'naplo.page_title',       sub: 'naplo.page_subtitle' },
   costsPage:      { title: 'costs.page_title',       sub: 'costs.page_subtitle' },
+  clitoolsPage:   { title: 'clitools.page_title',    sub: 'clitools.page_subtitle' },
   federationPage: { title: 'federation.page_title',  sub: 'federation.page_subtitle' },
   approvalsPage:  { title: 'approvals.page_title',   sub: 'approvals.page_subtitle' },
 }
@@ -592,8 +697,10 @@ function renderStaticI18n() {
   // Messages empty state
   const chatEmpty = document.querySelector('.chat-thread-empty p')
   if (chatEmpty) chatEmpty.textContent = t('messages.select_agent')
-  // Team hint
-  const teamHint = document.querySelector('#teamPage > p')
+  // Team hint. Lives under the Agents page org-chart view since the separate
+  // Team page was merged in; the old '#teamPage > p' selector matched nothing
+  // and left the hint stuck on its hard-coded Hungarian.
+  const teamHint = document.getElementById('teamHint')
   if (teamHint) teamHint.textContent = t('team.hint')
 
   // Overview stat labels (siblings of statAgents, statTasks, statMemories, statSkills)
@@ -642,7 +749,10 @@ function renderStaticI18n() {
       const nodes = [...el.childNodes]
       for (let i = nodes.length - 1; i >= 0; i--) {
         if (nodes[i].nodeType === 3 && nodes[i].textContent.trim()) {
-          nodes[i].textContent = ' ' + val
+          // Keep the node's trailing whitespace: it separates the label text from a
+          // following inline child such as the "(optional)" hint.
+          const trailing = nodes[i].textContent.match(/\s*$/)[0]
+          nodes[i].textContent = ' ' + val + trailing
           break
         }
       }
@@ -659,7 +769,7 @@ function renderStaticI18n() {
   })
   // Elements whose translation contains inline markup (strong/code/a): set innerHTML.
   document.querySelectorAll('[data-i18n-html]').forEach(el => {
-    el.innerHTML = t(el.dataset.i18nHtml)
+    el.innerHTML = tHtml(el.dataset.i18nHtml)
   })
   // #updatesSubtitle opts out of the [data-i18n] sweep (renderUpdatesVersion owns
   // it). Re-apply from the cached status so a language switch re-localizes its
@@ -684,14 +794,33 @@ if (document.readyState !== 'loading') {
 // === Activity (live agent status) ===
 // ============================================================
 
-let activityTimer = null
-
+// The Activity page is gone -- its live per-agent status is the Agents page's
+// "Aktivitás" card mode (see renderAgentCardActivity). This table is the shared
+// vocabulary: the same states, labels, colours and tooltips as before.
 const ACTIVITY_STATE_META = {
   working: { label: () => t('activity.state.working'), cls: 'act-working', tip: 'Élő állapot (a tmux pane tartalmából, 3 másodpercenként): éppen dolgozik / gondolkodik.' },
   idle: { label: () => t('activity.state.idle'), cls: 'act-idle', tip: 'Élő állapot (3 másodpercenként): fut, de épp nem csinál semmit.' },
+  dead: { label: () => t('activity.state.dead'), cls: 'act-dead', tip: 'A tmux session él, de nincs benne Claude CLI: a pane egy shell promptra esett vissza. Ez nem várakozás, ez halott ágens -- indítsd újra.' },
+  // Main thread idle, background (sub-)agents running. Display-only: the API's
+  // `state` stays 'idle' and this is picked by activityDisplayState.
+  subagents: {
+    label: (entry) => entry.bgAgents.queued > 0
+      ? t('activity.state.subagents_queued', { n: entry.bgAgents.running, q: entry.bgAgents.queued })
+      : t('activity.state.subagents', { n: entry.bgAgents.running }),
+    cls: 'act-subagents',
+    tip: 'Élő állapot (3 másodpercenként): a fő szál tétlen, de a háttér-alügynökei dolgoznak. A "vár" az alügynököknek küldött, még fel nem vett üzenetek száma.',
+  },
   unknown: { label: () => t('activity.state.unknown'), cls: 'act-unknown', tip: 'Élő állapot: nem sikerült megállapítani a session pane tartalmából.' },
   error: { label: () => t('activity.state.error'), cls: 'act-error', tip: 'Élő állapot: hiba látszik az ágens session paneljén.' },
   stopped: { label: () => t('activity.state.stopped'), cls: 'act-stopped', tip: 'Élő állapot: az ágens session nem fut.' },
+}
+
+// The state an entry is SHOWN in. The main thread working always wins; only an
+// idle main thread with running background agents reads as 'subagents'. An
+// entry without a recognised agent block (bgAgents null) keeps its own state.
+function activityDisplayState(entry) {
+  if (entry && entry.state === 'idle' && entry.bgAgents && entry.bgAgents.running > 0) return 'subagents'
+  return entry ? entry.state : 'unknown'
 }
 
 // === Kanban auto-refresh ===
@@ -718,87 +847,38 @@ document.addEventListener('visibilitychange', () => {
   }
 })
 
-function startActivityPoll() {
-  loadActivity()
-  if (activityTimer) clearInterval(activityTimer)
-  activityTimer = setInterval(loadActivity, 3000)
-}
+// Permission-mode chip. Shown for every mode EXCEPT the ones that let the agent
+// work on its own -- inverted on purpose: an unfamiliar mode is exactly the one
+// worth surfacing, so a future Claude Code mode shows up here instead of hiding
+// behind a list nobody remembered to extend. Without this an agent parked in an
+// ask-first mode renders as plain 'idle', which is how one sat unusable for
+// hours on 2026-07-27.
+const AUTONOMOUS_MODES = ['bypass permissions', 'accept edits', 'auto mode']
 
-function stopActivityPoll() {
-  if (activityTimer) {
-    clearInterval(activityTimer)
-    activityTimer = null
-  }
+// The live status body of one agent card in "Aktivitás" mode: the state badge,
+// the permission-mode chip and the last few lines of the agent's pane. Same
+// markup the Activity page used, minus the name row -- the card already carries
+// the avatar, name and description above it.
+function agentActivityBodyHtml(entry) {
+  const metaRaw = ACTIVITY_STATE_META[activityDisplayState(entry)] || ACTIVITY_STATE_META.unknown
+  const label = typeof metaRaw.label === 'function' ? metaRaw.label(entry) : metaRaw.label
+  const tail = (entry.tail || []).map((l) => escapeHtml(l)).join('\n')
+  const modeChip = entry.mode && !AUTONOMOUS_MODES.includes(entry.mode)
+    ? '<span class="act-mode-badge" title="' + escapeHtml(t('activity.tooltip.mode', { mode: entry.mode })) + '">' + escapeHtml(entry.mode) + '</span>'
+    : ''
+  const termIcon = entry.running
+    ? '<svg class="act-term-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>'
+    : ''
+  return (
+    '<div class="agent-act-head">' +
+      '<span class="activity-badge ' + metaRaw.cls + '" title="' + escapeHtml(metaRaw.tip || '') + '">' + (entry.state === 'working' ? '<span class="act-orb" aria-hidden="true"></span>' : '') + escapeHtml(label) + '</span>' +
+      '<span class="agent-act-head-right">' + modeChip + termIcon + '</span>' +
+    '</div>' +
+    (tail
+      ? '<pre class="activity-tail">' + tail + '</pre>'
+      : '<p class="activity-tail-empty">' + (entry.running ? t('agents.card.no_output') : t('agents.card.not_running')) + '</p>')
+  )
 }
-
-async function loadActivity() {
-  try {
-    const res = await fetch('api/agents/activity')
-    if (!res.ok) throw new Error('HTTP ' + res.status)
-    const entries = await res.json()
-    renderActivity(entries)
-    const upd = document.getElementById('activityUpdated')
-    if (upd) upd.textContent = t('activity.updated', { time: new Date().toLocaleTimeString('hu-HU') })
-  } catch (e) {
-    const list = document.getElementById('activityList')
-    if (list) list.innerHTML = '<p class="activity-empty">' + t('activity.error_load') + ': ' + escapeHtml(String(e.message || e)) + '</p>'
-  }
-}
-
-function renderActivity(entries) {
-  const list = document.getElementById('activityList')
-  if (!list) return
-  if (!Array.isArray(entries) || entries.length === 0) {
-    list.innerHTML = '<p class="activity-empty">' + t('activity.empty') + '</p>'
-    return
-  }
-  list.innerHTML = entries.map((a) => {
-    const metaRaw = ACTIVITY_STATE_META[a.state] || ACTIVITY_STATE_META.unknown
-    const meta = { ...metaRaw, label: typeof metaRaw.label === 'function' ? metaRaw.label() : metaRaw.label }
-    const tail = (a.tail || []).map((l) => escapeHtml(l)).join('\n')
-    const mainBadge = a.isMain ? '<span class="act-main-badge">' + t('activity.badge.main') + '</span>' : ''
-    // Permission-mode chip. Shown for every mode EXCEPT the ones that let the
-    // agent work on its own -- inverted on purpose: an unfamiliar mode is
-    // exactly the one worth surfacing, so a future Claude Code mode shows up
-    // here instead of hiding behind a list nobody remembered to extend.
-    // Without this an agent parked in an ask-first mode renders as plain
-    // 'idle', which is how one sat unusable for hours on 2026-07-27.
-    const AUTONOMOUS_MODES = ['bypass permissions', 'accept edits', 'auto mode']
-    const modeChip = a.mode && !AUTONOMOUS_MODES.includes(a.mode)
-      ? '<span class="act-mode-badge" title="' + escapeHtml(t('activity.tooltip.mode', { mode: a.mode })) + '">' + escapeHtml(a.mode) + '</span>'
-      : ''
-    const canOpen = !!a.running
-    const termIcon = canOpen
-      ? '<svg class="act-term-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" title="' + t('activity.tooltip.terminal') + '"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>'
-      : ''
-    return (
-      '<div class="activity-card ' + meta.cls + (canOpen ? ' act-clickable' : '') + '" data-agent="' + escapeHtml(a.name) + '">' +
-        '<div class="activity-card-head">' +
-          '<span class="activity-name">' + escapeHtml(a.name) + mainBadge + '</span>' +
-          '<span style="display:flex;align-items:center;gap:8px">' +
-            modeChip +
-            termIcon +
-            '<span class="activity-badge ' + meta.cls + '" title="' + escapeHtml(meta.tip || '') + '">' + meta.label + '</span>' +
-          '</span>' +
-        '</div>' +
-        (tail
-          ? '<pre class="activity-tail">' + tail + '</pre>'
-          : '<p class="activity-tail-empty">' + (a.running ? 'nincs friss kimenet' : 'a session nem fut') + '</p>') +
-      '</div>'
-    )
-  }).join('')
-}
-
-// Event delegation: clicking a running activity-card opens the terminal modal
-;(() => {
-  const actList = document.getElementById('activityList')
-  if (actList) {
-    actList.addEventListener('click', (e) => {
-      const card = e.target.closest('.activity-card.act-clickable[data-agent]')
-      if (card) openTerminalModal(card.dataset.agent)
-    })
-  }
-})()
 
 
 // ============================================================
@@ -829,6 +909,20 @@ let kanbanAssigneeFilter = ''
 // fully user-controlled via the toolbar dropdown.
 let kanbanGroupBy = 'none'
 let kanbanGroupByInitialized = false
+// Free-text / card-number search box in the board toolbar. A query of the form
+// "295" or "#295" matches the card SEQUENCE NUMBER exactly (that is the number
+// the board prints on every card and the one people actually use); anything
+// else is a case-insensitive substring match on the title. Deliberately NOT
+// persisted: a filter that survives a reload and hides most of the board is a
+// trap, and this one is typed in a second.
+let kanbanSearchQuery = ''
+// Card order inside a column: 'manual' (sort_order, i.e. the drag order --
+// the default and the only one where drag & drop makes sense) | 'seq_asc' |
+// 'seq_desc' | 'created_asc' | 'created_desc' | 'updated_desc'. Persisted in
+// localStorage.
+let kanbanSortBy = 'manual'
+// Every value the sort dropdown offers besides 'manual'.
+const KANBAN_SORTS = ['seq_asc', 'seq_desc', 'created_asc', 'created_desc', 'updated_desc']
 // Which swimlane keys (assignee name or priority value) are collapsed. Lives
 // for the page session only -- intentionally not persisted across reloads.
 const kanbanCollapsedLanes = new Set()
@@ -847,8 +941,8 @@ let breakdownIdeaId = null
 const columns = document.querySelectorAll('.kanban-col-body')
 
 // Modal wiring
-document.getElementById('cardModalClose').addEventListener('click', () => closeModal(cardModalOverlay))
-document.getElementById('cardDetailClose').addEventListener('click', () => closeModal(cardDetailOverlay))
+document.getElementById('cardModalClose').addEventListener('click', () => requestOverlayClose(cardModalOverlay))
+document.getElementById('cardDetailClose').addEventListener('click', () => requestOverlayClose(cardDetailOverlay))
 attachOverlayCloseGuard(cardModalOverlay)
 attachOverlayCloseGuard(cardDetailOverlay)
 
@@ -894,7 +988,18 @@ async function loadKanban() {
         const storedHiddenCols = JSON.parse(localStorage.getItem('marveen.kanbanHiddenColumns') || '[]')
         if (Array.isArray(storedHiddenCols)) kanbanHiddenColumns = new Set(storedHiddenCols)
       } catch { /* ignore malformed storage */ }
+      const storedSort = localStorage.getItem('marveen.kanbanSortBy')
+      if (KANBAN_SORTS.includes(storedSort)) {
+        kanbanSortBy = storedSort
+        const sortSel = document.getElementById('kanbanSortBy')
+        if (sortSel) sortSel.value = storedSort
+      }
     }
+    // Best effort and in parallel: the board must still load when the status
+    // endpoint is slow or fails; it just shows no live markers then.
+    const agentStatusP = fetch('api/agents/status')
+      .then((r) => (r.ok ? r.json() : []))
+      .catch(() => [])
     const [cardsRes, assigneesRes, projectsRes, labelsRes] = await Promise.all([
       fetch('api/kanban'),
       fetch('api/kanban/assignees'),
@@ -905,18 +1010,146 @@ async function loadKanban() {
     kanbanAssignees = await assigneesRes.json()
     kanbanProjects = await projectsRes.json()
     kanbanAllLabels = await labelsRes.json()
+    setKanbanAgentStatus(await agentStatusP)
     populateProjectFilter()
     populateProjectSuggestions()
     setupAssigneeFilter()
     renderKanban()
+    renderKanbanSummary()
   } catch (err) {
     console.error('Kanban betöltés hiba:', err)
+  }
+}
+
+// Card ed3c8caf (#569): the per-agent board summary strip. Best-effort: a
+// failed fetch leaves the strip hidden, the board itself is unaffected.
+async function renderKanbanSummary() {
+  const box = document.getElementById('kanbanSummary')
+  const body = document.getElementById('kanbanSummaryBody')
+  const totals = document.getElementById('kanbanSummaryTotals')
+  if (!box || !body || !totals) return
+  let data
+  try {
+    const r = await fetch('api/kanban/summary?hours=24')
+    if (!r.ok) return
+    data = await r.json()
+  } catch { return }
+  const agents = Array.isArray(data?.agents) ? data.agents : []
+  const ownerWaiting = data?.owner_waiting || { count: 0, cards: [] }
+  const closed = agents.reduce((n, a) => n + a.closed.length, 0)
+  const stuck = agents.reduce((n, a) => n + a.stuck.length, 0)
+  box.hidden = closed + stuck + ownerWaiting.count === 0
+  totals.textContent = t('kanban.summary.totals', { closed, stuck, owner: ownerWaiting.count })
+  body.innerHTML = ''
+
+  const cardChip = (ref, extra) => {
+    const chip = document.createElement('button')
+    chip.type = 'button'
+    chip.className = 'kanban-summary-chip'
+    chip.textContent = (ref.seq ? '#' + ref.seq : '') + (extra ? ' ' + extra : '')
+    chip.title = ref.title || ''
+    chip.addEventListener('click', () => {
+      const target = kanbanCards.find((c) => c.id === ref.id)
+      if (target) showCardDetail(target)
+      else showToast(t('kanban.toast.blocker_not_on_board'))
+    })
+    return chip
+  }
+  const line = (label, chips) => {
+    const row = document.createElement('div')
+    row.className = 'kanban-summary-row'
+    const who = document.createElement('span')
+    who.className = 'kanban-summary-who'
+    who.textContent = label
+    row.appendChild(who)
+    for (const c of chips) row.appendChild(c)
+    body.appendChild(row)
+  }
+  const moreMarker = (n) => {
+    const more = document.createElement('span')
+    more.className = 'kanban-summary-more'
+    more.textContent = t('kanban.summary.more', { n })
+    return more
+  }
+  // Per-agent chip cap per kind: a long stuck list (hundreds of chips) would
+  // make the strip several screens tall on a phone. The totals line still
+  // counts everything; the rest is one "+N" marker, like the owner list.
+  const AGENT_CHIP_CAP = 12
+  if (ownerWaiting.count > 0) {
+    const chips = ownerWaiting.cards.map((c) => cardChip(c))
+    if (ownerWaiting.count > ownerWaiting.cards.length) chips.push(moreMarker(ownerWaiting.count - ownerWaiting.cards.length))
+    line(t('kanban.summary.owner'), chips)
+  }
+  for (const a of agents) {
+    const chips = []
+    if (a.closed.length) {
+      const lab = document.createElement('span')
+      lab.className = 'kanban-summary-kind'
+      lab.textContent = t('kanban.summary.closed')
+      chips.push(lab)
+      for (const c of a.closed.slice(0, AGENT_CHIP_CAP)) {
+        const chip = cardChip(c, c.evidence ? '✓' : '')
+        const tip = [c.title]
+        // The row is the assignee; who moved it to done goes in the tooltip.
+        if (c.closed_by && c.closed_by !== a.agent) tip.push(t('kanban.summary.closed_by', { actor: c.closed_by }))
+        if (c.evidence) tip.push(`${t('kanban.summary.evidence')}: ${c.evidence}`)
+        chip.title = tip.join('\n')
+        chips.push(chip)
+      }
+      if (a.closed.length > AGENT_CHIP_CAP) chips.push(moreMarker(a.closed.length - AGENT_CHIP_CAP))
+    }
+    if (a.stuck.length) {
+      const lab = document.createElement('span')
+      lab.className = 'kanban-summary-kind kanban-summary-kind-stuck'
+      lab.textContent = t('kanban.summary.stuck')
+      chips.push(lab)
+      for (const c of a.stuck.slice(0, AGENT_CHIP_CAP)) chips.push(cardChip(c, t('kanban.summary.idle_days', { n: c.idle_days })))
+      if (a.stuck.length > AGENT_CHIP_CAP) chips.push(moreMarker(a.stuck.length - AGENT_CHIP_CAP))
+    }
+    line(a.agent, chips)
+  }
+  try {
+    box.open = localStorage.getItem('marveen.kanbanSummaryOpen') === '1'
+  } catch { /* storage blocked: stays collapsed */ }
+  if (!box.dataset.wired) {
+    box.dataset.wired = '1'
+    box.addEventListener('toggle', () => {
+      try { localStorage.setItem('marveen.kanbanSummaryOpen', box.open ? '1' : '0') } catch { /* ignore */ }
+    })
   }
 }
 
 document.getElementById('kanbanGroupBy').addEventListener('change', (e) => {
   kanbanGroupBy = e.target.value
   localStorage.setItem('marveen.kanbanGroupBy', kanbanGroupBy)
+  renderKanban()
+})
+
+document.getElementById('kanbanSortBy')?.addEventListener('change', (e) => {
+  kanbanSortBy = e.target.value
+  localStorage.setItem('marveen.kanbanSortBy', kanbanSortBy)
+  renderKanban()
+})
+
+// 'input' rather than 'change' so the board narrows while typing -- with a few
+// hundred cards the whole render is a few milliseconds, so no debounce is
+// needed. Escape clears, because a search box you cannot empty in one key is
+// the reason filters get left on by accident.
+// The browser's password manager ignores autocomplete="off" and drops the saved
+// dashboard login name into the first text box on the page, which is this one.
+// It never fills a readonly field, so the box stays readonly until the user
+// reaches for it.
+for (const ev of ['pointerdown', 'focus']) {
+  document.getElementById('kanbanSearch')?.addEventListener(ev, (e) => e.target.removeAttribute('readonly'))
+}
+document.getElementById('kanbanSearch')?.addEventListener('input', (e) => {
+  kanbanSearchQuery = e.target.value
+  renderKanban()
+})
+document.getElementById('kanbanSearch')?.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return
+  e.target.value = ''
+  kanbanSearchQuery = ''
   renderKanban()
 })
 
@@ -981,6 +1214,21 @@ function ownerAssigneeName() {
   return owner ? owner.name : null
 }
 
+// One key for comparing assignee names, because the two sides are written
+// differently: the owner entry carries a display name ("Balázs") while the cards
+// carry the id the agents write ("balazs"). Lowercasing alone leaves the accent,
+// so "balázs" !== "balazs" and the owner quick-filter matched nothing -- measured
+// on a board where 160 of 246 live cards were on that owner. Decomposing to NFD
+// and dropping the combining marks makes the two comparable without touching the
+// stored data, which is what the cards and the API still see.
+function assigneeKey(name) {
+  return String(name || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toLowerCase()
+}
+
 // Reflect the active state of the owner quick-toggle button (hidden when there
 // is no owner-type assignee).
 function syncOwnerFilterBtn() {
@@ -989,7 +1237,7 @@ function syncOwnerFilterBtn() {
   const owner = ownerAssigneeName()
   if (!owner) { btn.style.display = 'none'; return }
   btn.style.display = ''
-  const on = !!kanbanAssigneeFilter && kanbanAssigneeFilter.toLowerCase() === owner.toLowerCase()
+  const on = !!kanbanAssigneeFilter && assigneeKey(kanbanAssigneeFilter) === assigneeKey(owner)
   btn.style.background = on ? 'var(--accent)' : 'var(--bg)'
   btn.style.color = on ? '#081a2d' : 'var(--fg)'
   btn.setAttribute('aria-pressed', on ? 'true' : 'false')
@@ -1028,7 +1276,7 @@ function setupAssigneeFilter() {
     ownerBtn.addEventListener('click', () => {
       const owner = ownerAssigneeName()
       if (!owner) return
-      const on = kanbanAssigneeFilter.toLowerCase() === owner.toLowerCase()
+      const on = assigneeKey(kanbanAssigneeFilter) === assigneeKey(owner)
       kanbanAssigneeFilter = on ? '' : owner
       // Keep the dropdown in sync (only selectable if the owner is a known assignee).
       sel.value = kanbanAssignees.some((a) => a.name === kanbanAssigneeFilter) ? kanbanAssigneeFilter : ''
@@ -1058,15 +1306,56 @@ function setupAssigneeFilter() {
   syncOwnerFilterBtn()
 }
 
+// Does the card match the toolbar search box? Two modes, decided by the shape
+// of the query, so one field serves both needs:
+//   "295" / "#295"  -> exact card-number (seq) match, nothing else
+//   anything else   -> case-insensitive substring of the title
+// The number mode is exact on purpose: "29" must not drag in 129 and 295 when
+// the point of typing a number is to land on one card.
+function kanbanCardMatchesSearch(card) {
+  const q = kanbanSearchQuery.trim()
+  if (!q) return true
+  const num = q.match(/^#?(\d+)$/)
+  if (num) return card.seq != null && Number(card.seq) === Number(num[1])
+  return String(card.title || '').toLowerCase().includes(q.toLowerCase())
+}
+
+// Comparator for the cards inside one column, per the sort dropdown. Cards
+// without a seq (there should be none, but the field is nullable) sort last in
+// both directions rather than jumping to the top on a NaN comparison.
+function kanbanCardSorter() {
+  if (kanbanSortBy === 'seq_asc') {
+    return (a, b) => (a.seq ?? Infinity) - (b.seq ?? Infinity)
+  }
+  if (kanbanSortBy === 'seq_desc') {
+    return (a, b) => (b.seq ?? -Infinity) - (a.seq ?? -Infinity)
+  }
+  // Timestamps: a missing one sorts last in both directions, same rule as seq.
+  // The seq breaks ties, so cards created in the same second keep a stable order.
+  const ts = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
+  const byTime = (field, dir) => (a, b) => {
+    const x = ts(a[field]), y = ts(b[field])
+    if (x === null && y === null) return (a.seq ?? 0) - (b.seq ?? 0)
+    if (x === null) return 1
+    if (y === null) return -1
+    return dir * (x - y) || dir * ((a.seq ?? 0) - (b.seq ?? 0))
+  }
+  if (kanbanSortBy === 'created_asc') return byTime('created_at', 1)
+  if (kanbanSortBy === 'created_desc') return byTime('created_at', -1)
+  if (kanbanSortBy === 'updated_desc') return byTime('updated_at', -1)
+  return (a, b) => a.sort_order - b.sort_order
+}
+
 // Project + assignee + label filters, independent of the priority quick-filter
 // Project + assignee filters only -- the baseline the label quick-filter
 // chip counts are computed against, independent of which labels are
 // currently active, so a chip's count stays meaningful whether it's the one
 // being toggled or not.
 function kanbanCardMatchesBaseFilters(card) {
+  if (!kanbanCardMatchesSearch(card)) return false
   if (kanbanProjectFilter && (card.project || '') !== kanbanProjectFilter) return false
-  const assigneeFilter = kanbanAssigneeFilter.toLowerCase()
-  if (assigneeFilter && String(card.assignee || '').trim().toLowerCase() !== assigneeFilter) return false
+  const assigneeFilter = assigneeKey(kanbanAssigneeFilter)
+  if (assigneeFilter && assigneeKey(card.assignee) !== assigneeFilter) return false
   return true
 }
 
@@ -1113,7 +1402,7 @@ function renderKanbanQuickFilters() {
     const chip = document.createElement('span')
     chip.className = 'kanban-quick-filter-chip' + (active ? ' active' : '')
     chip.dataset.labelId = label.id
-    chip.style.setProperty('--chip-color', label.color)
+    chip.style.setProperty('--chip-color', safeCssColor(label.color, '#64748b'))
     chip.innerHTML = `#${escapeHtml(label.name)} <span class="kanban-quick-filter-count">${count}</span>${active ? '<span class="kanban-quick-filter-clear">&times;</span>' : ''}`
     chip.addEventListener('click', () => toggleKanbanLabelFilter(label.id))
     row.appendChild(chip)
@@ -1127,11 +1416,225 @@ function renderKanbanQuickFilters() {
   }
 }
 
+function renderKanbanTotals(visibleCardIds) {
+  const el = document.getElementById('kanbanTotals')
+  if (!el) return
+  const open = kanbanCards.filter((c) => c.status !== 'done').length
+  let txt = t('kanban.totals', { open, all: kanbanCards.length })
+  if (visibleCardIds && visibleCardIds.size !== kanbanCards.length) {
+    txt += ' ' + t('kanban.totals_filtered', { n: visibleCardIds.size })
+  }
+  el.textContent = txt
+}
+
+// One line next to the search box saying what the query actually found. Two
+// cases deserve their own words, because in both of them the board legitimately
+// shows nothing and the reason is not the query:
+//   - every match sits in a column the user hid (the chips above)
+//   - no match at all, which for a card number usually means it is archived,
+//     and the archived view is a separate tab that this search does not reach
+function renderKanbanSearchHint() {
+  const hintEl = document.getElementById('kanbanSearchHint')
+  if (!hintEl) return
+  if (!kanbanSearchQuery.trim()) { hintEl.textContent = ''; return }
+  const matches = kanbanCards.filter((c) => kanbanCardMatchesSearch(c))
+  // An ongoing card stays visible in the strip even when its status column is hidden.
+  const hiddenCount = matches.filter((c) => kanbanHiddenColumns.has(c.status) && !kanbanIsOngoing(c)).length
+  if (matches.length === 0) {
+    hintEl.textContent = t('kanban.filter.search_none')
+  } else if (hiddenCount === matches.length) {
+    hintEl.textContent = t('kanban.filter.search_all_hidden', { n: matches.length })
+  } else if (hiddenCount > 0) {
+    hintEl.textContent = t('kanban.filter.search_some_hidden', { n: matches.length, h: hiddenCount })
+  } else {
+    hintEl.textContent = t('kanban.filter.search_hits', { n: matches.length })
+  }
+}
+
+// Ongoing tasks: open cards labelled "Folyamatos" are standing duties (a weekly
+// check, a long-running watch), not work heading for "done". In the In progress
+// column they read as if they were about to finish, so they are pulled out of
+// their status column into a slim strip above the board. The card keeps its
+// real status, which can still be changed from its detail view; the strip is
+// not a drop target and nothing is ever posted with a virtual status.
+// The label is matched by name, case-insensitively: "Folyamatos" (the Hungarian
+// name the fleet uses) or "Ongoing".
+const KANBAN_ONGOING_LABELS = ['folyamatos', 'ongoing']
+
+function kanbanIsOngoing(card) {
+  return card.status !== 'done' && (card.labels || []).some((l) =>
+    l && typeof l.name === 'string' && KANBAN_ONGOING_LABELS.includes(l.name.trim().toLowerCase()))
+}
+
+function renderKanbanOngoing(cards) {
+  const strip = document.getElementById('kanbanOngoing')
+  const body = document.getElementById('kanbanOngoingBody')
+  if (!strip || !body) return
+  document.getElementById('countOngoing').textContent = cards.length
+  strip.hidden = cards.length === 0
+  body.innerHTML = ''
+  for (const card of cards.slice().sort((a, b) => (a.seq || 0) - (b.seq || 0))) {
+    const chip = document.createElement('button')
+    chip.type = 'button'
+    chip.className = 'kanban-ongoing-chip'
+    const seq = document.createElement('span')
+    seq.className = 'kanban-ongoing-seq'
+    seq.textContent = card.seq ? '#' + card.seq : ''
+    chip.appendChild(seq)
+    chip.appendChild(document.createTextNode(' ' + (card.title || '')))
+    chip.title = card.title || ''
+    chip.addEventListener('click', () => showCardDetail(card))
+    body.appendChild(chip)
+  }
+}
+
+// The owner's own queue, above the board and OUTSIDE every filter.
+//
+// Why it ignores the filters: this answers "what is the process waiting on me
+// for", which is a question about the person, not about the current view. A
+// queue that an unrelated project filter can silently empty would be worse
+// than no queue, because an empty strip reads as "nothing to do".
+//
+// Order: priority first (urgent > high > normal > low), then card number, so
+// the oldest card wins inside a priority. Done cards never appear.
+//
+// Two ways onto the strip: the owner's own cards, and any agent's card carrying
+// the "Rád vár" ("waiting on you") label -- the agent keeps the work, the owner
+// owes it a decision. Assignment alone missed most of that queue, because an
+// agent that needs an answer keeps its card. A card that is both appears once
+// (one filter pass over kanbanCards).
+//
+// The label is matched by name, not by id, so a re-created label (new id,
+// same name) still counts. Accents and case are folded because the label
+// editor accepts free text.
+const KANBAN_OWNER_QUEUE_LABEL = 'Rád vár'
+
+function kanbanNormalizeLabelName(s) {
+  return String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').trim().toLowerCase()
+}
+
+function kanbanIsOnOwnerStrip(card, owner) {
+  if (card.status === 'done') return false
+  if (String(card.assignee || '').trim().toLowerCase() === owner.toLowerCase()) return true
+  const want = kanbanNormalizeLabelName(KANBAN_OWNER_QUEUE_LABEL)
+  return (card.labels || []).some((l) => kanbanNormalizeLabelName(l && l.name) === want)
+}
+
+function renderKanbanOwnerStrip() {
+  const el = document.getElementById('kanbanOwnerStrip')
+  if (!el) return
+  const owner = ownerAssigneeName()
+  if (!owner) { el.hidden = true; return }
+  const mine = kanbanCards
+    .filter((c) => kanbanIsOnOwnerStrip(c, owner))
+    .sort((a, b) => {
+      const pa = KANBAN_PRIORITY_ORDER.indexOf(a.priority || 'normal')
+      const pb = KANBAN_PRIORITY_ORDER.indexOf(b.priority || 'normal')
+      if (pa !== pb) return pa - pb
+      return (a.seq ?? Infinity) - (b.seq ?? Infinity)
+    })
+  if (mine.length === 0) { el.hidden = true; return }
+  el.hidden = false
+
+  const collapsed = localStorage.getItem('marveen.kanbanOwnerStripCollapsed') === '1'
+  el.classList.toggle('collapsed', collapsed)
+  el.innerHTML = ''
+
+  const head = document.createElement('div')
+  head.className = 'kanban-owner-strip-head'
+  // The owner's portrait belongs here, because this strip is the ONLY place
+  // the owner's open cards are drawn (see kanbanHideFromLanes).
+  const face = document.createElement('span')
+  face.className = 'kanban-team-avatar owner kanban-owner-strip-avatar'
+  face.textContent = (owner[0] || '?').toUpperCase()
+  kanbanDecorateAvatar(face, owner)
+  const label = document.createElement('span')
+  label.textContent = t('kanban.owner_strip.title')
+  // The owner's nickname goes here too: this strip replaces the owner's lane,
+  // and the lane header is the other place a nickname is drawn.
+  const ownerNick = kanbanSwimlaneMeta(owner).nickname
+  const nick = document.createElement('span')
+  nick.className = 'kanban-nickname'
+  if (ownerNick) nick.textContent = ownerNick
+  const count = document.createElement('span')
+  count.className = 'kanban-owner-strip-count'
+  count.textContent = mine.length
+  const toggle = document.createElement('span')
+  toggle.className = 'kanban-owner-strip-toggle'
+  toggle.textContent = collapsed ? t('kanban.owner_strip.show') : t('kanban.owner_strip.hide')
+  head.append(face, label, nick, count, toggle)
+  head.addEventListener('click', () => {
+    const now = !el.classList.contains('collapsed')
+    localStorage.setItem('marveen.kanbanOwnerStripCollapsed', now ? '1' : '0')
+    renderKanbanOwnerStrip()
+  })
+  el.appendChild(head)
+
+  // Three tiers, urgent on top, each with its own colour: one chip row in
+  // priority order still made the owner read every dot to find what was
+  // urgent. The tier comes from the priority field: urgent+high = urgent,
+  // normal = when I have time, low = can wait.
+  const groups = document.createElement('div')
+  groups.className = 'kanban-owner-strip-groups'
+  const tierOf = (c) => (c.priority === 'urgent' || c.priority === 'high') ? 'urgent' : (c.priority === 'low' ? 'parked' : 'later')
+  for (const tier of ['urgent', 'later', 'parked']) {
+    const cards = mine.filter((c) => tierOf(c) === tier)
+    if (cards.length === 0) continue
+    const group = document.createElement('div')
+    group.className = 'kanban-owner-strip-group tier-' + tier
+    const gh = document.createElement('div')
+    gh.className = 'kanban-owner-strip-group-head'
+    gh.textContent = t('kanban.owner_strip.tier_' + tier) + ' · ' + cards.length
+    const items = document.createElement('div')
+    items.className = 'kanban-owner-strip-items'
+    group.append(gh, items)
+    groups.appendChild(group)
+    for (const card of cards) {
+      const chip = document.createElement('div')
+      chip.className = 'kanban-owner-strip-item'
+      chip.title = card.title
+      const dot = document.createElement('span')
+      dot.className = 'dot ' + (card.priority || 'normal')
+      const seq = document.createElement('span')
+      seq.className = 'seq'
+      seq.textContent = card.seq != null ? '#' + card.seq : ''
+      const title = document.createElement('span')
+      title.className = 'title'
+      title.textContent = card.title
+      chip.append(dot, seq, title)
+      // A labelled card stays with its agent; the chip says whose it is, so the
+      // owner knows who is waiting on the answer. Their own cards carry no marker.
+      const raw = String(card.assignee || '').trim()
+      if (raw && raw.toLowerCase() !== owner.toLowerCase()) {
+        const m = kanbanAssignees.find((a) => a.name.toLowerCase() === raw.toLowerCase())
+        const name = m ? (m.displayName || m.name) : raw
+        const who = document.createElement('span')
+        who.className = 'who'
+        const av = document.createElement('span')
+        av.className = 'kanban-team-avatar kanban-owner-strip-who-avatar ' + (m ? m.type : 'unknown')
+        av.textContent = (name[0] || '?').toUpperCase()
+        if (m) kanbanDecorateAvatar(av, m.name)
+        const nm = document.createElement('span')
+        nm.className = 'who-name'
+        nm.textContent = name
+        who.append(av, nm)
+        chip.appendChild(who)
+        chip.title = card.title + ' (' + name + ')'
+      }
+      chip.addEventListener('click', () => showCardDetail(card))
+      items.appendChild(chip)
+    }
+  }
+  el.appendChild(groups)
+}
+
 function renderKanban() {
   const cardById = new Map(kanbanCards.map(c => [c.id, c]))
 
   renderKanbanColumnChips()
   renderKanbanQuickFilters()
+  renderKanbanSearchHint()
+  renderKanbanOwnerStrip()
 
   // Determine which top-level cards are visible under current filters.
   const visibleCardIds = new Set()
@@ -1140,6 +1643,8 @@ function renderKanban() {
     if (!kanbanCardMatchesLabelFilter(card)) continue
     visibleCardIds.add(card.id)
   }
+
+  renderKanbanTotals(visibleCardIds)
 
   // A subtask is "embedded" when its parent is visible AND both share the same
   // column. Embedded subtasks are hidden as standalone cards and rendered
@@ -1154,11 +1659,14 @@ function renderKanban() {
   }
 
   const grouped = { planned: [], in_progress: [], waiting: [], testing: [], done: [] }
+  const ongoing = []
   for (const card of kanbanCards) {
     if (embeddedSubtaskIds.has(card.id)) continue
     if (!visibleCardIds.has(card.id)) continue
+    if (kanbanIsOngoing(card)) { ongoing.push(card); continue }
     if (grouped[card.status]) grouped[card.status].push(card)
   }
+  renderKanbanOngoing(ongoing)
 
   // Update counts (embedded subtasks don't count as separate cards)
   document.getElementById('countPlanned').textContent = grouped.planned.length
@@ -1174,21 +1682,21 @@ function renderKanban() {
     swimlaneBoard.hidden = true
     flatBoard.hidden = false
     for (const [status, cards] of Object.entries(grouped)) {
-      const col = document.querySelector(`#kanbanBoard .kanban-col-body[data-status="${status}"]`)
+      const col = document.querySelector(`#kanbanBoard .kanban-col-body[data-status="${CSS.escape(String(status))}"]`)
       col.innerHTML = ''
-      cards.sort((a, b) => a.sort_order - b.sort_order)
+      cards.sort(kanbanCardSorter())
 
       for (const card of cards) {
         const embeddedChildren = kanbanCards
           .filter(c => c.parent_id === card.id && embeddedSubtaskIds.has(c.id))
-          .sort((a, b) => a.sort_order - b.sort_order)
+          .sort(kanbanCardSorter())
         col.appendChild(createCardEl(card, embeddedChildren))
       }
     }
     // Hide/show flat-board columns based on visibility set
     const allColsHidden = KANBAN_STATUS_DEFS.every(d => kanbanHiddenColumns.has(d.status))
     for (const def of KANBAN_STATUS_DEFS) {
-      const colEl = flatBoard.querySelector(`.kanban-col[data-status="${def.status}"]`)
+      const colEl = flatBoard.querySelector(`.kanban-col[data-status="${CSS.escape(String(def.status))}"]`)
       if (colEl) colEl.hidden = kanbanHiddenColumns.has(def.status)
     }
     // "All columns hidden" hint
@@ -1247,7 +1755,82 @@ function kanbanSwimlaneMeta(key) {
   if (key === '__unassigned__') return { label: t('kanban.unassigned'), avatarClass: 'unknown', avatarChar: '?' }
   const match = kanbanAssignees.find(a => a.name === key)
   const label = match ? (match.displayName || match.name) : key
-  return { label, avatarClass: match ? match.type : 'unknown', avatarChar: (label[0] || '?').toUpperCase() }
+  return {
+    label,
+    // The character name behind the portrait, from store/team-nicknames.json.
+    // Empty when nobody set one, and the lane then shows the plain name.
+    nickname: (match && match.nickname) ? match.nickname : '',
+    avatarClass: match ? match.type : 'unknown',
+    avatarChar: (label[0] || '?').toUpperCase(),
+  }
+}
+
+// === Character portraits on the board ===
+//
+// Each lane head (and the owner strip) shows the person's portrait over the
+// coloured circle with the first letter of the name.
+//
+// The image is served by the SAME endpoints the agents page already uses, so no
+// new storage and no new upload path: agents/<name>/avatar.png for an agent,
+// store/marveen-avatar.png for the bot, store/owner-avatar.png for the owner.
+//
+// Why an <img> laid OVER the letter instead of asking first whether a picture
+// exists: the board would otherwise need a per-assignee "hasAvatar" round trip
+// before it could draw a single lane. The letter is rendered first and the image
+// covers it; if the file is missing the request 404s, the <img> removes itself,
+// and the letter is already underneath. One less thing that can be stale, and a
+// half-populated set of portraits degrades one lane at a time instead of all.
+function kanbanAvatarUrlFor(key) {
+  if (kanbanGroupBy === 'priority') return null
+  if (!key || key === '__unassigned__') return null
+  const m = kanbanAssignees.find(a => a.name === key)
+  if (!m) return null
+  if (m.type === 'owner') return 'api/marveen/owner-avatar' + avatarBust()
+  if (m.type === 'bot') return 'api/marveen/avatar' + avatarBust()
+  if (m.type === 'agent') return `api/agents/${encodeURIComponent(m.name)}/avatar` + avatarBust()
+  return null
+}
+
+function kanbanDecorateAvatar(spanEl, key) {
+  if (!spanEl) return
+  const url = kanbanAvatarUrlFor(key)
+  if (!url) return
+  const img = document.createElement('img')
+  img.className = 'kanban-avatar-img'
+  img.alt = ''
+  img.addEventListener('error', () => img.remove())
+  img.src = url
+  spanEl.appendChild(img)
+}
+
+// The owner's cards live in the strip above the board, OUTSIDE every filter
+// (see renderKanbanOwnerStrip). Drawing them in a swimlane as well would show
+// the same card twice. The strip wins: it is always visible and no filter can
+// empty it.
+//
+// Only the owner's OPEN cards are dropped, not the lane itself. The strip
+// deliberately omits done cards, so if one is closed and still on the board,
+// the lane reappears carrying exactly what the strip does not show. Nothing can
+// fall between the two.
+//
+// The "Rád vár" label does NOT hide a card here, on purpose: a labelled agent
+// card shows in the strip AND in its agent's lane, because the lane is where
+// that agent's whole queue is read. Only the owner's cards live in one place.
+//
+// Only when the lanes ARE people (group by assignee). Grouped by priority, a
+// lane is a priority, not the owner's lane: hiding there would drop the
+// owner's most urgent card from the one view built to rank urgency (review of
+// #1860). Whether a card is the owner's open card at all is kanbanIsOwnerOpen,
+// for views that are about people whatever the board grouping.
+function kanbanIsOwnerOpen(card) {
+  if (card.status === 'done') return false
+  const owner = ownerAssigneeName()
+  if (!owner) return false
+  return String(card.assignee || '').trim().toLowerCase() === owner.toLowerCase()
+}
+
+function kanbanHideFromLanes(card) {
+  return kanbanGroupBy === 'assignee' && kanbanIsOwnerOpen(card)
 }
 
 function renderSwimlaneBoard(grouped, embeddedSubtaskIds) {
@@ -1256,7 +1839,10 @@ function renderSwimlaneBoard(grouped, embeddedSubtaskIds) {
 
   const presentKeys = new Set()
   for (const cards of Object.values(grouped)) {
-    for (const c of cards) presentKeys.add(kanbanSwimlaneKeyFor(c))
+    for (const c of cards) {
+      if (kanbanHideFromLanes(c)) continue
+      presentKeys.add(kanbanSwimlaneKeyFor(c))
+    }
   }
 
   const canonicalOrder = kanbanGroupBy === 'priority'
@@ -1275,7 +1861,7 @@ function renderSwimlaneBoard(grouped, embeddedSubtaskIds) {
     const laneCardsByStatus = {}
     let totalCount = 0
     for (const def of KANBAN_STATUS_DEFS) {
-      const cards = grouped[def.status].filter(c => kanbanSwimlaneKeyFor(c) === key)
+      const cards = grouped[def.status].filter(c => !kanbanHideFromLanes(c) && kanbanSwimlaneKeyFor(c) === key)
       laneCardsByStatus[def.status] = cards
       if (!kanbanHiddenColumns.has(def.status)) totalCount += cards.length
     }
@@ -1283,16 +1869,18 @@ function renderSwimlaneBoard(grouped, embeddedSubtaskIds) {
     const lane = document.createElement('div')
     lane.className = 'kanban-swimlane' + (collapsed ? ' collapsed' : '')
     lane.dataset.group = key
-    if (separatorColor) lane.style.borderBottomColor = separatorColor
+    if (separatorColor) lane.style.borderBottomColor = safeCssColor(separatorColor)
 
     const header = document.createElement('div')
     header.className = 'kanban-swimlane-header'
     header.innerHTML = `
       <span class="kanban-swimlane-avatar ${meta.avatarClass}">${escapeHtml(meta.avatarChar)}</span>
       <span class="kanban-swimlane-name">${escapeHtml(meta.label)}</span>
+      ${meta.nickname ? `<span class="kanban-nickname">${escapeHtml(meta.nickname)}</span>` : ''}
       <span class="kanban-swimlane-count">${totalCount}</span>
       <button class="kanban-swimlane-toggle" type="button" aria-expanded="${!collapsed}" title="${collapsed ? t('kanban.swimlane.expand') : t('kanban.swimlane.collapse')}">${collapsed ? '▶' : '▼'}</button>
     `
+    kanbanDecorateAvatar(header.querySelector('.kanban-swimlane-avatar'), key)
     header.querySelector('.kanban-swimlane-toggle').addEventListener('click', (e) => {
       e.stopPropagation()
       if (kanbanCollapsedLanes.has(key)) kanbanCollapsedLanes.delete(key)
@@ -1316,11 +1904,11 @@ function renderSwimlaneBoard(grouped, embeddedSubtaskIds) {
       colBody.className = 'kanban-col-body kanban-swimlane-col-body'
       colBody.dataset.status = def.status
 
-      const cards = laneCardsByStatus[def.status].sort((a, b) => a.sort_order - b.sort_order)
+      const cards = laneCardsByStatus[def.status].sort(kanbanCardSorter())
       for (const card of cards) {
         const embeddedChildren = kanbanCards
           .filter(c => c.parent_id === card.id && embeddedSubtaskIds.has(c.id))
-          .sort((a, b) => a.sort_order - b.sort_order)
+          .sort(kanbanCardSorter())
         colBody.appendChild(createCardEl(card, embeddedChildren))
       }
       wireKanbanColumnDnD(colBody)
@@ -1375,8 +1963,8 @@ function updateWipBadges(grouped) {
       state = 'ok'; color = cfg.okColor
     }
     el.dataset.wip = state
-    el.style.color = color
-    el.style.borderColor = color
+    el.style.color = safeCssColor(color)
+    el.style.borderColor = safeCssColor(color)
   }
 }
 
@@ -1400,12 +1988,78 @@ function updateSubtaskBadges(embeddedSubtaskIds) {
   }
 }
 
+// Live agent state on the card (one human, many agents). An in_progress card
+// says an agent CLAIMED the work; it does not say the agent is still on it --
+// a stopped or stuck agent's card looks exactly like a moving one. The state is
+// already derived per agent by /api/agents/status (src/web/agent-status.ts), so
+// the board borrows that instead of guessing anything from the card itself.
+// The state belongs to the AGENT, not to the card: an agent holding two cards
+// in progress shows the same marker on both. 'unknown' renders nothing --
+// saying nothing beats asserting a state nobody measured.
+let kanbanAgentStatus = new Map()
+
+const KANBAN_AGENT_LIVE_LEVEL = {
+  working: 'ok',
+  idle: 'idle',
+  stalled: 'warn',
+  dead: 'bad',
+  stopped: 'bad',
+  unreachable: 'bad',
+}
+
+function setKanbanAgentStatus(rows) {
+  kanbanAgentStatus = new Map()
+  if (!Array.isArray(rows)) return
+  for (const r of rows) {
+    if (r && typeof r.agent === 'string') kanbanAgentStatus.set(r.agent.trim().toLowerCase(), r)
+  }
+}
+
+// An agent with several cards in progress is busy on at most one of them. When
+// the status names a DIFFERENT card as the agent's current work, 'working' and
+// 'stalled' would be false on this one, so it says where the agent is instead,
+// in grey. Stopped/dead/unreachable are true for every card the agent holds.
+function kanbanAgentLiveLevel(card) {
+  if (card.status !== 'in_progress' || !card.assignee) return null
+  const row = kanbanAgentStatus.get(String(card.assignee).trim().toLowerCase())
+  if (!row) return null
+  const level = KANBAN_AGENT_LIVE_LEVEL[row.state]
+  if (!level) return null
+  const otherCardId = row.work && row.work.kind === 'card' && row.work.cardId && row.work.cardId !== card.id
+    ? row.work.cardId
+    : null
+  if (otherCardId && (row.state === 'working' || row.state === 'stalled')) {
+    return { level: 'idle', row, elsewhere: kanbanCards.find((c) => c.id === otherCardId) || null }
+  }
+  return { level, row, elsewhere: null }
+}
+
+function kanbanAgentLiveBadge(card) {
+  const live = kanbanAgentLiveLevel(card)
+  if (!live) return ''
+  const { level, row, elsewhere } = live
+  const label = elsewhere
+    ? t('kanban.agent_live.elsewhere', { seq: elsewhere.seq != null ? '#' + elsewhere.seq : '' })
+    : t('kanban.agent_live.' + row.state)
+  let tip = t('kanban.agent_live.tooltip', { state: label })
+  if (typeof row.lastSignalAgeSec === 'number') {
+    tip += ' · ' + t('kanban.agent_live.last_signal', { age: formatDurationShort(row.lastSignalAgeSec) })
+  }
+  return `<span class="kanban-card-agent-live kanban-agent-live-${escapeAttr(level)}" data-agent-state="${escapeAttr(row.state)}" title="${escapeAttr(tip)}"><span class="kanban-agent-live-dot"></span>${escapeHtml(label)}</span>`
+}
+
 function createCardEl(card, embeddedChildren = []) {
   const el = document.createElement('div')
   el.className = 'kanban-card'
   el.dataset.id = card.id
   el.dataset.priority = card.priority
-  el.draggable = true
+  // Drag & drop rewrites sort_order, which is what 'manual' order shows. Under
+  // a seq sort the drop would be accepted and then have no visible effect --
+  // a move that looks like it failed. So the card is simply not draggable
+  // there; the touch path reads the same flag.
+  el.draggable = kanbanSortBy === 'manual'
+  const agentLive = kanbanAgentLiveLevel(card)
+  if (agentLive) el.dataset.agentLive = agentLive.level
 
   // Assignee chip. Match the card's assignee against the known list
   // case-insensitively (a card stored as "gorcsevivan" must still match the
@@ -1419,8 +2073,13 @@ function createCardEl(card, embeddedChildren = []) {
   // Display the persona displayName (falling back to the id) per #216, while
   // keeping the robust match above and the raw-name fallback chip below.
   const assigneeLabel = assignee ? (assignee.displayName || assignee.name) : ''
+  // The nickname rides along with the name here too. It matters most on the
+  // FLAT board: with no swimlanes there are no lane headers, so this chip is
+  // the only place a person is named at all.
+  const assigneeNick = (assignee && assignee.nickname)
+    ? `<span class="kanban-nickname">${escapeHtml(assignee.nickname)}</span>` : ''
   const assigneeHtml = assignee
-    ? `<span class="kanban-card-assignee"><span class="assignee-dot ${assignee.type}">${escapeHtml(assigneeLabel[0])}</span>${escapeHtml(assigneeLabel)}</span>`
+    ? `<span class="kanban-card-assignee"><span class="assignee-dot ${assignee.type}">${escapeHtml(assigneeLabel[0])}</span>${escapeHtml(assigneeLabel)}${assigneeNick}</span>`
     : rawAssignee
       ? `<span class="kanban-card-assignee"><span class="assignee-dot unknown">${escapeHtml(rawAssignee[0])}</span>${escapeHtml(rawAssignee)}</span>`
       : ''
@@ -1446,7 +2105,7 @@ function createCardEl(card, embeddedChildren = []) {
     const shown = card.labels.slice(0, 3)
     const overflow = card.labels.length - shown.length
     const pills = shown.map((l) =>
-      `<span class="kanban-card-label-pill" data-label-id="${escapeHtml(l.id)}" style="--label-color:${escapeHtml(l.color)}" title="${t('kanban.label.filter_tooltip', { name: escapeHtml(l.name) })}">#${escapeHtml(l.name)}</span>`
+      `<span class="kanban-card-label-pill" data-label-id="${escapeHtml(l.id)}" style="--label-color:${escapeHtml(safeCssColor(l.color, '#64748b'))}" title="${t('kanban.label.filter_tooltip', { name: escapeHtml(l.name) })}">#${escapeHtml(l.name)}</span>`
     ).join('')
     const overflowHtml = overflow > 0
       ? `<span class="kanban-card-label-pill kanban-card-label-overflow" title="${t('kanban.label.overflow_tooltip', { n: overflow })}">+${overflow}</span>`
@@ -1458,12 +2117,28 @@ function createCardEl(card, embeddedChildren = []) {
     ? `<span class="kanban-card-seq" style="font-family:monospace;font-size:11px;color:var(--muted);margin-right:5px">#${card.seq}</span>`
     : ''
 
+  // Blocked marker: only counts blockers that are not done yet. A card whose
+  // blockers have all closed is not blocked any more, and a badge that stayed
+  // put would be exactly the kind of lie the board is supposed to prevent.
+  const openBlockers = Array.isArray(card.blockers)
+    ? card.blockers.filter((b) => b.status !== 'done')
+    : []
+  const blockedHtml = openBlockers.length > 0
+    ? `<span class="kanban-card-blocked" title="${escapeHtml(t('kanban.blocker.card_tooltip', { n: openBlockers.length }))}">${t('kanban.blocker.card_badge')}${openBlockers.length > 1 ? ' ' + openBlockers.length : ''}</span>`
+    : ''
+
   // Card aging: left stripe + top-right badge based on hours since last update.
   // Skipped for done cards. Config thresholds and colours come from window._marveen.kanbanAging.
   let agingBadgeHtml = ''
   const agingCfg = window._marveen?.kanbanAging
-  if (agingCfg && card.updated_at && card.status !== 'done') {
-    const hoursOld = (Date.now() / 1000 - card.updated_at) / 3600
+  // Age from the last STATUS CHANGE, not from updated_at. A comment sets
+  // updated_at (see addKanbanComment in src/db.ts), so a card that has not
+  // moved in weeks used to look fresh as soon as anyone wrote on it -- and the
+  // main agent writes on cards more than anyone. Falls back to updated_at only
+  // if the API is older than this field.
+  const agingBasis = card.last_status_at ?? card.updated_at
+  if (agingCfg && agingBasis && card.status !== 'done') {
+    const hoursOld = (Date.now() / 1000 - agingBasis) / 3600
     let agingLevel = null
     let agingColor = null
     if (hoursOld >= agingCfg.criticalH) {
@@ -1476,10 +2151,10 @@ function createCardEl(card, embeddedChildren = []) {
     if (agingLevel) {
       const days = Math.floor(hoursOld / 24)
       const ageLabel = days >= 1 ? `${days}d` : `${Math.floor(hoursOld)}h`
-      const exact = new Date(card.updated_at * 1000).toLocaleString('hu-HU')
-      agingBadgeHtml = `<span class="kanban-card-aging-badge kanban-card-aging-${agingLevel}" style="color:${agingColor}" title="${t('kanban.aging.tooltip', { exact })}">⏳ ${ageLabel}</span>`
+      const exact = new Date(agingBasis * 1000).toLocaleString('hu-HU')
+      agingBadgeHtml = `<span class="kanban-card-aging-badge kanban-card-aging-${agingLevel}" style="color:${escapeHtml(safeCssColor(agingColor))}" title="${t('kanban.aging.tooltip', { exact })}">⏳ ${ageLabel}</span>`
       el.dataset.aging = agingLevel
-      el.style.setProperty('--card-aging-color', agingColor)
+      el.style.setProperty('--card-aging-color', safeCssColor(agingColor))
     }
   }
 
@@ -1498,10 +2173,17 @@ function createCardEl(card, embeddedChildren = []) {
     embeddedHtml = `<div class="kanban-embedded-subtasks">${items}</div>`
   }
 
+  // Evidence on done: what the closing agent said it checked. Shown only on
+  // done cards that carry it; the full text is in the tooltip and the detail.
+  const evidence = card.status === 'done' && typeof card.done_evidence === 'string' ? card.done_evidence.trim() : ''
+  const evidenceHtml = evidence
+    ? `<span class="kanban-card-evidence" title="${escapeAttr(t('kanban.evidence.tooltip', { text: evidence }))}">${escapeHtml(t('kanban.evidence.badge'))}</span>`
+    : ''
+
   el.innerHTML = `
     ${projectHtml}
     <div class="kanban-card-title">${seqHtml}${escapeHtml(card.title)}</div>
-    <div class="kanban-card-footer">${assigneeHtml}${dueHtml}</div>
+    <div class="kanban-card-footer">${assigneeHtml}${kanbanAgentLiveBadge(card)}${dueHtml}${blockedHtml}${evidenceHtml}</div>
     ${labelsHtml}
     <div class="kanban-card-actions">
       <button class="card-breakdown-btn" title="${t('kanban.btn.breakdown')}" aria-label="${t('kanban.btn.breakdown')}">⚡</button>
@@ -1752,7 +2434,7 @@ async function kanbanTouchEnd(e) {
   if (chip) {
     // Dropped on the status bar: no position information, so append.
     newStatus = chip.dataset.status
-    sortOrder = document.querySelectorAll(`.kanban-col-body[data-status="${newStatus}"] .kanban-card`).length
+    sortOrder = document.querySelectorAll(`.kanban-col-body[data-status="${CSS.escape(String(newStatus))}"] .kanban-card`).length
   } else if (col) {
     newStatus = col.dataset.status
     const after = getDragAfterElement(col, p.clientY)
@@ -1780,6 +2462,7 @@ async function kanbanTouchEnd(e) {
 function wireKanbanCardTouchDnD(el, card) {
   el.addEventListener('touchstart', (e) => {
     if (e.touches.length !== 1) return
+    if (!el.draggable) return
     const p = e.touches[0]
     endTouchDrag()
     touchDrag = {
@@ -1820,15 +2503,25 @@ function getDragAfterElement(col, y) {
   return closest
 }
 
+// The card version the edit form was FILLED from (PUT /api/kanban/:id refuses a
+// stale one with 409). The form is the one write path that does not round-trip the
+// card object -- it rebuilds the body from its fields -- so without this it would be
+// the one UI write that can still replace someone else's description. null = a new
+// card, or a card from a server without versions: the PUT then goes unchecked.
+let cardEditBaseVersion = null
+
 // === New card modal ===
 function openNewCardModal(status) {
   document.getElementById('cardModalTitle').textContent = t('kanban.modal.title_new')
   document.getElementById('cardTitle').value = ''
   document.getElementById('cardDesc').value = ''
+  document.getElementById('cardTestSteps').value = ''
   document.getElementById('cardPriority').value = 'normal'
   document.getElementById('cardProject').value = ''
   document.getElementById('cardDue').value = ''
+  document.getElementById('cardStart').value = ''
   document.getElementById('cardEditId').value = ''
+  cardEditBaseVersion = null
   document.getElementById('cardEditStatus').value = status || 'planned'
   populateAssigneeSelect('cardAssignee')
   populateProjectSuggestions()
@@ -1838,7 +2531,7 @@ function openNewCardModal(status) {
 
 function populateAssigneeSelect(selectId, selected) {
   const sel = document.getElementById(selectId)
-  sel.innerHTML = '<option value="">-- Nincs --</option>'
+  sel.innerHTML = `<option value="">${escapeHtml(t('kanban.meta.none'))}</option>`
   for (const a of kanbanAssignees) {
     const opt = document.createElement('option')
     opt.value = a.name
@@ -1856,11 +2549,15 @@ document.getElementById('saveCardBtn').addEventListener('click', async () => {
   const data = {
     title,
     description: document.getElementById('cardDesc').value.trim() || null,
+    test_steps: document.getElementById('cardTestSteps').value.trim() || null,
     assignee: document.getElementById('cardAssignee').value || null,
     priority: document.getElementById('cardPriority').value,
     project: document.getElementById('cardProject').value.trim() || null,
     due_date: document.getElementById('cardDue').value
       ? Math.floor(new Date(document.getElementById('cardDue').value).getTime() / 1000)
+      : null,
+    start_date: document.getElementById('cardStart').value
+      ? Math.floor(new Date(document.getElementById('cardStart').value).getTime() / 1000)
       : null,
   }
 
@@ -1868,12 +2565,22 @@ document.getElementById('saveCardBtn').addEventListener('click', async () => {
 
   try {
     if (editId) {
+      if (cardEditBaseVersion !== null) data.expected_version = cardEditBaseVersion
       const res = await fetch(`api/kanban/${encodeURIComponent(editId)}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
       })
-      if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || res.status) }
+      if (!res.ok) {
+        const e = await res.json().catch(() => ({}))
+        if (res.status === 409 && e.conflict === 'stale_version') {
+          // The modal STAYS OPEN: the typed text is the only copy of it, and closing
+          // would destroy it to report that something else was nearly destroyed.
+          showToast(t('kanban.toast.stale_version_form'), 8000)
+          return
+        }
+        throw new Error(e.error || res.status)
+      }
       showToast(t('kanban.toast.card_updated'))
     } else {
       data.status = document.getElementById('cardEditStatus').value
@@ -1915,7 +2622,7 @@ async function renderCardLabelsSection(card) {
   for (const label of attached) {
     const pill = document.createElement('span')
     pill.className = 'label-pill'
-    pill.style.setProperty('--label-color', label.color)
+    pill.style.setProperty('--label-color', safeCssColor(label.color, '#64748b'))
     pill.innerHTML = `#${escapeHtml(label.name)} <button class="label-pill-remove" title="${t('kanban.label.remove_btn')}" aria-label="${t('kanban.label.remove_btn')}">&times;</button>`
     pill.querySelector('.label-pill-remove').addEventListener('click', async () => {
       try {
@@ -1928,7 +2635,8 @@ async function renderCardLabelsSection(card) {
   }
 
   const attachedIds = new Set(attached.map((l) => l.id))
-  addSelect.innerHTML = `<option value="">-- ${t('kanban.label.add_placeholder')} --</option>`
+  // The key already carries its dashes (index.html shows it as is), so none are added here.
+  addSelect.innerHTML = `<option value="">${escapeHtml(t('kanban.label.add_placeholder'))}</option>`
   for (const label of kanbanAllLabels) {
     if (attachedIds.has(label.id)) continue
     const opt = document.createElement('option')
@@ -1961,7 +2669,7 @@ async function renderCardLabelsSection(card) {
   palette.forEach((color, i) => {
     const sw = document.createElement('span')
     sw.className = 'label-color-swatch' + (i === 0 ? ' selected' : '')
-    sw.style.background = color
+    sw.style.backgroundColor = safeCssColor(color)
     sw.addEventListener('click', () => {
       selectedColor = color
       newColorsEl.querySelectorAll('.label-color-swatch').forEach((s) => s.classList.remove('selected'))
@@ -1992,7 +2700,189 @@ async function renderCardLabelsSection(card) {
   }
 }
 
+// === Card blockers (in the detail modal) ===
+// Renders both directions from one GET: what this card waits on, and what waits
+// on it. The reverse list is read-only on purpose -- a block is removed from the
+// card that carries it, so there is exactly one place to clear each link.
+// Card 0f21864e (#568): the assignee's token use while this card was
+// in_progress. The number is an upper bound when the agent had other cards
+// in_progress at the same time, and the text says so instead of splitting it.
+function formatTokenCount(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + 'M'
+  if (n >= 1e3) return Math.round(n / 1e3) + 'k'
+  return String(n)
+}
+
+async function renderCardTokensSection(card) {
+  const box = document.getElementById('cardDetailTokens')
+  const body = document.getElementById('cardDetailTokensBody')
+  if (!box || !body) return
+  box.hidden = true
+  body.textContent = ''
+  let data
+  try {
+    const r = await fetch(`api/kanban/${encodeURIComponent(card.id)}/tokens`)
+    if (!r.ok) return
+    data = await r.json()
+  } catch { return }
+  if (!data || !data.agent || !Array.isArray(data.windows) || data.windows.length === 0) return
+  const lines = []
+  if (data.totalCalls === 0) {
+    lines.push(t('kanban.tokens.none'))
+  } else {
+    // Cache reads dominate the raw sum (96-98% on 4 live cards), so the
+    // headline names the three kinds instead of one big number.
+    lines.push(t('kanban.tokens.total', {
+      output: formatTokenCount(data.outputTokens),
+      fresh: formatTokenCount(data.freshInputTokens),
+      cached: formatTokenCount(data.cacheReadTokens),
+      calls: data.totalCalls,
+    }))
+    for (const m of data.perModel) {
+      lines.push(`${m.model || '?'}: ${t('kanban.tokens.model_line', { output: formatTokenCount(m.outputTokens), calls: m.calls })}`)
+    }
+  }
+  if (data.overlappingCards > 0) lines.push(t('kanban.tokens.overlap', { n: data.overlappingCards }))
+  const lastTo = data.windows[data.windows.length - 1].to
+  if (data.dataUntil && data.dataUntil < lastTo) {
+    lines.push(t('kanban.tokens.data_until', { time: new Date(data.dataUntil * 1000).toLocaleString() }))
+  }
+  for (const line of lines) {
+    const div = document.createElement('div')
+    div.textContent = line
+    body.appendChild(div)
+  }
+  box.title = t('kanban.tokens.tooltip', { agent: data.agent })
+  box.hidden = false
+}
+
+async function renderCardBlockersSection(card) {
+  const listEl = document.getElementById('cardBlockerList')
+  const addSelect = document.getElementById('cardBlockerAdd')
+  const blockingWrap = document.getElementById('cardBlockingWrap')
+  const blockingListEl = document.getElementById('cardBlockingList')
+  if (!listEl || !addSelect) return
+
+  let blockers = []
+  let blocking = []
+  try {
+    const data = await (await fetch(`api/kanban/${encodeURIComponent(card.id)}/blockers`)).json()
+    blockers = Array.isArray(data.blockers) ? data.blockers : []
+    blocking = Array.isArray(data.blocking) ? data.blocking : []
+  } catch { /* leave empty -- the lists just stay blank */ }
+
+  // A blocker whose card is done no longer holds anything up. It stays listed
+  // (the link is history worth seeing) but reads as cleared, so a glance at the
+  // list answers "am I still waiting?" without opening each card.
+  const isCleared = (ref) => ref.status === 'done'
+
+  const refRow = (ref, removable) => {
+    const row = document.createElement('div')
+    row.className = 'blocker-row' + (isCleared(ref) ? ' blocker-cleared' : '')
+    const seq = ref.seq != null ? `#${ref.seq} ` : ''
+    const link = document.createElement('button')
+    link.className = 'blocker-link'
+    link.type = 'button'
+    link.textContent = `${seq}${ref.title}`
+    link.title = t('kanban.blocker.open_hint')
+    link.addEventListener('click', () => {
+      const target = kanbanCards.find((c) => c.id === ref.id)
+      if (target) showCardDetail(target)
+      else showToast(t('kanban.toast.blocker_not_on_board'))
+    })
+    row.appendChild(link)
+    const state = document.createElement('span')
+    state.className = 'blocker-state'
+    state.textContent = t(`kanban.status.${ref.status}`)
+    row.appendChild(state)
+    if (removable) {
+      const rm = document.createElement('button')
+      rm.className = 'blocker-remove'
+      rm.type = 'button'
+      rm.innerHTML = '&times;'
+      rm.title = t('kanban.blocker.remove_btn')
+      rm.setAttribute('aria-label', t('kanban.blocker.remove_btn'))
+      rm.addEventListener('click', async () => {
+        try {
+          await fetch(`api/kanban/${encodeURIComponent(card.id)}/blockers/${encodeURIComponent(ref.id)}`, { method: 'DELETE' })
+          renderCardBlockersSection(card)
+          loadKanban()
+        } catch { showToast(t('kanban.toast.blocker_remove_error')) }
+      })
+      row.appendChild(rm)
+    }
+    return row
+  }
+
+  listEl.innerHTML = ''
+  if (blockers.length === 0) {
+    const empty = document.createElement('div')
+    empty.className = 'blocker-empty'
+    empty.textContent = t('kanban.blocker.none')
+    listEl.appendChild(empty)
+  } else {
+    for (const ref of blockers) listEl.appendChild(refRow(ref, true))
+  }
+
+  blockingListEl.innerHTML = ''
+  blockingWrap.style.display = blocking.length > 0 ? '' : 'none'
+  for (const ref of blocking) blockingListEl.appendChild(refRow(ref, false))
+
+  // Candidates: every other open card on the board that is not already linked.
+  // Cards this one blocks are excluded too -- adding one would close a cycle,
+  // and the server refuses it; offering it in the list would only produce an error.
+  const attachedIds = new Set(blockers.map((b) => b.id))
+  const blockingIds = new Set(blocking.map((b) => b.id))
+  addSelect.innerHTML = `<option value="">-- ${t('kanban.blocker.add_placeholder_short')} --</option>`
+  for (const other of kanbanCards) {
+    if (other.id === card.id || attachedIds.has(other.id) || blockingIds.has(other.id)) continue
+    if (other.status === 'done') continue
+    const opt = document.createElement('option')
+    opt.value = other.id
+    opt.textContent = (other.seq != null ? `#${other.seq} ` : '') + other.title.slice(0, 70)
+    addSelect.appendChild(opt)
+  }
+  addSelect.onchange = async () => {
+    const blockerId = addSelect.value
+    if (!blockerId) return
+    try {
+      const r = await fetch(`api/kanban/${encodeURIComponent(card.id)}/blockers`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ blockerId }),
+      })
+      if (!r.ok) {
+        // The server's message names the actual reason (cycle, missing card);
+        // surfacing it beats a generic failure the operator has to guess at.
+        const err = await r.json().catch(() => ({}))
+        showToast(err.error || t('kanban.toast.blocker_add_error'))
+        addSelect.value = ''
+        return
+      }
+      renderCardBlockersSection(card)
+      loadKanban()
+    } catch { showToast(t('kanban.toast.blocker_add_error')) }
+  }
+}
+
 // === Card detail ===
+// Card.active_seconds -> human text for the card detail panel.
+//
+// undefined means the card has no status-change history at all, which is NOT
+// the same as zero and must not render as "0m" -- the event table starts
+// mid-history, so an old card that never moved since would otherwise claim a
+// measured zero it has not got.
+function formatActiveTime(sec) {
+  if (sec === undefined || sec === null) return null
+  const s = Math.max(0, Math.floor(sec))
+  const d = Math.floor(s / 86400)
+  const h = Math.floor((s % 86400) / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  if (s === 0) return t('kanban.active.zero')
+  if (d >= 1) return t('kanban.active.d_h', { d, h })
+  if (h >= 1) return t('kanban.active.h_m', { h, m })
+  return t('kanban.active.m', { m })
+}
+
 async function showCardDetail(card) {
   // Running number (#N) in the title bar, plus the stable hex id in the meta.
   const seqPrefix = card.seq != null ? `#${card.seq} ` : ''
@@ -2004,7 +2894,7 @@ async function showCardDetail(card) {
   const assignee = rawDetailAssignee
     ? kanbanAssignees.find((a) => a.name.toLowerCase() === rawDetailAssignee.toLowerCase())
     : null
-  const assigneeDisplay = assignee ? (assignee.displayName || assignee.name) : (rawDetailAssignee || '-- nincs --')
+  const assigneeDisplay = assignee ? (assignee.displayName || assignee.name) : (rawDetailAssignee || t('kanban.meta.none'))
   const priorityLabels = { low: t('kanban.priority.low'), normal: t('kanban.priority.normal'), high: t('kanban.priority.high'), urgent: t('kanban.priority.urgent') }
   const statusLabels = { planned: t('kanban.status.planned'), in_progress: t('kanban.status.in_progress'), testing: t('kanban.status.testing'), waiting: t('kanban.status.waiting'), done: t('kanban.status.done') }
 
@@ -2017,11 +2907,11 @@ async function showCardDetail(card) {
     </div>
     <div class="meta-item">
       <span class="meta-label">${t('kanban.meta.status')}</span>
-      <span class="meta-value meta-value-editable" id="metaStatusValue" data-card-id="${card.id}" title="${t('kanban.meta.edit_tooltip')}">${statusLabels[card.status] || card.status}</span>
+      <span class="meta-value meta-value-editable" id="metaStatusValue" data-card-id="${escapeHtml(card.id)}" title="${t('kanban.meta.edit_tooltip')}">${escapeHtml(statusLabels[card.status] || card.status)}</span>
     </div>
     <div class="meta-item">
       <span class="meta-label">${t('kanban.meta.assignee')}</span>
-      <span class="meta-value meta-value-editable" id="metaAssigneeValue" data-card-id="${card.id}" title="${t('kanban.meta.edit_tooltip')}">${escapeHtml(assigneeDisplay)}</span>
+      <span class="meta-value meta-value-editable" id="metaAssigneeValue" data-card-id="${escapeHtml(card.id)}" title="${t('kanban.meta.edit_tooltip')}">${escapeHtml(assigneeDisplay)}</span>
     </div>
     <div class="meta-item">
       <span class="meta-label">${t('kanban.meta.priority')}</span>
@@ -2032,8 +2922,16 @@ async function showCardDetail(card) {
       <span class="meta-value">${card.project ? escapeHtml(card.project) : t('kanban.meta.none')}</span>
     </div>
     <div class="meta-item">
+      <span class="meta-label">${t('kanban.meta.start')}</span>
+      <span class="meta-value">${card.start_date ? new Date(card.start_date * 1000).toLocaleDateString(_lang === 'en' ? 'en-US' : 'hu-HU') : t('kanban.meta.none')}</span>
+    </div>
+    <div class="meta-item">
       <span class="meta-label">${t('kanban.meta.deadline')}</span>
       <span class="meta-value">${card.due_date ? new Date(card.due_date * 1000).toLocaleDateString(_lang === 'en' ? 'en-US' : 'hu-HU') : t('kanban.meta.none')}</span>
+    </div>
+    <div class="meta-item">
+      <span class="meta-label">${t('kanban.meta.active')}</span>
+      <span class="meta-value" title="${escapeHtml(formatActiveTime(card.active_seconds) ? t('kanban.active.tooltip') : t('kanban.active.tooltip_none'))}">${escapeHtml(formatActiveTime(card.active_seconds) ?? t('kanban.active.none'))}</span>
     </div>
   `
 
@@ -2093,7 +2991,7 @@ async function showCardDetail(card) {
     const current = card.assignee || ''
     const sel = document.createElement('select')
     sel.style.cssText = 'padding:2px 6px; border-radius:4px; border:1px solid var(--border); background:var(--bg-card); color:var(--text); font-size:inherit'
-    sel.innerHTML = '<option value="">-- Nincs --</option>'
+    sel.innerHTML = `<option value="">${escapeHtml(t('kanban.meta.none'))}</option>`
     for (const a of kanbanAssignees) {
       const opt = document.createElement('option')
       opt.value = a.name
@@ -2107,7 +3005,7 @@ async function showCardDetail(card) {
     const save = async () => {
       const newVal = sel.value || null
       if (newVal === current || (newVal === null && !current)) {
-        assigneeValueEl.textContent = current ? current : '-- nincs --'
+        assigneeValueEl.textContent = current ? current : t('kanban.meta.none')
         return
       }
       try {
@@ -2116,27 +3014,61 @@ async function showCardDetail(card) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ ...card, assignee: newVal }),
         })
+        // `{...card}` carries the version this object was loaded at, so a card that
+        // changed meanwhile is refused instead of having its description reverted.
+        if (r.status === 409) {
+          const e = await r.json().catch(() => ({}))
+          if (e.conflict === 'stale_version') {
+            assigneeValueEl.textContent = current ? current : t('kanban.meta.none')
+            showToast(t('kanban.toast.stale_version'), 6000)
+            loadKanban && loadKanban()
+            return
+          }
+        }
         if (!r.ok) throw new Error('PUT failed')
+        // The next whole-card write from this same view must carry the NEW version,
+        // or it would be refused as stale against our own write.
+        const saved = await r.json().catch(() => ({}))
+        if (Number.isInteger(saved.version)) card.version = saved.version
         card.assignee = newVal
-        assigneeValueEl.textContent = newVal ? newVal : '-- nincs --'
+        assigneeValueEl.textContent = newVal ? newVal : t('kanban.meta.none')
         showToast(t('kanban.toast.assignee_updated'))
         loadKanban && loadKanban()
       } catch {
-        assigneeValueEl.textContent = current ? current : '-- nincs --'
+        assigneeValueEl.textContent = current ? current : t('kanban.meta.none')
         showToast(t('kanban.toast.save_error'))
       }
     }
     sel.addEventListener('change', save)
     sel.addEventListener('blur', () => {
       if (assigneeValueEl.querySelector('select')) {
-        assigneeValueEl.textContent = card.assignee ? card.assignee : '-- nincs --'
+        assigneeValueEl.textContent = card.assignee ? card.assignee : t('kanban.meta.none')
       }
     })
   })
 
   document.getElementById('cardDetailDesc').textContent = card.description || ''
 
+  // Card 8fe51afd: the testing steps in a block of their own. Hidden when the
+  // card has none -- an empty "Tesztelési lépések" heading on every card would
+  // train the reader to skip past the one card where it is filled in. The
+  // `is-testing` mark is what makes it stand out exactly when it is due.
+  const testStepsBox = document.getElementById('cardDetailTestSteps')
+  const testStepsBody = document.getElementById('cardDetailTestStepsBody')
+  const steps = (card.test_steps || '').trim()
+  testStepsBody.textContent = steps
+  testStepsBox.hidden = !steps
+  testStepsBox.classList.toggle('is-testing', !!steps && card.status === 'testing')
+  const evidenceBox = document.getElementById('cardDetailEvidence')
+  if (evidenceBox) {
+    const ev = typeof card.done_evidence === 'string' ? card.done_evidence.trim() : ''
+    document.getElementById('cardDetailEvidenceBody').textContent = ev
+    evidenceBox.hidden = !ev
+  }
+
   renderCardLabelsSection(card)
+  renderCardBlockersSection(card)
+  renderCardTokensSection(card)
 
   // #115: Parent meta row — dropdown replaces the old read-only display; shown only when editable
   const parentMetaItem = document.getElementById('parentMetaItem')
@@ -2165,8 +3097,14 @@ async function showCardDetail(card) {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...card, parent_id: newParentId }),
       })
-      if (r.ok) { card.parent_id = newParentId; showToast(label); loadKanban(); showCardDetail(card) }
-      else showToast(t('kanban.toast.save_error'))
+      if (r.ok) {
+        const saved = await r.json().catch(() => ({}))
+        if (Number.isInteger(saved.version)) card.version = saved.version
+        card.parent_id = newParentId; showToast(label); loadKanban(); showCardDetail(card)
+      } else if (r.status === 409 && (await r.json().catch(() => ({}))).conflict === 'stale_version') {
+        showToast(t('kanban.toast.stale_version'), 6000)
+        loadKanban()
+      } else showToast(t('kanban.toast.save_error'))
     }
     parentMetaItem.style.display = ''
   } else {
@@ -2194,7 +3132,7 @@ async function showCardDetail(card) {
   // Author select for new comment. Default to the bot assignee resolved by
   // type (never a hard-coded display name -- BOT_NAME differs per deployment),
   // falling back to the first assignee. The old literal 'Marveen' never matched
-  // on non-Marveen installs, so the select stayed on "-- Nincs --" and the
+  // on non-Marveen installs, so the select stayed on "-- nincs --" and the
   // comment submit silently no-opped (addCommentBtn returns when !author).
   // (Resolution of the #254/#241 overlap: keep #241's type-resolved default
   // over #254's hard-coded "Gábor" -- same deployment-agnostic reasoning.)
@@ -2235,12 +3173,19 @@ async function showCardDetail(card) {
     document.getElementById('cardModalTitle').textContent = t('kanban.modal.title_edit')
     document.getElementById('cardTitle').value = card.title
     document.getElementById('cardDesc').value = card.description || ''
+    document.getElementById('cardTestSteps').value = card.test_steps || ''
     document.getElementById('cardPriority').value = card.priority
     document.getElementById('cardProject').value = card.project || ''
     document.getElementById('cardDue').value = card.due_date
       ? new Date(card.due_date * 1000).toISOString().split('T')[0]
       : ''
+    document.getElementById('cardStart').value = card.start_date
+      ? new Date(card.start_date * 1000).toISOString().split('T')[0]
+      : ''
     document.getElementById('cardEditId').value = card.id
+    // Taken at FILL time, not at save time: it has to describe the text the user
+    // is about to edit on top of, or the check certifies nothing.
+    cardEditBaseVersion = Number.isInteger(card.version) ? card.version : null
     document.getElementById('cardEditStatus').value = card.status
     populateAssigneeSelect('cardAssignee', card.assignee)
     populateProjectSuggestions()
@@ -2261,7 +3206,13 @@ async function showCardDetail(card) {
 
   // Delete
   document.getElementById('cardDeleteBtn').onclick = async () => {
-    if (!confirm(t('kanban.confirm.delete'))) return
+    const confirmed = await confirmDialog({
+      title: t('kanban.confirm.delete_title'),
+      message: t('kanban.confirm.delete'),
+      okLabel: t('kanban.confirm.delete_ok'),
+      danger: true,
+    })
+    if (!confirmed) return
     try {
       await fetch(`api/kanban/${encodeURIComponent(card.id)}`, { method: 'DELETE' })
       closeModal(cardDetailOverlay)
@@ -2316,8 +3267,8 @@ async function showCardDetail(card) {
         div.style.cssText = 'cursor:pointer; display:flex; justify-content:space-between; align-items:center; gap:8px'
         const info = document.createElement('div')
         info.style.flex = '1'
-        info.innerHTML = `<div><strong>${escapeHtml(ch.title)}</strong> <span style="color:var(--text-muted)">[${statusLabelsShort[ch.status] || ch.status}]</span></div>
-          <div style="font-size:0.85em;color:var(--text-muted)">${ch.assignee ? escapeHtml(ch.assignee) : ''}${ch.description ? ' -- ' + escapeHtml(ch.description).slice(0, 80) : ''}</div>`
+        info.innerHTML = `<div><strong>${escapeHtml(ch.title)}</strong> <span style="color:var(--text-muted)">[${escapeHtml(statusLabelsShort[ch.status] || ch.status)}]</span></div>
+          <div style="font-size:0.85em;color:var(--text-muted)">${ch.assignee ? escapeHtml(ch.assignee) : ''}${ch.description ? ' -- ' + escSnippet(ch.description, 80) : ''}</div>`
         info.onclick = () => { closeModal(cardDetailOverlay); showCardDetail(ch) }
         div.appendChild(info)
         if (canDeleteChild) {
@@ -2327,7 +3278,13 @@ async function showCardDetail(card) {
           delBtn.textContent = t('kanban.modal.delete_btn')
           delBtn.onclick = async (e) => {
             e.stopPropagation()
-            if (!confirm(t('kanban.confirm.delete_subtask', { title: ch.title }))) return
+            const confirmed = await confirmDialog({
+              title: t('kanban.confirm.delete_subtask_title'),
+              message: t('kanban.confirm.delete_subtask', { title: ch.title }),
+              okLabel: t('kanban.confirm.delete_subtask_ok'),
+              danger: true,
+            })
+            if (!confirmed) return
             try {
               const r = await fetch(`api/kanban/${encodeURIComponent(ch.id)}`, { method: 'DELETE' })
               if (!r.ok) { showToast(t('common.error_delete')); return }
@@ -2351,12 +3308,15 @@ async function showCardDetail(card) {
   // Breakdown button
   document.getElementById('cardBreakdownBtn').onclick = async () => {
     const btn = document.getElementById('cardBreakdownBtn')
+    // The label is "⚡ <span data-i18n>…</span>"; put its own nodes back afterwards, so it keeps its
+    // icon and follows a language switch (it used to be overwritten with a hardcoded "Breakdown").
+    const label = [...btn.childNodes]
     btn.disabled = true
     btn.textContent = t('kanban.breakdown.generating')
     try {
       const res = await fetch(`api/kanban/${encodeURIComponent(card.id)}/breakdown`, { method: 'POST' })
       const data = await res.json()
-      if (!res.ok) { showToast(data.error || 'Hiba'); btn.disabled = false; btn.textContent = 'Breakdown'; return }
+      if (!res.ok) { showToast(data.error || t('kanban.breakdown.failed')); return }
       breakdownMode = 'kanban'
       breakdownCardId = card.id
       breakdownSubtasks = data.subtasks
@@ -2364,10 +3324,10 @@ async function showCardDetail(card) {
       const dodSec = document.getElementById('breakdownDoDSection')
       if (dodSec) dodSec.style.display = 'none'
     } catch (err) {
-      showToast('Breakdown hiba')
+      showToast(t('kanban.breakdown.failed'))
     } finally {
       btn.disabled = false
-      btn.textContent = 'Breakdown'
+      btn.replaceChildren(...label)
     }
   }
 
@@ -2375,25 +3335,25 @@ async function showCardDetail(card) {
 }
 
 async function triggerBreakdown(card) {
-  const btn = document.querySelector(`.kanban-card[data-id="${card.id}"] .card-breakdown-btn`)
+  const btn = document.querySelector(`.kanban-card[data-id="${CSS.escape(String(card.id))}"] .card-breakdown-btn`)
   if (btn) { btn.disabled = true; btn.textContent = '...' }
   try {
     const res = await fetch(`api/kanban/${encodeURIComponent(card.id)}/breakdown`, { method: 'POST' })
     const data = await res.json()
-    if (!res.ok) { showToast(data.error || 'Breakdown hiba'); return }
+    if (!res.ok) { showToast(data.error || t('kanban.breakdown.failed')); return }
     breakdownMode = 'kanban'
     breakdownCardId = card.id
     breakdownSubtasks = data.subtasks
     showBreakdownModal(data.subtasks, card)
   } catch {
-    showToast('Breakdown hiba')
+    showToast(t('kanban.breakdown.failed'))
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = '⚡' }
   }
 }
 
 function showBreakdownModal(subtasks, parentCard) {
-  document.getElementById('breakdownProvider').textContent = t('kanban.breakdown.parent_label', { title: escapeHtml(parentCard.title) })
+  document.getElementById('breakdownProvider').textContent = t('kanban.breakdown.parent_label', { title: parentCard.title })
   const list = document.getElementById('breakdownList')
   list.innerHTML = ''
 
@@ -2413,15 +3373,15 @@ function showBreakdownModal(subtasks, parentCard) {
         <input type="text" class="breakdown-title-input" value="${escapeHtml(st.title)}"
           style="flex:1; padding:5px 8px; border-radius:6px; border:1px solid var(--border); background:var(--bg-card); color:var(--text); font-size:0.9em">
         <label style="font-size:0.8em; white-space:nowrap">
-          <input type="checkbox" class="breakdown-check" data-idx="${i}" checked> Bele
+          <input type="checkbox" class="breakdown-check" data-idx="${i}" checked> ${escapeHtml(t('kanban.breakdown.include'))}
         </label>
       </div>
       <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap">
         <select class="breakdown-assignee-select" style="padding:4px 8px; border-radius:6px; border:1px solid var(--border); background:var(--bg-card); color:var(--text); font-size:0.85em">
-          <option value="">-- nincs --</option>
+          <option value="">${escapeHtml(t('kanban.unassigned'))}</option>
           ${assigneeOptions}
         </select>
-        <span class="priority-badge priority-${st.priority}">${priorityLabels[st.priority] || st.priority}</span>
+        <span class="priority-badge priority-${escapeHtml(st.priority)}">${escapeHtml(priorityLabels[st.priority] || st.priority)}</span>
       </div>
     `
     // Set assignee select value after insert
@@ -2455,7 +3415,7 @@ document.getElementById('breakdownAcceptBtn').addEventListener('click', async ()
         body: JSON.stringify({ subtasks: accepted, success_criteria: successCriteria }),
       })
       const data = await res.json()
-      if (!res.ok) { showToast(data.error || 'Hiba'); return }
+      if (!res.ok) { showToast(data.error || t('common.error_save')); return }
       closeModal(breakdownOverlay)
       showToast(t('kanban.breakdown.promoted', { count: data.child_count }))
       loadIdeasPage()
@@ -2467,7 +3427,7 @@ document.getElementById('breakdownAcceptBtn').addEventListener('click', async ()
       body: JSON.stringify({ subtasks: accepted }),
     })
     const data = await res.json()
-    if (!res.ok) { showToast(data.error || 'Hiba'); return }
+    if (!res.ok) { showToast(data.error || t('common.error_save')); return }
     closeModal(breakdownOverlay)
     closeModal(cardDetailOverlay)
     showToast(t('kanban.breakdown.created_count', { count: data.created.length }))
@@ -2506,6 +3466,11 @@ const AVATARS = [
 let selectedAvatar = null
 let selectedAvatarFile = null // custom upload chosen in the create wizard (deferred until the agent exists)
 let agents = []
+// Agent name -> measured context-window fraction (0..1), from /api/context-guard.
+// Refreshed alongside the agent list (loadAgents), not on its own poll timer --
+// the underlying measurement reads each agent's transcript from disk, so it is
+// only worth paying for when the Agents page is actually being (re)drawn.
+let contextGuardPct = {}
 let currentAgent = null
 // API-safe agent id for the currently open detail modal. Sub-agents key off
 // their name; the main agent's detail object carries name:'marveen' for legacy
@@ -2518,6 +3483,9 @@ let wizardStep = 1
 let generatedClaudeMd = ''
 let generatedSoulMd = ''
 let wizardCreatedName = ''
+// True once step 3's texts came from the created agent's detail. When that GET failed, the boxes start empty and an
+// empty claudeMd/soulMd in the Create PUT would overwrite the generated files (#2845).
+let wizardTextsLoaded = false
 // Set from the POST /api/agents response when the backend fell back to a template
 // because personality generation failed. It answers 200 in that case (the agent
 // EXISTS and works), so `res.ok` alone cannot tell the operator anything -- without
@@ -2528,6 +3496,9 @@ let wizardPersonalityPending = null
 function openModal(overlay) {
   overlay.classList.add('active')
   document.body.style.overflow = 'hidden'
+  // What the fields held when the modal opened (an edit modal is filled before this), so closing it
+  // asks only about real changes, not about text it was opened with.
+  overlay._openValues = new Map(unsavedInputFields(overlay).map(f => [f, f.value]))
 }
 function closeModal(overlay) {
   overlay.classList.remove('active')
@@ -2539,52 +3510,112 @@ function closeModal(overlay) {
   if (overlay && overlay.id === 'skillModalOverlay') skillModalScope = null
 }
 
-// True if any visible text/textarea field inside the overlay has typed
-// content. Used to gate backdrop-click close so a stray click can't
-// silently discard unsaved input (data loss reported 2026-08-19: a full
-// card description was lost by clicking outside the "Új kártya" modal).
+// True if any visible text/textarea field inside the overlay has content that was not there when the
+// modal opened. Used to gate the close so a stray click can't silently discard unsaved input (data loss
+// reported 2026-08-19: a full card description was lost by clicking outside the "Új kártya" modal).
+// An edit modal (a card, a memory, a schedule) opens filled; it used to ask "unsaved text" on every
+// close, also when nothing had been changed.
 function overlayHasUnsavedInput(overlay) {
-  const fields = overlay.querySelectorAll(
-    'input[type="text"]:not([list]), input[type="date"], input[type="email"], input[type="url"], textarea',
-  )
-  for (const f of fields) {
-    if (f.offsetParent !== null && f.value && f.value.trim()) return true
+  const opened = overlay._openValues
+  for (const f of unsavedInputFields(overlay)) {
+    if (f.offsetParent === null || f.readOnly || f.disabled || !f.value || !f.value.trim()) continue
+    if (opened && opened.get(f) === f.value) continue
+    return true
   }
   return false
 }
 
-// Backdrop click closes the modal only if it has no unsaved input; if it
-// does, a confirm() gates the close so the click has to be deliberate.
-function attachOverlayCloseGuard(overlay) {
-  overlay.addEventListener('click', (e) => {
-    if (e.target !== overlay) return
-    if (overlayHasUnsavedInput(overlay) && !confirm('Van be nem mentett szöveg -- biztosan bezárod mentés nélkül?')) return
-    closeModal(overlay)
+// The text fields whose content a close could lose.
+function unsavedInputFields(overlay) {
+  return [...overlay.querySelectorAll(
+    'input[type="text"]:not([list]), input[type="date"], input[type="email"], input[type="url"], textarea',
+  )]
+}
+
+// A save that keeps its modal open (the agent's settings): the saved text is what the field now holds
+// "as opened", so closing afterwards does not ask about changes that are already saved.
+function markFieldSaved(el) {
+  const overlay = el && el.closest ? el.closest('.modal-overlay') : null
+  if (overlay && overlay._openValues) overlay._openValues.set(el, el.value)
+}
+
+// The default question before a guarded modal closes: none for an empty form; with typed input, a
+// confirm dialog, so the close has to be deliberate. The dialog opens on top of this modal; its own
+// backdrop click and Escape are a "no".
+async function confirmUnsavedInputClose(overlay) {
+  if (!overlayHasUnsavedInput(overlay)) return true
+  return confirmDialog({
+    title: t('common.confirm.unsaved_title'),
+    message: t('common.confirm.unsaved'),
+    okLabel: t('common.confirm.unsaved_ok'),
+    danger: true,
   })
 }
 
-// Wizard open
-addBtn.addEventListener('click', () => {
+// Every way of closing a guarded modal goes through here: the backdrop click, its own close button,
+// and Escape. Before, only the backdrop asked, so the close button or Escape still dropped the input.
+async function requestOverlayClose(overlay) {
+  const check = overlay._closeCheck
+  if (check && !(await check())) return
+  closeModal(overlay)
+}
+
+// Registers the modal's question (by default the unsaved-input one; a modal that knows better, like
+// the skill editor, passes its own) and wires the backdrop click. The question is kept on the element
+// itself: the first modals are guarded near the top of this file, long before a module-level Map
+// declared here would be initialized.
+function attachOverlayCloseGuard(overlay, check = () => confirmUnsavedInputClose(overlay)) {
+  overlay._closeCheck = check
+  overlay.addEventListener('click', async (e) => {
+    if (e.target !== overlay) return
+    await requestOverlayClose(overlay)
+  })
+}
+
+// OWNERGATE2-1104: creating an agent (POST /api/agents, then the PUT of its CLAUDE.md/SOUL.md) needs the owner. The
+// public status says whether this window can act as the owner: no login set up yet (the token is the owner then), a
+// browser login, or the owner's session cookie beside the token or the Bridge key. An unknown answer opens the
+// wizard anyway; the server's own gate still decides.
+async function canActAsOwnerNow() {
+  try {
+    const r = await fetch('api/auth/status', { cache: 'no-store' })
+    if (!r.ok) return true
+    const s = await r.json()
+    return Boolean(s && (s.setup_required || s.method === 'session' || s.owner_session === true))
+  } catch {
+    return true
+  }
+}
+
+// Wizard open: without the owner, the login comes first, so no create starts that the server would refuse halfway.
+addBtn.addEventListener('click', async () => {
+  if (!(await canActAsOwnerNow())) {
+    showToast(t('common.owner_session_required'))
+    if (typeof window.mvShowLogin === 'function') window.mvShowLogin({ cancellable: true })
+    return
+  }
   resetWizard()
   openModal(agentWizardOverlay)
   setTimeout(() => agentName.focus(), 200)
 })
 
 // Close buttons
-document.getElementById('wizardClose').addEventListener('click', () => closeModal(agentWizardOverlay))
-document.getElementById('agentDetailClose').addEventListener('click', () => closeModal(agentDetailOverlay))
-document.getElementById('skillModalClose').addEventListener('click', () => closeModal(skillModalOverlay))
+document.getElementById('wizardClose').addEventListener('click', () => requestOverlayClose(agentWizardOverlay))
+document.getElementById('agentDetailClose').addEventListener('click', () => requestOverlayClose(agentDetailOverlay))
+document.getElementById('skillModalClose').addEventListener('click', () => requestOverlayClose(skillModalOverlay))
 
 // Click-outside-to-close
 attachOverlayCloseGuard(agentWizardOverlay)
 attachOverlayCloseGuard(agentDetailOverlay)
 attachOverlayCloseGuard(skillModalOverlay)
 
-// Close all modals on Escape
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') {
-    document.querySelectorAll('.modal-overlay.active').forEach((o) => closeModal(o))
-  }
+// Close all modals on Escape. A confirmDialog on top answers its own Escape as a "no", so the modal
+// under it stays open (closing it too would drop the input the dialog was protecting). A guarded
+// modal asks first, as its backdrop and close button do.
+document.addEventListener('keydown', async (e) => {
+  if (e.key !== 'Escape') return
+  if (document.querySelector('.confirm-dialog')) return
+  for (const o of document.querySelectorAll('.modal-overlay.active')) await requestOverlayClose(o)
 })
 
 // === Avatar Gallery ===
@@ -2630,7 +3661,23 @@ function populateProfileSelect(selectEl, descEl, selected) {
       if (p.id === selected) opt.selected = true
       selectEl.appendChild(opt)
     }
+    // A REQUESTED PROFILE THAT DOES NOT EXIST. No option
+    // matched, so the select used to show the FIRST profile, and the agent in
+    // fact ran under `default` (the server's silent fallback). The requested
+    // name is shown as it is, marked, with the consequence in the description.
+    const missing = selected && !profiles.some(p => p.id === selected) ? selected : null
+    if (missing) {
+      const opt = document.createElement('option')
+      opt.value = missing
+      opt.textContent = `⚠ ${missing} (${t('agents.profile_missing_option')})`
+      opt.selected = true
+      selectEl.prepend(opt)
+    }
     const updateDesc = () => {
+      if (missing && selectEl.value === missing) {
+        descEl.textContent = t('agents.profile_missing_desc', { id: missing })
+        return
+      }
       const p = profiles.find(x => x.id === selectEl.value)
       descEl.textContent = p ? p.description : ''
     }
@@ -2715,6 +3762,8 @@ function resetWizard() {
   agentName.value = ''
   agentDesc.value = ''
   agentModel.value = 'inherit'
+  document.getElementById('agentModelCustomModelId').value = ''
+  updateCustomModelIdRow(agentModel)
   loadAvailableModels()
   loadOllamaModels()
   selectedAvatar = null
@@ -2724,6 +3773,7 @@ function resetWizard() {
   generatedClaudeMd = ''
   generatedSoulMd = ''
   wizardCreatedName = ''
+  wizardTextsLoaded = false
   wizardPersonalityPending = null
   renderWizardPendingBanner()
   document.getElementById('wizardClaudeMd').value = ''
@@ -2749,12 +3799,30 @@ function updateWizardUI() {
   document.getElementById('wizardStep3').hidden = wizardStep !== 3
 }
 
+// The model ID field shows with a custom provider, as in the agent editor.
+agentModel.addEventListener('change', () => updateCustomModelIdRow(agentModel))
+
 // Step 1 -> Step 2 (generate)
 document.getElementById('wizardNextBtn').addEventListener('click', async () => {
+  // The agent already exists (Back from step 3): Next returns to its review and never POSTs again, so a second Next
+  // cannot answer 409 or, after a rename, create a second agent (#2845). The step 1 fields are not applied again,
+  // and the toast says so.
+  if (wizardCreatedName) {
+    showToast(t('agents.wizard.already_created', { name: wizardCreatedName }))
+    wizardStep = 3
+    updateWizardUI()
+    return
+  }
   const name = agentName.value.trim()
   const desc = agentDesc.value.trim()
+  // A custom provider goes in its own field with the model id typed beside it, as the agent editor saves it.
+  const modelVal = agentModel.value
+  const customProvider = modelVal.startsWith('custom:') ? modelVal.slice('custom:'.length) : null
+  const customModelInput = document.getElementById('agentModelCustomModelId')
+  const customModelId = customProvider ? customModelInput.value.trim() : ''
   if (!name) { agentName.focus(); return }
   if (!desc) { agentDesc.focus(); return }
+  if (customProvider && !customModelId) { customModelInput.focus(); showToast(t('agents.model.custom_model_required')); return }
 
   wizardStep = 2
   updateWizardUI()
@@ -2770,14 +3838,15 @@ document.getElementById('wizardNextBtn').addEventListener('click', async () => {
       body: JSON.stringify({
         name,
         description: desc,
-        model: agentModel.value,
+        model: customProvider ? customModelId : modelVal,
+        customProvider,
         profile: document.getElementById('agentProfile').value,
       }),
     })
 
     if (!res.ok) {
       const err = await res.json()
-      throw new Error(err.error || 'Ismeretlen hiba')
+      throw new Error(err.error || t('common.unknown'))
     }
 
     const result = await res.json()
@@ -2800,6 +3869,7 @@ document.getElementById('wizardNextBtn').addEventListener('click', async () => {
       const detail = await detailRes.json()
       generatedClaudeMd = detail.claudeMd || detail.content || ''
       generatedSoulMd = detail.soulMd || ''
+      wizardTextsLoaded = true
     }
 
     statusEl.textContent = t('kanban.breakdown.running')
@@ -2830,8 +3900,17 @@ document.getElementById('wizardNextBtn').addEventListener('click', async () => {
       updateWizardUI()
     }, 600)
   } catch (err) {
-    showToast(`Hiba: ${err.message}`)
-    wizardStep = 1
+    showToast(`${t('common.error')}: ${err.message}`)
+    // Back to step 1 only when the create POST itself failed. Once the agent exists, a later error (detail fetch,
+    // avatar) goes on to its review: step 1 would only offer to create it again (#2845).
+    if (wizardCreatedName) {
+      wizardStep = 3
+      document.getElementById('wizardClaudeMd').value = generatedClaudeMd
+      document.getElementById('wizardSoulMd').value = generatedSoulMd
+      renderWizardPendingBanner()
+    } else {
+      wizardStep = 1
+    }
     updateWizardUI()
   }
 })
@@ -2856,20 +3935,24 @@ document.getElementById('wizardCreateBtn').addEventListener('click', async () =>
   createBtn.querySelector('.btn-loading').hidden = false
 
   try {
-    // Update with edited content
+    // Update with edited content. A text that never loaded and is still empty is left out: the server keeps the
+    // generated file for an omitted field, while an empty string would overwrite it (#2845).
+    const edits = {}
+    if (wizardTextsLoaded || claudeMd) edits.claudeMd = claudeMd
+    if (wizardTextsLoaded || soulMd) edits.soulMd = soulMd
     const res = await fetch(`api/agents/${encodeURIComponent(name)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ claudeMd, soulMd }),
+      body: JSON.stringify(edits),
     })
 
     if (!res.ok) {
       const err = await res.json()
-      throw new Error(err.error || 'Ismeretlen hiba')
+      throw new Error(err.error || t('common.unknown'))
     }
 
     closeModal(agentWizardOverlay)
-    showToast('Ugynok letrehozva. Kosd be a csatornat a parosatashoz.')
+    showToast(t('agents.wizard.created'))
     await loadAgents()
     // Drop the operator straight into the Telegram tab of the new agent so
     // the pairing step is in front of them -- easy to miss otherwise.
@@ -2878,7 +3961,7 @@ document.getElementById('wizardCreateBtn').addEventListener('click', async () =>
       switchAgentTab('channel')
     } catch { /* detail open failed, list refresh already happened */ }
   } catch (err) {
-    showToast(`Hiba: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`)
   } finally {
     createBtn.disabled = false
     createBtn.querySelector('.btn-text').hidden = false
@@ -2888,9 +3971,68 @@ document.getElementById('wizardCreateBtn').addEventListener('click', async () =>
 
 // === Toast ===
 function showToast(msg, duration = 3000) {
+  // Some callers pass a type word ('error') where the duration goes. The delay was then NaN, which setTimeout runs
+  // at once: the toast was gone before it could be seen. Anything but a finite number means the default.
+  if (typeof duration !== 'number' || !Number.isFinite(duration)) duration = 3000
   toast.textContent = msg
   toast.classList.add('visible')
-  setTimeout(() => toast.classList.remove('visible'), duration)
+  setTimeout(() => toast.classList.remove('visible'), toastDuration(msg, duration))
+}
+
+// A long message (a refusal with its reason and the steps to fix it) needs more
+// than the default 3 s to be read: about 60 ms per character, at most 15 s. Never
+// shorter than the duration the caller asked for.
+function toastDuration(msg, duration) {
+  return Math.max(duration, Math.min(15000, String(msg ?? '').length * 60))
+}
+
+// The server's answer decides what an action toast says (#2424-#2427): a refused
+// request is never shown as done. readActionReply() keeps the status and the JSON
+// body (an empty object when there is none). refusalReason() is the text for a
+// refusal: the owner-session refusal in the page language (the server's English
+// text is written for API callers), otherwise the server's own reason, otherwise
+// the HTTP status.
+async function readActionReply(res) {
+  const body = await res.json().catch(() => null)
+  return { ok: res.ok, status: res.status, body: body && typeof body === 'object' ? body : {} }
+}
+
+// OWNERGATE2-1104: a strict owner gate refused and no dashboard login exists yet (setup_required: true). Signing in
+// cannot help then, so the text says to CREATE the login first, and the create-login form is opened for it.
+function ownerSessionText(body) {
+  if (!body || body.code !== 'owner_session_required') return ''
+  if (body.setup_required === true) {
+    openCreateLoginSettings()
+    return t('common.owner_login_setup_required')
+  }
+  return t('common.owner_session_required')
+}
+
+// OWNERGATE2-1104: opens the create-login form (renderCreateLoginForm), which lives only in the Dashboard login card on
+// Settings, the Security tab: the same way the setup banner's button gets there. Open modals close through their own
+// guard first (unsaved input asks; a modal kept open keeps the user where they are). The onboarding overlay is only
+// hidden for this page load, never dismissed, so it comes back on the next load once the login exists.
+let createLoginOpening = false
+async function openCreateLoginSettings() {
+  if (createLoginOpening) return
+  createLoginOpening = true
+  try {
+    for (const ov of document.querySelectorAll('.modal-overlay.active')) {
+      if (ov.id === 'onboardingOverlay') { ov.classList.remove('active'); ov.hidden = true; document.body.style.overflow = ''; continue }
+      await requestOverlayClose(ov)
+      if (ov.classList.contains('active')) return
+    }
+    try { localStorage.setItem(SETTINGS_ACTIVE_TAB_KEY, 'security') } catch { /* storage blocked */ }
+    if (typeof switchPage === 'function') switchPage('settings')
+    const link = document.querySelector('.sb-link[data-page="settings"]')
+    if (link) { document.querySelectorAll('.sb-link').forEach((l) => l.classList.remove('active')); link.classList.add('active') }
+  } finally {
+    createLoginOpening = false
+  }
+}
+
+function refusalReason(res, body) {
+  return ownerSessionText(body) || (body && typeof body.error === 'string' && body.error) || ('HTTP ' + res.status)
 }
 
 // === Agents API ===
@@ -2899,15 +4041,26 @@ async function loadAgents() {
     // The federation status fetch is deliberately failure-proof (.catch ->
     // null): it must NEVER take down the Agents page -- including on an
     // older backend where the route 404s.
-    const [agentsRes, marveenRes, fedStatus] = await Promise.all([
+    const [agentsRes, marveenRes, fedStatus, ctxGuard] = await Promise.all([
       fetch('api/agents'),
       fetch('api/marveen'),
       fetch('api/federation/status').then((r) => (r.ok ? r.json() : null)).catch(() => null),
+      // Same failure-proofing as federation status above: an older backend or a
+      // transient error here must not take down the whole Agents page over a
+      // badge.
+      fetch('api/context-guard').then((r) => (r.ok ? r.json() : null)).catch(() => null),
     ])
     agents = await agentsRes.json()
     if (fedStatus && Array.isArray(fedStatus.peers)) federatedPeerStatus = fedStatus.peers
+    contextGuardPct = {}
+    if (ctxGuard && Array.isArray(ctxGuard.agents)) {
+      for (const g of ctxGuard.agents) {
+        if (typeof g.pct === 'number' && isFinite(g.pct)) contextGuardPct[g.agent] = g.pct
+      }
+    }
     if (marveenRes.ok) {
       window._marveen = await marveenRes.json()
+      updateMainChannelUnconfBanner(window._marveen)
       // A backend CHANNEL_PROVIDER-éhez igazitsuk a kliens-default-ot,
       // hogy ne 'telegram' jelenjen meg amikor a backend discord-on van.
       if (window._marveen?.channelProvider) {
@@ -2929,6 +4082,24 @@ function formatContextTokens(n) {
   if (n < 1000) return `${n} token`
   const k = n / 1000
   return `≈${k < 10 ? k.toFixed(1) : Math.round(k)}k token`
+}
+
+// Small "context window used" badge for an Agents-grid card, sourced from
+// contextGuardPct (populated in loadAgents from /api/context-guard -- the
+// same measurement the context-guard runner itself acts on, so this reads
+// the identical number a [CONTEXT-GUARD] restart would fire on, not a
+// second, potentially-drifting calculation).
+// Empty string when there is nothing to show (guard disabled, agent not
+// running, or the measurement genuinely failed) -- no badge is better than a
+// misleading "0%".
+function contextPctBadgeHtml(agentName) {
+  const pct = contextGuardPct[agentName]
+  if (typeof pct !== 'number' || !isFinite(pct) || pct < 0) return ''
+  const pctRound = Math.round(pct * 100)
+  // Mirrors context-guard's own default tiers (actPct 0.90, hardPct 0.97):
+  // green under act, amber from act to hard, red at/over hard.
+  const tier = pct >= 0.97 ? 'danger' : pct >= 0.90 ? 'warning' : 'ok'
+  return `<span class="agent-ctx-badge ${tier}" title="${escapeHtml(t('agents.context_tip', { pct: pctRound }))}">${pctRound}%</span>`
 }
 
 // Populate the auto-restart controls + context display from an agent payload.
@@ -2968,6 +4139,167 @@ function setupAutoRestartUI(agent) {
     schedKind.dataset.wired = '1'
   }
 }
+
+// ---- context-guard UI -------------------------------------------------------
+
+const CG_PHASE_LABELS = {
+  idle: 'idle',
+  'await-handoff': 'handoff',
+  'await-ready': 'restarting',
+  cooldown: 'cooldown',
+}
+
+// One-sentence tooltips for the phase badge (CGBADGE908) -- the context badge
+// already had one (agents.context_tip), the phase badge had none, and the
+// owner had to ask what "cooldown" meant.
+const CG_PHASE_TIPS = {
+  'await-handoff': 'agents.guard_phase_tip_handoff',
+  'await-ready': 'agents.guard_phase_tip_restarting',
+  cooldown: 'agents.guard_phase_tip_cooldown',
+}
+
+async function setupContextGuardUI(agentName) {
+  const cgEnabled = document.getElementById('cgEnabled')
+  const cgAdvancedWrap = document.getElementById('cgAdvancedWrap')
+  if (!cgEnabled || !cgAdvancedWrap) return
+
+  if (cgEnabled.dataset.wired !== '1') {
+    cgEnabled.addEventListener('change', () => {
+      cgAdvancedWrap.hidden = !cgEnabled.checked
+    })
+    cgEnabled.dataset.wired = '1'
+  }
+
+  const cgActPct = document.getElementById('cgActPct')
+  const cgHardPct = document.getElementById('cgHardPct')
+  const cgValidationHint = document.getElementById('cgValidationHint')
+  const validatePcts = () => {
+    const invalid = Number(cgHardPct.value) < Number(cgActPct.value)
+    if (cgValidationHint) cgValidationHint.style.display = invalid ? '' : 'none'
+  }
+  if (cgActPct && cgActPct.dataset.cgwired !== '1') {
+    cgActPct.addEventListener('input', validatePcts)
+    cgHardPct.addEventListener('input', validatePcts)
+    cgActPct.dataset.cgwired = '1'
+  }
+
+  try {
+    const r = await fetch(`api/agents/${encodeURIComponent(agentName)}/context-guard`)
+    if (!r.ok) return
+    const body = await r.json()
+    const cfg = body.contextGuard || {}
+    cgEnabled.checked = cfg.enabled === true
+    cgAdvancedWrap.hidden = !cgEnabled.checked
+    const cgLimitTokens = document.getElementById('cgLimitTokens')
+    if (cgLimitTokens) cgLimitTokens.value = cfg.limitTokens ? String(cfg.limitTokens) : ''
+    if (cgActPct) cgActPct.value = cfg.actPct != null ? Math.round(cfg.actPct * 100) : 90
+    if (cgHardPct) cgHardPct.value = cfg.hardPct != null ? Math.round(cfg.hardPct * 100) : 97
+    const cgCooldownMinutes = document.getElementById('cgCooldownMinutes')
+    if (cgCooldownMinutes) cgCooldownMinutes.value = cfg.cooldownMinutes ?? 15
+    const cgHandoffTimeout = document.getElementById('cgHandoffTimeout')
+    if (cgHandoffTimeout) cgHandoffTimeout.value = cfg.handoffTimeoutMinutes ?? 20
+  } catch { /* silent */ }
+
+  updateContextGuardLiveStatus(agentName)
+}
+
+function updateContextGuardLiveStatus(agentName) {
+  const liveEl = document.getElementById('cgLiveStatus')
+  const phaseEl = document.getElementById('cgPhaseDisplay')
+  const pctEl = document.getElementById('cgPctDisplay')
+  if (!liveEl || !phaseEl || !pctEl) return
+  fetch('api/context-guard')
+    .then(r => r.ok ? r.json() : null)
+    .then(body => {
+      if (!body || !Array.isArray(body.agents)) return
+      const entry = body.agents.find(a => a.agent === agentName)
+      if (!entry) return
+      liveEl.style.display = ''
+      phaseEl.textContent = CG_PHASE_LABELS[entry.phase] || entry.phase || '-'
+      pctEl.textContent = typeof entry.pct === 'number' ? Math.round(entry.pct * 100) + '%' : '-'
+    })
+    .catch(() => {})
+}
+
+;(function startContextGuardPoll() {
+  function poll() {
+    fetch('api/context-guard')
+      .then(r => r.ok ? r.json() : null)
+      .then(body => {
+        if (!body || !Array.isArray(body.agents)) return
+        body.agents.forEach(entry => {
+          const card = document.querySelector(`.agent-card[data-name="${CSS.escape(entry.agent)}"]`)
+          if (!card) return
+          let badge = card.querySelector('.ctx-guard-badge')
+          const active = entry.phase && entry.phase !== 'idle'
+          if (!active) { if (badge) badge.remove(); return }
+          if (!badge) {
+            badge = document.createElement('span')
+            badge.className = 'ctx-guard-badge'
+            badge.style.cssText = 'font-size:10px;padding:1px 5px;border-radius:10px;background:var(--accent-warning,#f59e0b);color:#000;margin-left:4px;font-weight:600'
+            const footer = card.querySelector('.agent-card-footer')
+            if (footer) footer.appendChild(badge)
+          }
+          // CGBADGE908: the phase badge never appends the context pct -- the
+          // card already has its own context badge, and "cooldown 19%" read as
+          // a cooldown position while 19 was the context fill measured at a
+          // different poll instant (so the same number appeared twice on one
+          // card with two values). In cooldown the number is what the word
+          // promises: the remaining time.
+          let cgLabel = CG_PHASE_LABELS[entry.phase] || entry.phase
+          if (entry.phase === 'cooldown' && typeof entry.cooldownUntilMs === 'number') {
+            const minLeft = Math.max(0, Math.ceil((entry.cooldownUntilMs - Date.now()) / 60000))
+            cgLabel += ` ${minLeft}m`
+          }
+          badge.textContent = cgLabel
+          const cgTipKey = CG_PHASE_TIPS[entry.phase]
+          badge.title = cgTipKey ? t(cgTipKey) : ''
+        })
+        if (currentAgent && document.getElementById('cgLiveStatus')) {
+          updateContextGuardLiveStatus(currentAgent.autoRestartId || currentAgent.name)
+        }
+      })
+      .catch(() => {})
+  }
+  setInterval(poll, 30_000)
+})()
+
+document.getElementById('saveContextGuardBtn').addEventListener('click', async () => {
+  if (!currentAgent) return
+  const id = currentAgent.autoRestartId || currentAgent.name
+  const cgEnabled = document.getElementById('cgEnabled')
+  const cgActPct = document.getElementById('cgActPct')
+  const cgHardPct = document.getElementById('cgHardPct')
+  const cgCooldownMinutes = document.getElementById('cgCooldownMinutes')
+  const cgHandoffTimeout = document.getElementById('cgHandoffTimeout')
+  const cgLimitTokensEl = document.getElementById('cgLimitTokens')
+
+  const actPct = Number(cgActPct.value) / 100
+  const hardPct = Number(cgHardPct.value) / 100
+  if (hardPct < actPct) {
+    showToast(t('agents.settings.ctx_guard_pct_hint'))
+    return
+  }
+
+  const limitTokensRaw = cgLimitTokensEl ? cgLimitTokensEl.value.trim() : ''
+  const cfg = {
+    enabled: cgEnabled.checked,
+    actPct,
+    hardPct,
+    cooldownMinutes: Number(cgCooldownMinutes.value) || 15,
+    handoffTimeoutMinutes: Number(cgHandoffTimeout.value) || 20,
+    limitTokens: limitTokensRaw ? Number(limitTokensRaw) : null,
+  }
+  try {
+    const res = await fetch(`api/agents/${encodeURIComponent(id)}/context-guard`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cfg),
+    })
+    if (!res.ok) throw new Error()
+    showToast(t('agents.toast.ctx_guard_saved'))
+  } catch { showToast(t('common.error_save')) }
+})
 
 // Populate the idle-flush controls from an agent payload. Same source as
 // setupAutoRestartUI (the agent detail carries contextGuard alongside
@@ -3027,6 +4359,7 @@ async function openMarveenDetail() {
   // Reuse the agent detail modal for Marveen
   currentAgent = { ...m, name: mainAgentId(), claudeMd: '', soulMd: '', mcpJson: '', skills: [] }
   setupAutoRestartUI(currentAgent)
+  setupContextGuardUI(agentApiName())
   setupIdleFlushUI(currentAgent)
 
   const displayName = m.name || 'Marveen'
@@ -3037,7 +4370,10 @@ async function openMarveenDetail() {
   document.getElementById('agentDetailName').textContent = displayName
   document.getElementById('agentDetailDesc').textContent = m.description || ''
   document.getElementById('agentDetailModel').textContent = m.model || '-'
-  document.getElementById('agentDetailChStatus').innerHTML = `<span class="tg-status"><span class="tg-dot connected"></span>${t('agents.channel.connected')}</span>`
+  // CHANNELUNCONF1110: it said "connected" unconditionally, also on an install whose channel has no token.
+  document.getElementById('agentDetailChStatus').innerHTML = m.mainChannelUnconfigured
+    ? `<span class="tg-status"><span class="tg-dot"></span>${t('agents.channel.not_configured')}</span>`
+    : `<span class="tg-status"><span class="tg-dot connected"></span>${t('agents.channel.connected')}</span>`
   // Populate the Skills tab for the main agent too: the endpoint returns the
   // global ~/.claude/skills under its real id (agentId), which every agent
   // inherits. Previously this was hard-set to '-' and loadSkills was never
@@ -3094,6 +4430,8 @@ async function openMarveenDetail() {
     }
   } catch {}
   applyMarveenReadonlyMode(true)
+  // The main agent's voice reply section stayed blank: only the sub-agent detail loaded it (#2848).
+  loadVoiceConfig(mainAgentId())
 
   // Telegram tab -- without this the tab stays in the default "not connected"
   // view even though the bot is running and receiving messages.
@@ -3159,6 +4497,20 @@ function applyMarveenReadonlyMode(readOnly) {
   if (authModeGroup) authModeGroup.hidden = readOnly
   const memoryIsolationGroup = document.getElementById('memoryIsolationGroup')
   if (memoryIsolationGroup) memoryIsolationGroup.hidden = readOnly
+  // #2727: the security profile and the Claude plan are per SUB-agent settings. openMarveenDetail never fills
+  // their selects, so for the main agent they showed whatever the last opened sub-agent left there (or an empty
+  // select on a fresh load), above a Save button that returns early for role 'main'. Hidden here, the one hook
+  // both open paths run; openAgentDetail used to hide the plan group itself, which the main agent never reached.
+  for (const id of ['securityProfileGroup', 'claudePlanGroup']) {
+    const group = document.getElementById(id)
+    if (group) group.hidden = readOnly
+  }
+  // MAINAUTHSWITCH1107: the main agent's own authentication switch, on the main agent card only
+  const mainAuthGroup = document.getElementById('mainAuthGroup')
+  if (mainAuthGroup) {
+    mainAuthGroup.hidden = !readOnly
+    if (readOnly) loadMainAuthPanel()
+  }
   const note = document.getElementById('marveenReadonlyNote')
   if (note) note.hidden = !readOnly
 }
@@ -3238,12 +4590,13 @@ function renderAgents() {
       <div class="agent-card-top">
         <div class="agent-avatar gradient-1"><img src="api/marveen/avatar${avatarBust()}" alt="${escapeHtml(displayName)}"></div>
         <div class="agent-card-info">
-          <div class="agent-name">${escapeHtml(displayName)} <span class="marveen-badge">${t('agents.main_badge')}</span></div>
+          <div class="agent-name">${escapeHtml(displayName)}${m.nickname ? ` <span class="agent-nickname">${escapeHtml(m.nickname)}</span>` : ''} <span class="marveen-badge">${t('agents.main_badge')}</span></div>
           <div class="agent-desc">${escapeHtml(m.description || '')}</div>
         </div>
       </div>
       <div class="agent-card-footer">
         <span class="agent-model-badge ${escapeHtml(mainModelClass)}">${escapeHtml(mainModelLabel)}</span>
+        ${contextPctBadgeHtml(mainAgentId())}
         <span class="process-indicator" title="${t('agents.marveen_process_tip')}"><span class="process-dot running"></span>${t('agents.status.running')}</span>
         <span class="tg-status" title="${t('agents.marveen_channel_tip')}"><span class="tg-dot connected"></span>${t('agents.status.online')}</span>
       </div>
@@ -3257,6 +4610,7 @@ function renderAgents() {
           Terminal
         </button>
       </div>
+      <div class="agent-card-activity"></div>
     `
     mCard.querySelector('.agent-terminal-btn')?.addEventListener('click', (e) => {
       e.stopPropagation(); openTerminalModal(mainAgentId())
@@ -3264,18 +4618,23 @@ function renderAgents() {
     mCard.querySelector('.agent-conversation-btn')?.addEventListener('click', (e) => {
       e.stopPropagation(); openConversationModal(mainAgentId(), t('agents.marveen_boss'))
     })
-    mCard.addEventListener('click', () => openMarveenDetail())
+    mCard.addEventListener('click', () => onAgentCardClick(mainAgentId(), openMarveenDetail))
     agentsGrid.insertBefore(mCard, addBtn)
   }
 
   for (const agent of agents) {
+    // Skip the main agent — it is already rendered as the dedicated Marveen
+    // card above (window._marveen block). Without this guard a second card
+    // appears once the agents/atlas/ config directory is created.
+    if (agent.name === mainAgentId()) continue
+
     // agent.name is the sanitized id (API/filesystem); displayName keeps the
     // original accented/cased input the user typed.
     const label = agent.displayName || agent.name
     const card = document.createElement('div')
     card.className = 'agent-card'
     card.dataset.name = agent.name
-    const initial = label.charAt(0).toUpperCase()
+    const initial = escapeHtml(label.charAt(0).toUpperCase())
     const gradientClass = getAvatarGradient(agent.name)
     const avatarHtml = (agent.hasImage || agent.hasAvatar)
       ? `<img src="api/agents/${encodeURIComponent(agent.name)}/avatar${avatarBust()}" alt="${escapeHtml(label)}">`
@@ -3283,7 +4642,7 @@ function renderAgents() {
 
     const modelClass = agent.model && agent.model !== 'inherit' ? agent.model : ''
     const modelLabel = agent.model || 'inherit'
-    const chConnected = agentIsConnected(agent)
+    const chConnected = agentOwnChannelConnected(agent)
     const chDotClass = chConnected ? 'connected' : 'disconnected'
     const chLabel = chConnected ? t('agents.status.online') : t('agents.status.offline')
     const isRunning = agent.running || false
@@ -3294,12 +4653,17 @@ function renderAgents() {
       <div class="agent-card-top">
         <div class="agent-avatar ${gradientClass}">${avatarHtml}</div>
         <div class="agent-card-info">
-          <div class="agent-name">${escapeHtml(label)}</div>
+          <div class="agent-name">${escapeHtml(label)}${agent.nickname ? ` <span class="agent-nickname">${escapeHtml(agent.nickname)}</span>` : ''}</div>
           <div class="agent-desc">${escapeHtml(agent.description || '')}</div>
         </div>
       </div>
       <div class="agent-card-footer">
-        <span class="agent-model-badge ${escapeHtml(modelClass)}">${escapeHtml(modelLabel)}</span>
+        ${agent.missingCustomProvider || agent.brokenCustomModel
+          ? `<span class="agent-model-badge provider-missing" title="${escapeHtml(agent.missingCustomProvider
+              ? t('agents.model.provider_missing_card', { id: agent.missingCustomProvider })
+              : t('agents.model.custom_model_broken', { model: agent.brokenCustomModel }))}">⚠ ${escapeHtml(modelLabel)}</span>`
+          : `<span class="agent-model-badge ${escapeHtml(modelClass)}">${escapeHtml(modelLabel)}</span>`}
+        ${contextPctBadgeHtml(agent.name)}
         <span class="process-indicator" title="${escapeHtml(processTip(isRunning))}"><span class="process-dot ${runDotClass}"></span>${runLabel}</span>
         <span class="tg-status" title="${escapeHtml(channelTip(chConnected))}"><span class="tg-dot ${chDotClass}"></span>${chLabel}</span>
       </div>
@@ -3307,6 +4671,10 @@ function renderAgents() {
         <div class="agent-reauth-banner">
           <span class="agent-reauth-reason">${escapeHtml(agent.reauthReason || t('agents.reauth.reason'))}</span>
           <button class="btn-danger btn-compact agent-login-btn" data-phase="start">${t('agents.btn.login')}</button>
+        </div>` : ''}
+      ${Array.isArray(agent.sharedEnvAuthKeys) && agent.sharedEnvAuthKeys.length ? `
+        <div class="agent-sharedenv-banner" title="${escapeHtml(t('agents.sharedEnvAuth.tip'))}">
+          <span class="agent-sharedenv-text">${escapeHtml(t('agents.sharedEnvAuth.label'))}: ${escapeHtml(agent.sharedEnvAuthKeys.join(', '))}</span>
         </div>` : ''}
       <div class="agent-card-actions">
         <button class="btn-secondary btn-compact agent-conversation-btn" title="${t('agents.btn.conversation')}">
@@ -3318,6 +4686,7 @@ function renderAgents() {
           Terminal
         </button>
       </div>
+      <div class="agent-card-activity"></div>
     `
     // Login button handler (start → confirm flow)
     card.querySelectorAll('.agent-login-btn').forEach(btn => {
@@ -3331,7 +4700,7 @@ function renderAgents() {
     card.querySelector('.agent-conversation-btn')?.addEventListener('click', (e) => {
       e.stopPropagation(); openConversationModal(agent.name, label)
     })
-    card.addEventListener('click', () => openAgentDetail(agent.name))
+    card.addEventListener('click', () => onAgentCardClick(agent.name, () => openAgentDetail(agent.name)))
     // Only running agents have a live session to look at, so only they get the
     // copy-the-tmux-command buttons.
     if (isRunning) attachTmuxCopyButtons(card, agent)
@@ -3352,6 +4721,14 @@ function renderAgents() {
 // endpoint. The main (Marveen) card matches on mainAgentId(); sub-agent cards
 // match on their data-name.
 let agentsBusyTimer = null
+// Last known 'working' ids from the poll below. Shared with the org chart so a
+// re-render (which rebuilds every node) keeps the active border instead of
+// blinking it off until the next 3s tick.
+let _workingAgentIds = new Set()
+// Ids whose tmux session is up. Decides whether an "Aktivitás"-mode card opens
+// the terminal on click, the same rule the Activity page used (a stopped agent
+// has no session to look at, so its card was not clickable).
+let _liveAgentIds = new Set()
 function startAgentsBusyPoll() {
   refreshAgentTerminalBusy()
   if (agentsBusyTimer) clearInterval(agentsBusyTimer)
@@ -3360,8 +4737,22 @@ function startAgentsBusyPoll() {
 function stopAgentsBusyPoll() {
   if (agentsBusyTimer) { clearInterval(agentsBusyTimer); agentsBusyTimer = null }
 }
+// The poll only serves the Overview and Agents pages, and a hidden tab needs
+// neither: stop it while the tab is hidden, and when the tab is shown again on
+// one of those pages, restart it (startAgentsBusyPoll refreshes at once).
+// Same rule as the kanban auto-refresh.
+function agentsBusyPollPageOpen() {
+  return ['overviewPage', 'agentsPage'].some((id) => {
+    const page = document.getElementById(id)
+    return !!page && !page.hidden
+  })
+}
+function onAgentsBusyPollVisibility() {
+  if (document.hidden) stopAgentsBusyPoll()
+  else if (agentsBusyPollPageOpen()) startAgentsBusyPoll()
+}
+document.addEventListener('visibilitychange', onAgentsBusyPollVisibility)
 async function refreshAgentTerminalBusy() {
-  if (!agentsGrid) return
   let entries
   try {
     const res = await fetch('api/agents/activity')
@@ -3369,15 +4760,40 @@ async function refreshAgentTerminalBusy() {
     entries = await res.json()
   } catch { return }
   if (!Array.isArray(entries)) return
-  const stateByName = new Map(entries.map((e) => [e.name, e.state]))
+  const byName = new Map(entries.filter((e) => e && e.name).map((e) => [e.name, e]))
+  _workingAgentIds = new Set(entries.filter((e) => e && e.state === 'working').map((e) => e.name))
+  _liveAgentIds = new Set(entries.filter((e) => e && e.running).map((e) => e.name))
   const mainId = mainAgentId()
-  agentsGrid.querySelectorAll('.agent-card:not(.add-card)').forEach((card) => {
-    const btn = card.querySelector('.agent-terminal-btn')
-    if (!btn) return
-    const id = card.classList.contains('marveen-card') ? mainId : card.dataset.name
-    const working = !!id && stateByName.get(id) === 'working'
-    btn.classList.toggle('agent-terminal-btn--busy', working)
-  })
+  if (agentsGrid) {
+    agentsGrid.querySelectorAll('.agent-card:not(.add-card):not(.federated-agent-card)').forEach((card) => {
+      const id = card.classList.contains('marveen-card') ? mainId : card.dataset.name
+      const entry = id ? byName.get(id) : null
+      const working = !!entry && entry.state === 'working'
+      const btn = card.querySelector('.agent-terminal-btn')
+      if (btn) btn.classList.toggle('agent-terminal-btn--busy', working)
+      // "Aktivitás" card mode: the live body plus the state colour and the
+      // clickable affordance. Written on every tick regardless of the current
+      // mode, so switching modes shows the current state instead of a blank
+      // card waiting for the next poll.
+      const body = card.querySelector('.agent-card-activity')
+      if (body) body.innerHTML = entry ? agentActivityBodyHtml(entry) : ''
+      const stateCls = entry ? (ACTIVITY_STATE_META[activityDisplayState(entry)] || ACTIVITY_STATE_META.unknown).cls : 'act-unknown'
+      for (const meta of Object.values(ACTIVITY_STATE_META)) card.classList.remove(meta.cls)
+      card.classList.add(stateCls)
+      card.classList.toggle('agent-card-act-clickable', !!entry && !!entry.running)
+    })
+  }
+  // Org-chart view: same signal, painted as the node's border. Toggled in place
+  // rather than re-rendering, so an in-progress drag survives the tick.
+  // The overview's mini graph is kept live by the same poll while the overview
+  // page is open (switchPage starts it there too).
+  for (const graphId of ['teamGraph', 'overviewTeamGrid']) {
+    const graph = document.getElementById(graphId)
+    if (!graph) continue
+    graph.querySelectorAll('.team-node[data-agent-id]').forEach((el) => {
+      el.classList.toggle('team-node-active', _workingAgentIds.has(el.dataset.agentId))
+    })
+  }
 }
 
 // Federated (remote-system) agents from the manifest-poller cache. Kept in a
@@ -3416,7 +4832,7 @@ function renderFederatedAgentCards(agentsGrid, addBtn) {
       <div class="agent-card-top">
         <div class="agent-avatar ${gradientClass}">${escapeHtml(fa.displayName.charAt(0).toUpperCase())}</div>
         <div class="agent-card-info">
-          <div class="agent-name">${escapeHtml(fa.displayName)} <span class="federated-badge">${t('federation.badge', { peer: fa.peer })}</span></div>
+          <div class="agent-name">${escapeHtml(fa.displayName)} <span class="federated-badge">${t('federation.badge', { peer: escapeHtml(fa.peer) })}</span></div>
           <div class="agent-desc">${escapeHtml(fa.qualified)}</div>
         </div>
       </div>
@@ -3462,7 +4878,7 @@ async function openAgentDetail(agentName) {
   document.getElementById('agentDetailTitle').textContent = detailLabel
 
   // Overview tab
-  const initial = detailLabel.charAt(0).toUpperCase()
+  const initial = escapeHtml(detailLabel.charAt(0).toUpperCase())
   const gradientClass = getAvatarGradient(currentAgent.name)
   const avatar = document.getElementById('agentDetailAvatar')
   avatar.className = 'detail-avatar ' + gradientClass
@@ -3474,38 +4890,59 @@ async function openAgentDetail(agentName) {
   document.getElementById('agentDetailModel').textContent = currentAgent.activeModel || currentAgent.model || 'inherit'
   document.getElementById('agentDetailModelRestarting').hidden = true
 
-  const chConnected = agentIsConnected(currentAgent)
+  const chConnected = agentOwnChannelConnected(currentAgent)
   document.getElementById('agentDetailChStatus').innerHTML = `<span class="tg-status"><span class="tg-dot ${chConnected ? 'connected' : 'disconnected'}"></span>${chConnected ? t('agents.channel.connected') : t('agents.channel.disconnected')}</span>`
 
-  // Settings tab - load Ollama + DeepSeek models then set value
+  // Settings tab - load Ollama + DeepSeek + custom-provider models then set value
   loadAvailableModels()
   loadOllamaModels().then(() => {
     const sel = document.getElementById('editAgentModel')
     const mv = currentAgent.activeModel || currentAgent.model || 'claude-opus-4-8[1m]'
+    const customProviderId = currentAgent.customProvider || null
     // The model <select> is one shared element reused per agent. A manual
-    // OpenRouter id (or openrouter-auto:tier) may not be among the static/auto
-    // options, so setting .value would silently show nothing. Inject THIS
-    // agent's model as a selectable option (cleaning any stale injected ones
-    // first) so every agent always displays its own model, per-agent.
+    // OpenRouter id (or openrouter-auto:tier, or custom model) may not be
+    // among the static/auto options, so setting .value would silently show
+    // nothing. Inject THIS agent's model as a selectable option (cleaning any
+    // stale injected ones first) so every agent always displays its own model.
     Array.from(sel.querySelectorAll('option.dynamic-model-opt')).forEach(o => o.remove())
-    if (!Array.from(sel.options).some(o => o.value === mv)) {
-      const opt = document.createElement('option')
-      opt.value = mv
-      opt.className = 'dynamic-model-opt'
-      opt.textContent = mv.startsWith('openrouter-auto:') ? `🔀 ${mv}` : `🔀 ${mv}`
-      sel.appendChild(opt)
+    if (customProviderId) {
+      // Custom provider: select value is "custom:<providerId>"; model-id in the text input.
+      const cpVal = `custom:${customProviderId}`
+      if (!Array.from(sel.options).some(o => o.value === cpVal)) {
+        const opt = document.createElement('option')
+        opt.value = cpVal
+        opt.className = 'dynamic-model-opt'
+        opt.textContent = `🔧 ${customProviderId}`
+        sel.appendChild(opt)
+      }
+      sel.value = cpVal
+      const modelInput = document.getElementById('editAgentModelCustomModelId')
+      // A model saved as the picker value ("custom:<id>") is no model id: leave the field empty, so a save asks for one.
+      if (modelInput) modelInput.value = mv.startsWith('custom:') ? '' : mv
+    } else {
+      if (!Array.from(sel.options).some(o => o.value === mv)) {
+        const opt = document.createElement('option')
+        opt.value = mv
+        opt.className = 'dynamic-model-opt'
+        opt.textContent = mv.startsWith('openrouter-auto:') ? `🔀 ${mv}` : `🔀 ${mv}`
+        sel.appendChild(opt)
+      }
+      sel.value = mv
     }
-    sel.value = mv
+    // PICKERCLIKAPU923: re-apply the CLI gate AFTER the value is set, so the
+    // agent's current model is never the disabled option regardless of which
+    // of the two async loads finished first (measured in Chromium: a value set
+    // onto a disabled option still reads back, but the order must not matter).
+    if (lastAvailableModelsData) applyClaudeCliGate(lastAvailableModelsData)
+    updateCustomModelIdRow(sel)
+    markMissingCustomProvider(sel, customProviderId, customProviderId ? null : (mv.startsWith('custom:') ? mv : null))
   })
   populateProfileSelect(
     document.getElementById('editAgentProfile'),
     document.getElementById('editAgentProfileDesc'),
     currentAgent.securityProfile || 'default',
   )
-  // The main agent's Claude login is managed via channels.sh, not the per-agent
-  // config path, so plan selection does not apply to it. Hide the whole group.
-  const planGroup = document.getElementById('claudePlanGroup')
-  if (planGroup) planGroup.hidden = currentAgent.role === 'main'
+  // (the main agent has no plan to pick here: applyMarveenReadonlyMode hides the group for it)
   populatePlanSelect(
     document.getElementById('editAgentPlan'),
     document.getElementById('editAgentPlanDesc'),
@@ -3522,6 +4959,7 @@ async function openAgentDetail(agentName) {
 
   // Auto-restart settings + live context size
   setupAutoRestartUI(currentAgent)
+  setupContextGuardUI(currentAgent.autoRestartId || currentAgent.name)
   setupIdleFlushUI(currentAgent)
 
   // Telegram tab
@@ -3542,7 +4980,13 @@ async function openAgentDetail(agentName) {
   // Delete button (restore visibility for normal agents)
   document.getElementById('deleteAgentBtn').style.display = ''
   document.getElementById('deleteAgentBtn').onclick = async () => {
-    if (!confirm(t('agents.confirm.delete', { name: currentAgent.name }))) return
+    const confirmed = await confirmDialog({
+      title: t('agents.confirm.delete_title'),
+      message: t('agents.confirm.delete', { name: currentAgent.name }),
+      okLabel: t('agents.confirm.delete_ok'),
+      danger: true,
+    })
+    if (!confirmed) return
     try {
       await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}`, { method: 'DELETE' })
       closeModal(agentDetailOverlay)
@@ -3561,18 +5005,21 @@ async function openAgentDetail(agentName) {
   // Authorization header and the API would 401 it.
   document.getElementById('exportAgentBtn').onclick = async () => {
     if (!currentAgent) return
-    const withSecrets = confirm(
-      'Belevegyük a titkokat (channel bot token, párosítási állapot)?\n\n' +
-      'OK = igen, csak saját gépek közötti átvitelhez.\n' +
-      'Mégse = nem, biztonságosan megosztható (csak identitás + viselkedés).'
-    )
+    const choice = await askAgentExport({
+      title: t('agents.export.confirm_title'),
+      message: t('agents.export.confirm', { name: currentAgent.name }),
+      okLabel: t('agents.export.confirm_ok'),
+      secretsLabel: t('agents.export.with_secrets'),
+    })
+    if (!choice) return
+    const withSecrets = choice.withSecrets
     const name = currentAgent.name
     const url = `api/agents/${encodeURIComponent(name)}/export${withSecrets ? '?secrets=1' : ''}`
     try {
       const res = await fetch(url)
       if (!res.ok) {
         const data = await res.json().catch(() => ({}))
-        showToast(data.error || 'Hiba az exportálás során')
+        showToast(data.error || t('agents.export.error'))
         return
       }
       const blob = await res.blob()
@@ -3584,9 +5031,9 @@ async function openAgentDetail(agentName) {
       a.click()
       a.remove()
       URL.revokeObjectURL(objectUrl)
-      showToast(`Ügynök exportálva${withSecrets ? ' (titkokkal)' : ''}`)
+      showToast(t(withSecrets ? 'agents.export.done_secrets' : 'agents.export.done'))
     } catch {
-      showToast('Hiba az exportálás során')
+      showToast(t('agents.export.error'))
     }
   }
 
@@ -3824,19 +5271,132 @@ function updateProcessControl(agent) {
   }
 }
 
+// RESTARTFORCEUI1018: the server refuses a manual main restart while the pane is busy or unreadable (409
+// restart-blocked, manual-restart-gate.ts), so a click never cuts a running turn by accident. A stuck main
+// agent can read busy for good, so the refusal is not the end: a second confirm sends an explicit force.
+// MAINAUTHSWITCH1107 (APIKULCSINDITAS1004 D): the main agent's authentication switch. Reads the main agent's detail
+// (authMode, hasApiKey, mainAuthLaunched = what the last launch ran on), saves through the owner-gated PUT, then
+// restarts through the same gated path as the restart button.
+function mainAuthSelected() {
+  return document.querySelector('input[name="mainAuthMode"]:checked')?.value || 'shared'
+}
+function renderMainAuthSections() {
+  const api = mainAuthSelected() === 'api'
+  document.getElementById('mainAuthApiSection').hidden = !api
+}
+function mainAuthRunningText(d) {
+  const l = d && d.mainAuthLaunched
+  if (!l || !l.effective) return t('agents.main_auth.running_unknown')
+  const base = t('agents.main_auth.running_' + l.effective)
+  if (l.configured === 'api' && l.effective !== 'api' && l.conflict) {
+    const reason = t('agents.main_auth.reason_' + String(l.conflict).replace(/-/g, '_'))
+    return t('agents.main_auth.not_honoured').replace('{reason}', reason) + ' ' + base
+  }
+  return base
+}
+async function loadMainAuthPanel() {
+  const group = document.getElementById('mainAuthGroup')
+  if (!group) return
+  document.getElementById('mainAuthError').hidden = true
+  document.getElementById('mainAuthApiKey').value = ''
+  let d = null
+  try {
+    const res = await fetch(`api/agents/${encodeURIComponent(mainAgentId())}`)
+    if (res.ok) d = await res.json()
+  } catch { /* shown as unknown */ }
+  const mode = d && d.authMode === 'api' ? 'api' : 'shared'
+  for (const r of document.querySelectorAll('input[name="mainAuthMode"]')) r.checked = r.value === mode
+  const status = document.getElementById('mainAuthKeyStatus')
+  status.textContent = d && d.hasApiKey ? t('agents.main_auth.key_stored') : t('agents.main_auth.key_missing')
+  status.style.color = d && d.hasApiKey ? 'var(--success)' : 'var(--warning)'
+  document.getElementById('mainAuthRunning').textContent = mainAuthRunningText(d)
+  renderMainAuthSections()
+}
+document.querySelectorAll('input[name="mainAuthMode"]').forEach((r) => r.addEventListener('change', renderMainAuthSections))
+
+document.getElementById('mainAuthApplyBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('mainAuthApplyBtn')
+  const errorDiv = document.getElementById('mainAuthError')
+  errorDiv.hidden = true
+  const mode = mainAuthSelected()
+  const payload = { authMode: mode }
+  const key = document.getElementById('mainAuthApiKey').value.trim()
+  if (mode === 'api' && key) payload.apiKey = key
+  btn.disabled = true
+  try {
+    const res = await fetch(`api/agents/${encodeURIComponent(mainAgentId())}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    const reply = await readActionReply(res)
+    if (!reply.ok) {
+      errorDiv.textContent = refusalReason(res, reply.body)
+      errorDiv.hidden = false
+      return
+    }
+    document.getElementById('mainAuthApiKey').value = ''
+    if (reply.body.verified === false) showToast(t('agents.main_auth.unverified'))
+    const restarted = await restartMainAgentGated()
+    showToast(t(restarted ? 'agents.main_auth.saved_restarting' : 'agents.main_auth.saved_not_restarted'))
+    setTimeout(() => { loadMainAuthPanel() }, 20000)
+    loadMainAuthPanel()
+  } catch (err) {
+    errorDiv.textContent = err && err.message ? err.message : String(err)
+    errorDiv.hidden = false
+  } finally {
+    btn.disabled = false
+  }
+})
+
+
+
+function postMarveenRestart(force) {
+  return force
+    ? fetch('api/marveen/restart', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ force: true }) })
+    : fetch('api/marveen/restart', { method: 'POST' })
+}
+
+// The main agent's gated restart: a busy or unreadable pane asks before forcing (the restart button and the
+// MAINAUTHSWITCH1107 switch share it). Resolves true when restarted, false when the owner declined the force;
+// throws on a failed restart.
+async function restartMainAgentGated() {
+  let res = await postMarveenRestart(false)
+  if (res.status === 409) {
+    const blocked = await res.clone().json().catch(() => ({}))
+    if (blocked.error === 'restart-blocked') {
+      const key = blocked.reason === 'busy' ? 'agents.confirm.force_restart_busy' : 'agents.confirm.force_restart_unreadable'
+      const forced = await confirmDialog({
+        title: t('agents.confirm.hard_restart_title'),
+        message: t(key),
+        okLabel: t('agents.confirm.force_restart_ok'),
+        danger: true,
+      })
+      if (!forced) { showToast(t('agents.toast.restart_not_forced')); return false }
+      res = await postMarveenRestart(true)
+    }
+  }
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || t('agents.toast.restart_failed'))
+  }
+  return true
+}
+
 document.getElementById('marveenRestartBtn').addEventListener('click', async () => {
-  if (!confirm(t('agents.confirm.hard_restart'))) return
+  const confirmed = await confirmDialog({
+    title: t('agents.confirm.hard_restart_title'),
+    message: t('agents.confirm.hard_restart'),
+    okLabel: t('agents.confirm.hard_restart_ok'),
+    danger: true,
+  })
+  if (!confirmed) return
   const btn = document.getElementById('marveenRestartBtn')
   btn.disabled = true
   try {
-    const res = await fetch('api/marveen/restart', { method: 'POST' })
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}))
-      throw new Error(err.error || t('agents.toast.restart_failed'))
-    }
-    showToast(t('agents.toast.marveen_restarted'))
+    if (await restartMainAgentGated()) showToast(t('agents.toast.marveen_restarted'))
   } catch (err) {
-    showToast(`Hiba: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`)
   } finally {
     btn.disabled = false
   }
@@ -3864,7 +5424,7 @@ document.getElementById('agentStartBtn').addEventListener('click', async () => {
     }
     loadAgents()
   } catch (err) {
-    showToast(`Hiba: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`)
   } finally {
     btn.disabled = false
     btn.querySelector('.btn-text').hidden = false
@@ -3874,7 +5434,13 @@ document.getElementById('agentStartBtn').addEventListener('click', async () => {
 
 document.getElementById('agentStopBtn').addEventListener('click', async () => {
   if (!currentAgent) return
-  if (!confirm(t('agents.confirm.stop'))) return
+  const confirmed = await confirmDialog({
+    title: t('agents.confirm.stop_title'),
+    message: t('agents.confirm.stop'),
+    okLabel: t('agents.confirm.stop_ok'),
+    danger: true,
+  })
+  if (!confirmed) return
 
   try {
     const res = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}/stop`, { method: 'POST' })
@@ -3890,7 +5456,7 @@ document.getElementById('agentStopBtn').addEventListener('click', async () => {
     }
     loadAgents()
   } catch (err) {
-    showToast(`Hiba: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`)
   }
 })
 
@@ -3910,6 +5476,8 @@ let currentChannelProvider = 'telegram'
     const res = await fetch('api/marveen')
     if (!res.ok) return
     const data = await res.json()
+    // CHANNELUNCONF1110: the "no channel configured" banner, from the same payload, on every page load.
+    updateMainChannelUnconfBanner(data)
     if (!data.channelProvider || data.channelProvider === currentChannelProvider) return
     currentChannelProvider = data.channelProvider
     const sel = document.getElementById('chProviderSelect')
@@ -3983,11 +5551,60 @@ async function loadOllamaModels() {
 // panel. Backend gates the list behind a vault entry, so an empty array
 // here means the operator has not configured an API key yet -- in that
 // case we hide the optgroup and surface a hint pointing to the Vault page.
+// PICKERCLIKAPU923: the INSTALLED Claude Code CLI decides which Claude ids
+// are launchable (a customer install pins 2.1.110, where claude-fable-5-1 and
+// claude-opus-5-5 answer 400 on the first prompt and the agent goes silently
+// deaf). Two branches, both deliberate:
+//   measured   -> unsupported options are disabled and labelled; the option
+//                 that is an agent's CURRENT model is never disabled, so the
+//                 edit panel keeps showing the real value and a save does not
+//                 silently rewrite it (#751 lesson).
+//   unmeasured -> nothing is filtered (a customer who can pick no model is
+//                 worse off than today) and a visible hint says so.
+let lastAvailableModelsData = null
+function applyClaudeCliGate(data) {
+  if (data) lastAvailableModelsData = data
+  const support = data && data.claudeSupport ? data.claudeSupport : null
+  const cli = data && data.cli ? data.cli : null
+  const selects = [document.getElementById('agentModel'), document.getElementById('editAgentModel')]
+  const hints = [document.getElementById('agentModelCliHint'), document.getElementById('editAgentModelCliHint')]
+  const base = (id) => String(id || '').replace(/\[[^\]]*\]$/, '')
+  const unsupported = new Map()
+  if (support && support.measured && Array.isArray(support.unsupported)) {
+    for (const u of support.unsupported) unsupported.set(u.id, u.minCli)
+  }
+  selects.forEach((sel, i) => {
+    if (!sel) return
+    const hint = hints[i]
+    if (!support || !support.measured) {
+      // Unmeasured: restore any earlier gating, show the hint, filter nothing.
+      Array.from(sel.options).forEach((opt) => {
+        if (opt.dataset.cliGated === '1') { opt.disabled = false; opt.textContent = opt.dataset.cliLabel || opt.textContent; delete opt.dataset.cliGated }
+      })
+      if (hint) { hint.textContent = t('agents.model.cliUnmeasured').replace('{err}', (cli && cli.error) || '?'); hint.style.display = '' }
+      return
+    }
+    if (hint) hint.style.display = 'none'
+    const current = sel.value
+    Array.from(sel.options).forEach((opt) => {
+      if (!String(opt.value).startsWith('claude-')) return
+      const minCli = unsupported.get(base(opt.value))
+      if (opt.dataset.cliGated === '1') { opt.disabled = false; opt.textContent = opt.dataset.cliLabel || opt.textContent; delete opt.dataset.cliGated }
+      if (!minCli) return
+      if (!opt.dataset.cliLabel) opt.dataset.cliLabel = opt.textContent
+      opt.dataset.cliGated = '1'
+      opt.textContent = opt.dataset.cliLabel + ' (' + t('agents.model.cliUnsupported').replace('{v}', support.installedVersion).replace('{min}', minCli) + ')'
+      opt.disabled = opt.value !== current
+    })
+  })
+}
+
 async function loadAvailableModels() {
   try {
     const res = await fetch('api/models/available')
     if (!res.ok) return
     const data = await res.json()
+    applyClaudeCliGate(data)
     const deepseekModels = Array.isArray(data.deepseek) ? data.deepseek : []
     const editGroup = document.getElementById('deepseekModelGroup')
     const wizardGroup = document.getElementById('agentModelDeepseekGroup')
@@ -4008,6 +5625,27 @@ async function loadAvailableModels() {
       }
     }
     if (hint) hint.style.display = deepseekModels.length === 0 ? 'block' : 'none'
+
+    // MiniMax: direct Anthropic-compatible API (no OpenRouter markup), gated
+    // behind MINIMAX_API_KEY same as DeepSeek. Empty array -> hide the group.
+    const minimaxModels = Array.isArray(data.minimax) ? data.minimax : []
+    const editMinimaxGroup = document.getElementById('minimaxModelGroup')
+    const wizardMinimaxGroup = document.getElementById('agentModelMinimaxGroup')
+    for (const group of [editMinimaxGroup, wizardMinimaxGroup]) {
+      if (!group) continue
+      group.innerHTML = ''
+      if (minimaxModels.length === 0) {
+        group.style.display = 'none'
+        continue
+      }
+      group.style.display = ''
+      for (const m of minimaxModels) {
+        const opt = document.createElement('option')
+        opt.value = m.id
+        opt.textContent = m.label
+        group.appendChild(opt)
+      }
+    }
 
     // OpenRouter: two optgroups per select (Auto = weekly-fresh tier
     // recommendation, value `openrouter-auto:<tier>`; Manual = the 2 concrete
@@ -4059,7 +5697,63 @@ async function loadAvailableModels() {
     )
     const orBtn = document.getElementById('openrouterBrowseBtn')
     if (orBtn) orBtn.style.display = (data.openrouterConfigured && isMainAgent) ? '' : 'none'
+
+    // Custom providers: one <option value="custom:<id>"> per defined provider.
+    const customProviders = Array.isArray(data.customProviders) ? data.customProviders : []
+    const cpGroupIds = ['editAgentModelCustomProviderGroup', 'agentModelCustomProviderGroup']
+    for (const gid of cpGroupIds) {
+      const g = document.getElementById(gid)
+      if (!g) continue
+      g.label = '🔧 ' + t('providers.optgroup')
+      g.innerHTML = ''
+      if (customProviders.length === 0) { g.style.display = 'none'; continue }
+      g.style.display = ''
+      for (const p of customProviders) {
+        const opt = document.createElement('option')
+        opt.value = `custom:${p.id}`
+        opt.textContent = `🔧 ${p.label}`
+        g.appendChild(opt)
+      }
+    }
+    updateCustomModelIdRow(document.getElementById('editAgentModel'))
+    updateCustomModelIdRow(document.getElementById('agentModel'))
   } catch { /* dashboard not available */ }
+}
+
+// A provider deleted since the agent got it stays selected, so the agent's real setting shows, but the option and a
+// line under the picker say it is gone: the agent does not start until it gets another model.
+async function markMissingCustomProvider(sel, providerId, brokenModel = null) {
+  const warn = document.getElementById('editAgentModelProviderMissing')
+  if (!warn) return
+  warn.textContent = t('agents.model.provider_missing')
+  warn.hidden = true
+  // A model saved as the picker value with no provider beside it: say so, whatever the provider list holds.
+  // No option is marked: the provider may exist, and picking it again (with a model id) is the fix, so any change hides it.
+  if (brokenModel) {
+    warn.textContent = t('agents.model.custom_model_broken', { model: brokenModel })
+    warn.hidden = false
+    return
+  }
+  if (!providerId) return
+  const agent = currentAgent
+  let ids = null
+  try {
+    const r = await fetch('api/custom-providers')
+    if (r.ok) ids = ((await r.json()).providers || []).map(p => p.id)
+  } catch { /* unknown: say nothing rather than a false alarm */ }
+  if (!ids || ids.includes(providerId) || currentAgent !== agent) return
+  const opt = Array.from(sel.options).find(o => o.value === `custom:${providerId}`)
+  if (opt) { opt.textContent = '🔧 ' + t('agents.model.provider_deleted', { id: providerId }); opt.dataset.deleted = '1' }
+  warn.hidden = sel.selectedOptions[0]?.dataset.deleted !== '1'
+}
+
+function updateCustomModelIdRow(selectEl) {
+  if (!selectEl) return
+  const isEdit = selectEl.id === 'editAgentModel'
+  const rowId = isEdit ? 'editAgentModelCustomModelRow' : 'agentModelCustomModelRow'
+  const row = document.getElementById(rowId)
+  if (!row) return
+  row.style.display = (selectEl.value || '').startsWith('custom:') ? '' : 'none'
 }
 
 // --- OpenRouter manual-list curation (tick models into the shared dropdown) ---
@@ -4168,8 +5862,13 @@ async function toggleCuratedModel(id, name, checked) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id, name, checked }),
     })
-    if (!res.ok) throw new Error('save failed')
-    const data = await res.json()
+    // OWNERGATE3-1104: the server may refuse (403 owner_session_required); say why before the rollback below.
+    const reply = await readActionReply(res)
+    if (!reply.ok) {
+      showToast(t('common.not_done', { msg: refusalReason(res, reply.body) }))
+      throw new Error('save failed')
+    }
+    const data = reply.body
     openrouterCurated = new Set((Array.isArray(data.models) ? data.models : []).map(m => m.id))
     // Repopulate the dropdown "kézi" optgroups without disturbing selections.
     loadAvailableModels()
@@ -4252,18 +5951,32 @@ function startModelRestartPolling(name, expectedModel, triggeredAt) {
   }, 2000)
 }
 
+document.getElementById('editAgentModel').addEventListener('change', () => {
+  const sel = document.getElementById('editAgentModel')
+  updateCustomModelIdRow(sel)
+  document.getElementById('editAgentModelProviderMissing').hidden = sel.selectedOptions[0]?.dataset.deleted !== '1'
+})
+
 document.getElementById('saveModelBtn').addEventListener('click', async () => {
   if (!currentAgent || currentAgent.role === 'main') return
-  const newModel = document.getElementById('editAgentModel').value
+  const selectVal = document.getElementById('editAgentModel').value
+  const isCustom = selectVal.startsWith('custom:')
+  const customProviderId = isCustom ? selectVal.slice('custom:'.length) : null
+  // The model id is required with a custom provider: the picker value ("custom:<id>") used to be saved as the model.
+  const customModelInput = document.getElementById('editAgentModelCustomModelId')
+  const customModelId = isCustom ? customModelInput.value.trim() : ''
+  if (isCustom && !customModelId) { customModelInput.focus(); showToast(t('agents.model.custom_model_required')); return }
+  const newModel = isCustom ? customModelId : selectVal
   const name = currentAgent.name
   try {
     const res = await fetch(`api/agents/${encodeURIComponent(name)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: newModel }),
+      body: JSON.stringify({ model: newModel, customProvider: customProviderId }),
     })
     if (!res.ok) throw new Error()
     currentAgent.model = newModel
+    markFieldSaved(customModelInput)
     const triggeredAt = Math.floor(Date.now() / 1000)
     document.getElementById('agentDetailModelRestarting').hidden = false
     document.getElementById('processLabel').textContent = t('agents.process_label')
@@ -4274,7 +5987,9 @@ document.getElementById('saveModelBtn').addEventListener('click', async () => {
     if (!restartRes.ok) {
       document.getElementById('agentDetailModelRestarting').hidden = true
       if (currentAgent) updateProcessControl(currentAgent)
-      showToast(t('agents.restart_failed'))
+      // RESTARTSTOPPED1005: a deliberately stopped agent is not restarted; the
+      // model is saved and applies at its next start -- not a failure.
+      showToast(t(restartRes.status === 409 ? 'agents.toast.model_saved_stopped' : 'agents.restart_failed'))
       return
     }
     startModelRestartPolling(name, newModel, triggeredAt)
@@ -4322,13 +6037,13 @@ document.getElementById('analyzeAllModelsBtn').addEventListener('click', async (
       html += '<ul style="margin:0 0 10px;padding-left:18px">'
       for (const r of changes) {
         const safeReason = r.reason.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-        html += `<li style="margin-bottom:6px"><strong>${r.agent}</strong>: ${r.currentModel} &rarr; ${r.suggestedModel}`
+        html += `<li style="margin-bottom:6px"><strong>${escapeHtml(r.agent)}</strong>: ${escapeHtml(r.currentModel)} &rarr; ${escapeHtml(r.suggestedModel)}`
         html += ` <details style="display:inline-block;vertical-align:top;margin-left:4px"><summary style="cursor:pointer;font-size:11px;color:var(--text-muted)">${t('agents.model.details')}</summary>`
         html += `<pre style="white-space:pre-wrap;font-size:11px;margin:4px 0 0;background:var(--surface);padding:6px 8px;border-radius:4px;color:var(--text-muted)">${safeReason}</pre></details></li>`
       }
       html += '</ul>'
       if (ok.length > 0) {
-        html += `<p style="color:var(--text-muted);margin:0;font-size:12px">${t('agents.model.ok_agents', { list: ok.map(r => r.agent).join(', ') })}</p>`
+        html += `<p style="color:var(--text-muted);margin:0;font-size:12px">${t('agents.model.ok_agents', { list: escapeHtml(ok.map(r => r.agent).join(', ')) })}</p>`
       }
       html += `<button class="btn-secondary btn-compact" id="createModelChangeCardsBtn" style="margin-top:10px">${t('agents.model.create_cards_btn')}</button>`
     }
@@ -4337,7 +6052,12 @@ document.getElementById('analyzeAllModelsBtn').addEventListener('click', async (
     const createBtn = document.getElementById('createModelChangeCardsBtn')
     if (createBtn) {
       createBtn.addEventListener('click', async () => {
-        if (!confirm(t('agents.model.cards_confirm', { n: changes.length }))) return
+        const confirmed = await confirmDialog({
+          title: t('agents.model.cards_confirm_title'),
+          message: t('agents.model.cards_confirm', { n: changes.length }),
+          okLabel: t('agents.model.cards_confirm_ok'),
+        })
+        if (!confirmed) return
         createBtn.disabled = true
         createBtn.textContent = t('agents.model.creating_cards')
         let created = 0
@@ -4364,21 +6084,38 @@ document.getElementById('analyzeAllModelsBtn').addEventListener('click', async (
   } catch { panel.innerHTML = '<p style="color:var(--error);font-size:13px">' + t('agents.model.error') + '</p>' }
 })
 
+// The export question: export or not, and whether the channel secrets go too. The box starts unticked,
+// and Cancel exports nothing (the native confirm() made Cancel the export without secrets).
+async function askAgentExport({ title, message, okLabel, secretsLabel }) {
+  const label = document.createElement('label')
+  label.className = 'confirm-dialog-check'
+  const box = document.createElement('input')
+  box.type = 'checkbox'
+  const text = document.createElement('span')
+  text.textContent = secretsLabel
+  label.append(box, text)
+  const ok = await confirmDialog({ title, message, okLabel, content: label })
+  return ok ? { withSecrets: box.checked } : null
+}
+
 // === Export ALL agents (whole fleet) into one .tar.gz bundle ===
 const exportAllAgentsBtn = document.getElementById('exportAllAgentsBtn')
 if (exportAllAgentsBtn) {
   exportAllAgentsBtn.addEventListener('click', async () => {
-    const withSecrets = confirm(
-      'Belevegyük a titkokat (channel bot tokenek, párosítási állapot) MINDEN ügynöknél?\n\n' +
-      'OK = igen, csak saját gépek közötti átvitelhez.\n' +
-      'Mégse = nem, biztonságosan megosztható (csak identitás + viselkedés).'
-    )
+    const choice = await askAgentExport({
+      title: t('agents.export_all.confirm_title'),
+      message: t('agents.export_all.confirm'),
+      okLabel: t('agents.export.confirm_ok'),
+      secretsLabel: t('agents.export_all.with_secrets'),
+    })
+    if (!choice) return
+    const withSecrets = choice.withSecrets
     const url = `api/agents/export-all${withSecrets ? '?secrets=1' : ''}`
     try {
       const res = await fetch(url)
       if (!res.ok) {
         const data = await res.json().catch(() => ({}))
-        showToast(data.error || 'Hiba az exportálás során')
+        showToast(data.error || t('agents.export.error'))
         return
       }
       const blob = await res.blob()
@@ -4390,9 +6127,9 @@ if (exportAllAgentsBtn) {
       a.click()
       a.remove()
       URL.revokeObjectURL(objectUrl)
-      showToast(`Flotta exportálva${withSecrets ? ' (titkokkal)' : ''}`)
+      showToast(t(withSecrets ? 'agents.export_all.done_secrets' : 'agents.export_all.done'))
     } catch {
-      showToast('Hiba az exportálás során')
+      showToast(t('agents.export.error'))
     }
   })
 }
@@ -4419,27 +6156,52 @@ if (importAgentBtn && importAgentFile) {
     try {
       let { res, data } = await upload(false)
       if (res.status === 409) {
-        const prompt = data.kind === 'fleet'
-          ? 'Néhány ügynök már létezik ezen a gépen. Felülírjuk az ütközőket?'
-          : `Már létezik "${data.name || ''}" nevű ügynök. Felülírjuk?`
-        if (confirm(prompt)) {
-          ;({ res, data } = await upload(true))
+        // Overwriting deletes the existing agent's folder and puts the bundle's content in its place.
+        let message
+        if (data.kind === 'fleet') {
+          const existing = (data.skipped || []).filter((s) => s.reason === 'already exists').map((s) => s.name)
+          const done = (data.imported || []).length
+          message = t('agents.import.fleet_overwrite_confirm', { list: existing.join(', ') }) + '\n\n' +
+            t('agents.import.fleet_overwrite_effect') +
+            (done ? '\n\n' + t('agents.import.fleet_already_imported', { n: done }) : '')
         } else {
+          // The single-agent 409 carries the name in its error only (importAgentBundle).
+          const m = /^Agent "([^"]+)" already exists/.exec(data.error || '')
+          message = (m ? t('agents.import.overwrite_confirm', { name: m[1] }) : t('agents.import.overwrite_confirm_no_name')) +
+            '\n\n' + t('agents.import.overwrite_effect')
+        }
+        const confirmed = await confirmDialog({
+          title: t('agents.import.overwrite_confirm_title'),
+          message,
+          okLabel: t('agents.import.overwrite_confirm_ok'),
+          danger: true,
+        })
+        if (!confirmed) {
+          // A fleet bundle's new agents are already in: show them, and say the existing ones were left alone.
+          if (data.kind === 'fleet' && (data.imported || []).length) {
+            showToast(t('agents.import.fleet_kept', { n: data.imported.length }))
+            loadAgents()
+          }
           return
         }
+        ;({ res, data } = await upload(true))
       }
-      if (!res.ok) { showToast(data.error || 'Hiba az importálás során'); return }
-      const note = data.includedSecrets ? ' (titkokkal)' : ''
+      if (!res.ok) { showToast(data.error || t('agents.import.error')); return }
+      const parts = []
       if (data.kind === 'fleet') {
-        const n = (data.imported || []).length
         const skipped = (data.skipped || []).length
-        showToast(`Flotta importálva: ${n} ügynök${note}${skipped ? ` (${skipped} kihagyva)` : ''}`)
+        parts.push(t('agents.import.fleet_done', { n: (data.imported || []).length }))
+        if (data.includedSecrets) parts.push(t('agents.import.note_secrets'))
+        if (skipped) parts.push(t('agents.import.note_skipped', { n: skipped }))
       } else {
-        showToast(`Ügynök importálva: ${data.name}${note}${data.overwritten ? ' (felülírva)' : ''}`)
+        parts.push(t('agents.import.done', { name: data.name }))
+        if (data.includedSecrets) parts.push(t('agents.import.note_secrets'))
+        if (data.overwritten) parts.push(t('agents.import.note_overwritten'))
       }
+      showToast(parts.join(' '))
       loadAgents()
     } catch {
-      showToast('Hiba az importálás során')
+      showToast(t('agents.import.error'))
     } finally {
       importAgentFile.value = ''
     }
@@ -4458,7 +6220,6 @@ document.getElementById('saveAutoRestartBtn').addEventListener('click', async ()
     mode: document.getElementById('arMode').value === 'fresh' ? 'fresh' : 'continue',
     dailyTime: schedKind === 'daily' ? document.getElementById('arDailyTime').value : null,
     intervalHours: schedKind === 'interval' ? Number(document.getElementById('arIntervalHours').value) : null,
-    handoff: false,
   }
   try {
     const res = await fetch(`api/agents/${encodeURIComponent(id)}/auto-restart`, {
@@ -4466,9 +6227,10 @@ document.getElementById('saveAutoRestartBtn').addEventListener('click', async ()
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(cfg),
     })
-    if (!res.ok) throw new Error()
-    const body = await res.json()
-    if (currentAgent) currentAgent.autoRestart = body.autoRestart
+    // OWNERGATE3-1104: the server may refuse (403 owner_session_required); show why instead of a generic error.
+    const reply = await readActionReply(res)
+    if (!reply.ok) { showToast(t('common.not_done', { msg: refusalReason(res, reply.body) })); return }
+    if (currentAgent) currentAgent.autoRestart = reply.body.autoRestart
     showToast(t('agents.toast.auto_restart_saved'))
   } catch { showToast(t('common.error_save')) }
 })
@@ -4478,13 +6240,15 @@ document.getElementById('saveIdleFlushBtn').addEventListener('click', async () =
   // Like auto-restart, this applies to the main session too, so role === 'main'
   // is NOT skipped. The context-guard store is keyed by the same id.
   const id = currentAgent.autoRestartId || currentAgent.name
-  // Send the WHOLE config, not just the three idle fields. The endpoint
-  // normalizes the body into a complete config, so a fragment would silently
-  // reset actPct/hardPct/saturationRestart/enabled to their defaults -- saving
-  // an idle-flush preference would disarm the wedge tiers on an agent that had
-  // them on. Re-read rather than trusting the cached detail: not every path
-  // that opens this pane populates contextGuard, and an empty object here is
-  // indistinguishable from a genuinely default config.
+  // Send the WHOLE config, not just the three idle fields. The endpoint used
+  // to REPLACE the stored row with the normalized body, so a fragment reset
+  // actPct/hardPct/saturationRestart/enabled to their defaults -- saving an
+  // idle-flush preference disarmed the wedge tiers on an agent that had them
+  // on. It merges now (mergeContextGuardConfig); the full body stays because
+  // it is correct under both behaviours. Re-read rather than trusting the
+  // cached detail: not every path that opens this pane populates
+  // contextGuard, and an empty object here is indistinguishable from a
+  // genuinely default config.
   let current = {}
   try {
     const cur = await fetch(`api/agents/${encodeURIComponent(id)}/context-guard`)
@@ -4534,9 +6298,9 @@ async function loadVoiceConfig(agentName) {
     if (!r.ok) return
     const cfg = await r.json()
     voiceModelSel.innerHTML = (cfg.availableVoices || []).map(v =>
-      `<option value="${v}"${v === cfg.voiceModel ? ' selected' : ''}>${v}</option>`
+      `<option value="${escapeHtml(v)}"${v === cfg.voiceModel ? ' selected' : ''}>${escapeHtml(v)}</option>`
     ).join('')
-    const modeInput = document.querySelector(`input[name="voiceResponseMode"][value="${cfg.responseMode || 'text'}"]`)
+    const modeInput = document.querySelector(`input[name="voiceResponseMode"][value="${CSS.escape(String(cfg.responseMode || 'text'))}"]`)
     if (modeInput) modeInput.checked = true
   } catch { /* silent */ }
 }
@@ -4609,7 +6373,7 @@ document.getElementById('voiceInstallBtn').addEventListener('click', async () =>
   } catch {
     btn.disabled = false
     btn.textContent = 'Telepítés'
-    showToast('Hiba a telepítés során')
+    showToast(t('agents.voice.install_error'))
   }
 })
 
@@ -4624,9 +6388,11 @@ document.getElementById('saveVoiceConfigBtn').addEventListener('click', async ()
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ responseMode: modeEl.value, voiceModel: modelEl.value }),
     })
-    if (!r.ok) throw new Error()
-    showToast('Hangbeállítás mentve')
-  } catch { showToast('Hiba a mentés során') }
+    // OWNERGATE3-1104: the server may refuse (403 owner_session_required); show why instead of a generic error.
+    const reply = await readActionReply(r)
+    if (!reply.ok) { showToast(t('common.not_done', { msg: refusalReason(r, reply.body) })); return }
+    showToast(t('agents.voice.saved'))
+  } catch { showToast(t('common.error_save')) }
 })
 
 document.getElementById('saveProfileBtn').addEventListener('click', async () => {
@@ -4759,10 +6525,15 @@ document.getElementById('authFlowInitBtn').addEventListener('click', async () =>
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
     })
-    const data = await res.json()
-    if (data.ok && data.authUrl) {
+    // OWNERGATE3-1104: a refusal (403 owner_session_required) is shown in the page language (refusalReason).
+    const reply = await readActionReply(res)
+    const data = reply.body
+    if (!reply.ok) {
+      errorDiv.textContent = refusalReason(res, data)
+      errorDiv.hidden = false
+    } else if (data.ok && data.authUrl) {
       const urlEl = document.getElementById('authFlowUrl')
-      urlEl.href = data.authUrl
+      urlEl.href = safeHref(data.authUrl) || '#'
       urlEl.textContent = data.authUrl
       resultDiv.hidden = false
     } else {
@@ -4781,7 +6552,7 @@ document.getElementById('authFlowInitBtn').addEventListener('click', async () =>
 
 document.getElementById('authFlowCopyBtn').addEventListener('click', () => {
   const url = document.getElementById('authFlowUrl').textContent
-  navigator.clipboard.writeText(url).then(() => showToast('URL masolva'))
+  navigator.clipboard.writeText(url).then(() => showToast(t('common.toast.copied')))
 })
 
 document.getElementById('memoryIsolationToggle').addEventListener('change', async (e) => {
@@ -4837,6 +6608,7 @@ document.getElementById('saveClaudeMdBtn').addEventListener('click', async () =>
       body: JSON.stringify({ claudeMd: document.getElementById('editClaudeMd').value }),
     })
     if (!res.ok) throw new Error()
+    markFieldSaved(document.getElementById('editClaudeMd'))
     showToast(t('agents.claude_md_saved'))
   } catch { showToast(t('common.error_save')) }
 })
@@ -4850,6 +6622,7 @@ document.getElementById('saveSoulMdBtn').addEventListener('click', async () => {
       body: JSON.stringify({ soulMd: document.getElementById('editSoulMd').value }),
     })
     if (!res.ok) throw new Error()
+    markFieldSaved(document.getElementById('editSoulMd'))
     showToast(t('agents.soul_md_saved'))
   } catch { showToast(t('common.error_save')) }
 })
@@ -4863,7 +6636,8 @@ document.getElementById('saveMcpJsonBtn').addEventListener('click', async () => 
       body: JSON.stringify({ mcpJson: document.getElementById('editMcpJson').value }),
     })
     if (!res.ok) throw new Error()
-    showToast('.mcp.json mentve')
+    markFieldSaved(document.getElementById('editMcpJson'))
+    showToast(t('agents.mcp_json_saved'))
   } catch { showToast(t('common.error_save')) }
 })
 
@@ -4877,6 +6651,28 @@ function agentIsConnected(agent) {
   if (currentChannelProvider === 'slack') return !!agent.hasSlack
   if (currentChannelProvider === 'teams') return !!agent.hasTeams
   return !!agent.hasTelegram
+}
+
+// The agent card and the detail header ask about the agent's OWN channel
+// (agent-config.json channelProvider, carried on the /api/agents summary).
+// An unset or unknown value falls back to agentIsConnected(), i.e. to the
+// dashboard-wide provider. The Channel tab keeps agentIsConnected(): it
+// follows its own provider dropdown.
+const AGENT_CHANNEL_FLAG = {
+  telegram: 'hasTelegram',
+  discord: 'hasDiscord',
+  slack: 'hasSlack',
+  teams: 'hasTeams',
+  googlechat: 'hasGooglechat',
+}
+
+function agentOwnChannelConnected(agent) {
+  if (!agent) return false
+  const own = agent.channelProvider
+  if (typeof own === 'string' && Object.prototype.hasOwnProperty.call(AGENT_CHANNEL_FLAG, own)) {
+    return !!agent[AGENT_CHANNEL_FLAG[own]]
+  }
+  return agentIsConnected(agent)
 }
 
 function getProviderLabel() {
@@ -4917,7 +6713,7 @@ function updateProviderUI() {
 
   if (isTg) {
     if (title) title.textContent = t('channel.setup.tg_title')
-    if (steps) steps.innerHTML = t('channel.setup.tg_steps')
+    if (steps) steps.innerHTML = tHtml('channel.setup.tg_steps')
     if (label) label.textContent = 'Bot API Token'
     if (input) input.placeholder = '123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11'
     if (slackGroup) slackGroup.hidden = true
@@ -4927,7 +6723,7 @@ function updateProviderUI() {
     if (pairingInfo) pairingInfo.textContent = t('channel.setup.tg_pairing')
   } else if (currentChannelProvider === 'discord') {
     if (title) title.textContent = t('channel.setup.discord_title')
-    if (steps) steps.innerHTML = t('channel.setup.discord_steps')
+    if (steps) steps.innerHTML = tHtml('channel.setup.discord_steps')
     if (label) label.textContent = 'Bot Token'
     if (input) input.placeholder = 'MTIzNDU2Nzg5MDEyMzQ1Njc4OQ...'
     if (slackGroup) slackGroup.hidden = true
@@ -4937,7 +6733,7 @@ function updateProviderUI() {
     if (pairingInfo) pairingInfo.textContent = t('channel.setup.discord_pairing')
   } else if (currentChannelProvider === 'teams') {
     if (title) title.textContent = t('channel.setup.teams_title')
-    if (steps) steps.innerHTML = t('channel.setup.teams_steps')
+    if (steps) steps.innerHTML = tHtml('channel.setup.teams_steps')
     if (slackGroup) slackGroup.hidden = true
     if (manifestBtnGroup) manifestBtnGroup.hidden = true
     if (smokeTestBtn) smokeTestBtn.hidden = true
@@ -4947,7 +6743,7 @@ function updateProviderUI() {
     if (pairingInfo) pairingInfo.textContent = t('channel.setup.teams_pairing')
   } else {
     if (title) title.textContent = t('channel.setup.slack_title')
-    if (steps) steps.innerHTML = t('channel.setup.slack_steps')
+    if (steps) steps.innerHTML = tHtml('channel.setup.slack_steps')
     if (label) label.textContent = 'Bot Token (xoxb-...)'
     if (input) input.placeholder = 'xoxb-...'
     if (slackGroup) slackGroup.hidden = false
@@ -5055,15 +6851,20 @@ document.getElementById('chConnectBtn').addEventListener('click', async () => {
     }
     if (!res.ok) {
       const err = await res.json().catch(() => ({}))
-      throw new Error(err.error || 'Kapcsolodasi hiba')
+      throw new Error(err.error || t('channel.toast.connect_error'))
     }
     const result = await res.json()
-    showToast(`${getProviderLabel()} sikeresen csatlakoztatva!`)
+    // #1878 (6): on the main agent the save restarts the channels session; a failed
+    // restart must not read as "connected".
+    if (result.restartError) showToast(t('agents.channel.saved_restart_failed', { provider: getProviderLabel(), cmd: result.restartCommand || '' }), 12000)
+    else showToast(t('channel.toast.connected', { provider: getProviderLabel() }))
     // Refresh detail
+    // CHANNELUNCONF1110: the main agent's detail draws from /api/marveen; fetch it first so the status and the banner follow.
+    if (currentAgent.name === mainAgentId()) await refreshMainChannelUnconfBanner()
     await openAgentDetail(currentAgent.name)
     loadAgents()
   } catch (err) {
-    showToast(`Hiba: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`)
   } finally {
     btn.disabled = false
     btn.querySelector('.btn-text').hidden = false
@@ -5076,7 +6877,28 @@ document.getElementById('chTestBtn').addEventListener('click', async () => {
   try {
     const res = await fetch(`${channelApiBase()}/test`, { method: 'POST' })
     if (!res.ok) throw new Error()
-    showToast('Kapcsolat rendben!')
+    const data = await res.json().catch(() => ({}))
+    // SLACKSCOPEJELZ1007: a Slack token that lacks a manifest scope works, but
+    // part of the plugin silently does not (im:read: writing to the owner's DM
+    // after a restart). Say so instead of "all right".
+    const missing = Array.isArray(data.missingScopes) ? data.missingScopes : []
+    if (missing.length > 0) {
+      // showToast's 2nd argument is the DURATION (ms). Long enough to read
+      // a sentence that names scopes and what to do.
+      const msg = t('channel.toast.missing_scopes', { scopes: missing.join(', ') })
+        + (missing.includes('im:read') ? ' ' + t('channel.toast.missing_scopes_imread') : '')
+      showToast(msg, 12000)
+    } else {
+      const exp = data.secretExpiry
+      const suffix = !exp ? ''
+        : exp.state === 'missing' ? ' ' + t('channel.toast.teams_secret_expiry_missing')
+        : exp.state === 'invalid' ? ' ' + t('channel.toast.teams_secret_expiry_invalid')
+        : exp.state === 'ok' ? ' ' + t('channel.toast.teams_secret_expiry_ok', { date: exp.date, days: exp.daysLeft })
+        : exp.state === 'soon' ? ' ' + t('channel.toast.teams_secret_expiry_soon', { date: exp.date, days: exp.daysLeft })
+        : exp.state === 'expired' ? ' ' + t('channel.toast.teams_secret_expiry_expired', { date: exp.date })
+        : ''
+      showToast(t('channel.toast.test_ok') + suffix, suffix ? 8000 : undefined)
+    }
   } catch {
     showToast(t('channel.toast.smoke_failed'))
   }
@@ -5092,13 +6914,13 @@ document.getElementById('chReconnectBtn').addEventListener('click', async () => 
     const res = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}/channel/reconnect`, { method: 'POST' })
     const data = await res.json()
     if (data.ok) {
-      showToast('Channel-MCP reconnect sikeres')
+      showToast(t('channel.toast.reconnect_ok'))
       document.getElementById('chDisconnectedNotice').hidden = true
     } else {
-      showToast(data.message || 'Reconnect sikertelen', true)
+      showToast(data.message || t('channel.toast.reconnect_failed'), 8000)
     }
   } catch {
-    showToast('Reconnect hiba', true)
+    showToast(t('channel.toast.reconnect_error'), 8000)
   } finally {
     btn.disabled = false
     btn.textContent = origText
@@ -5112,15 +6934,15 @@ document.getElementById('chSmokeTestBtn').addEventListener('click', async () => 
   btn.disabled = true
   btn.textContent = t('agents.btn.running')
   try {
-    const res = await fetch(`api/agents/${encodeURIComponent(currentAgent)}/channels/slack/smoke-test`, { method: 'POST' })
+    const res = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}/channels/slack/smoke-test`, { method: 'POST' })
     const data = await res.json()
     if (!res.ok) {
-      showToast(data.error || 'Smoke-test sikertelen', true)
+      showToast(data.error || t('channel.smoke_test.failed'), 8000)
       return
     }
     showSmokeTestResult(data.output || 'OK')
   } catch {
-    showToast('Smoke-test hiba', true)
+    showToast(t('channel.smoke_test.error'), 8000)
   } finally {
     btn.disabled = false
     btn.textContent = origText
@@ -5191,7 +7013,7 @@ async function approvePairing(code) {
     refreshPendingPairings()
     refreshAllowedList()
   } catch (err) {
-    showToast(`Hiba: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`)
   }
 }
 
@@ -5243,7 +7065,13 @@ async function refreshAllowedList() {
 async function removeAllowed(kind, id) {
   if (!currentAgent) return
   const label = kind === 'user' ? t('channel.kind.user') : t('channel.kind.group')
-  if (!confirm(t('channel.confirm.remove', { label, id }))) return
+  const confirmed = await confirmDialog({
+    title: t('channel.confirm.remove_title'),
+    message: t('channel.confirm.remove', { label, id }),
+    okLabel: t('channel.confirm.remove_ok'),
+    danger: true,
+  })
+  if (!confirmed) return
   try {
     const res = await fetch(`${channelApiBase()}/allowed/${kind}/${encodeURIComponent(id)}`, { method: 'DELETE' })
     if (!res.ok) {
@@ -5253,7 +7081,7 @@ async function removeAllowed(kind, id) {
     showToast(t('common.toast.removed'))
     refreshAllowedList()
   } catch (err) {
-    showToast(`Hiba: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`)
   }
 }
 
@@ -5278,8 +7106,8 @@ async function refreshInvites() {
       const status = inv.used
         ? `<span class="tg-allowed-kind" style="background:rgba(180,180,180,0.15); color:var(--text-muted);">${t('channel.invite.used_badge')}</span>`
         : `<span class="tg-allowed-kind tg-allowed-kind-group">${t('channel.invite.active_badge', { min: expiresIn })}</span>`
-      const linkHtml = inv.deepLink
-        ? `<a href="${escapeHtml(inv.deepLink)}" target="_blank" class="tg-allowed-id" style="text-decoration:underline;">${escapeHtml(inv.deepLink)}</a>`
+      const linkHtml = safeHref(inv.deepLink)
+        ? `<a href="${escapeHtml(safeHref(inv.deepLink))}" target="_blank" class="tg-allowed-id" style="text-decoration:underline;">${escapeHtml(inv.deepLink)}</a>`
         : `<span class="tg-allowed-id">${t('channel.invite.no_username')}</span>`
       item.innerHTML = `
         <div class="tg-allowed-meta" style="flex-wrap:wrap; gap:6px;">
@@ -5317,7 +7145,7 @@ async function generateInvite() {
     const res = await fetch(`${channelApiBase()}/invites`, { method: 'POST' })
     if (!res.ok) {
       const err = await res.json().catch(() => ({}))
-      throw new Error(err.error || 'Sikertelen')
+      throw new Error(err.error || t('common.failed'))
     }
     const data = await res.json()
     if (data.deepLink) {
@@ -5328,7 +7156,7 @@ async function generateInvite() {
     }
     refreshInvites()
   } catch (err) {
-    showToast(`Hiba: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`)
   } finally {
     btn.disabled = false
     btn.textContent = t('channel.btn.invite_new')
@@ -5337,17 +7165,23 @@ async function generateInvite() {
 
 async function revokeInviteToken(token) {
   if (!currentAgent) return
-  if (!confirm(t('channel.confirm.revoke'))) return
+  const confirmed = await confirmDialog({
+    title: t('channel.confirm.revoke_title'),
+    message: t('channel.confirm.revoke'),
+    okLabel: t('channel.confirm.revoke_ok'),
+    danger: true,
+  })
+  if (!confirmed) return
   try {
     const res = await fetch(`${channelApiBase()}/invites/${encodeURIComponent(token)}`, { method: 'DELETE' })
     if (!res.ok) {
       const err = await res.json().catch(() => ({}))
-      throw new Error(err.error || 'Sikertelen')
+      throw new Error(err.error || t('common.failed'))
     }
     showToast(t('channel.toast.invite_revoked'))
     refreshInvites()
   } catch (err) {
-    showToast(`Hiba: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`)
   }
 }
 
@@ -5380,7 +7214,7 @@ async function refreshChannelRequests() {
     for (const req of items) {
       const item = document.createElement('div')
       item.className = 'tg-allowed-item'
-      const name = req.channel_name ? escapeHtml(req.channel_name) : req.channel_id
+      const name = escapeHtml(req.channel_name || req.channel_id)
       const ts = new Date(req.requested_at * 1000).toLocaleString('hu-HU')
       const userId = req.user_id ? `<span class="tg-allowed-id">user: ${escapeHtml(req.user_id)}</span>` : ''
       item.innerHTML = `
@@ -5407,8 +7241,8 @@ let _approveReqId = null
 function openApproveModal(id, channelName, userId) {
   _approveReqId = id
   const desc = document.getElementById('chApproveModalDesc')
-  const userNote = userId ? t('channel.approve.requester', { user: escapeHtml(userId) }) : ''
-  desc.textContent = t('channel.approve.desc', { channel: escapeHtml(channelName), requester: userNote })
+  const userNote = userId ? t('channel.approve.requester', { user: userId }) : ''
+  desc.textContent = t('channel.approve.desc', { channel: channelName, requester: userNote })
   document.getElementById('chApproveRequireMention').checked = true
   document.getElementById('chApproveAllowFromAll').checked = false
   document.getElementById('chApproveModalOverlay').hidden = false
@@ -5429,14 +7263,14 @@ async function submitApproveModal() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ requireMention, allowFromAll }),
     })
-    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Hiba')
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || t('common.failed'))
     document.getElementById('chApproveModalOverlay').hidden = true
-    const item = document.querySelector(`[data-req-id="${id}"]`)
+    const item = document.querySelector(`[data-req-id="${CSS.escape(String(id))}"]`)
     if (item) item.remove()
     showToast(t('channel.toast.approved'))
     refreshChannelRequests()
   } catch (err) {
-    showToast(`Hiba: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`)
   } finally {
     confirmBtn.querySelector('.btn-text').hidden = false
     confirmBtn.querySelector('.btn-loading').hidden = true
@@ -5450,11 +7284,11 @@ async function denyChannelRequest(id, itemEl) {
   if (itemEl) itemEl.remove()
   try {
     const res = await fetch(`api/agents/${encodeURIComponent(currentAgent.name)}/channel-requests/${id}/deny`, { method: 'POST' })
-    if (!res.ok) throw new Error('Hiba')
+    if (!res.ok) throw new Error(t('common.failed'))
     showToast(t('channel.toast.denied'))
     refreshChannelRequests()
   } catch (err) {
-    showToast(`Hiba: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`)
     refreshChannelRequests()
   }
 }
@@ -5483,10 +7317,21 @@ document.getElementById('chApproveBtn').addEventListener('click', async () => {
 document.getElementById('chDisconnectBtn').addEventListener('click', async () => {
   if (!currentAgent) return
   const provLabel = getProviderLabel()
-  if (!confirm(`Biztosan levalasztod a ${provLabel} csatornat?`)) return
+  const confirmed = await confirmDialog({
+    title: t('channel.confirm.disconnect_title'),
+    message: t('channel.confirm.disconnect', { provider: provLabel }),
+    okLabel: t('channel.confirm.disconnect_ok'),
+    danger: true,
+  })
+  if (!confirmed) return
   try {
-    await fetch(`${channelApiBase()}`, { method: 'DELETE' })
-    showToast(`${provLabel} levalasztva`)
+    // OWNERGATE2-1104: the server may refuse (403 owner_session_required); a refusal is never shown as done.
+    const res = await fetch(`${channelApiBase()}`, { method: 'DELETE' })
+    const reply = await readActionReply(res)
+    if (!reply.ok) { showToast(t('common.not_done', { msg: refusalReason(res, reply.body) })); return }
+    showToast(t('channel.toast.disconnected', { provider: provLabel }))
+    // CHANNELUNCONF1110: the main agent's detail draws from /api/marveen; fetch it first so the status and the banner follow.
+    if (currentAgent.name === mainAgentId()) await refreshMainChannelUnconfBanner()
     await openAgentDetail(currentAgent.name)
     loadAgents()
   } catch {
@@ -5531,7 +7376,13 @@ async function loadSkills(agentName) {
       const delBtn = item.querySelector('.btn-icon-danger')
       if (delBtn) {
         delBtn.addEventListener('click', async () => {
-          if (!confirm(t('skills.confirm.delete', { name: skill.name }))) return
+          const confirmed = await confirmDialog({
+            title: t('skills.confirm.delete_title'),
+            message: t('skills.confirm.delete', { name: skill.name }),
+            okLabel: t('skills.confirm.delete_ok'),
+            danger: true,
+          })
+          if (!confirmed) return
           try {
             await fetch(`api/agents/${encodeURIComponent(agentName)}/skills/${encodeURIComponent(skill.name)}`, { method: 'DELETE' })
             showToast(t('skills.toast.deleted'))
@@ -5597,7 +7448,17 @@ document.getElementById('saveSkillBtn').addEventListener('click', async () => {
   const isGlobal = skillModalScope === 'global'
   if (!isGlobal && !currentAgent) return
   const name = document.getElementById('skillName').value.trim()
-  if (!name) { document.getElementById('skillName').focus(); return }
+  if (!name) {
+    document.getElementById('skillName').focus()
+    showToast(t('skills.toast.name_required'))
+    return
+  }
+  const description = document.getElementById('skillDescription').value.trim()
+  if (!description) {
+    document.getElementById('skillDescription').focus()
+    showToast(t('skills.toast.desc_required'))
+    return
+  }
 
   const btn = document.getElementById('saveSkillBtn')
   btn.disabled = true
@@ -5613,22 +7474,23 @@ document.getElementById('saveSkillBtn').addEventListener('click', async () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         name,
-        description: document.getElementById('skillDescription').value.trim(),
+        description,
       }),
     })
     if (!res.ok) {
       const err = await res.json()
-      throw new Error(err.error || 'Hiba')
+      throw new Error(err.error || t('common.error'))
     }
+    const created = await res.json().catch(() => ({}))
     closeModal(skillModalOverlay)
-    showToast(t('skills.toast.added'))
+    showToast(created.pending ? t('skills.toast.queued') : t('skills.toast.added'))
     if (isGlobal) {
       loadGlobalSkills()
     } else {
       loadSkills(agentApiName())
     }
   } catch (err) {
-    showToast(`Hiba: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`)
   } finally {
     btn.disabled = false
     btn.querySelector('.btn-text').hidden = false
@@ -5659,12 +7521,12 @@ document.getElementById('importSkillBtn').addEventListener('click', async () => 
     })
     if (!res.ok) {
       const err = await res.json()
-      throw new Error(err.error || 'Import hiba')
+      throw new Error(err.error || t('common.failed'))
     }
     const result = await res.json()
     closeModal(skillModalOverlay)
     const importedList = Array.isArray(result.imported) ? result.imported : []
-    showToast(t('skills.toast.imported', { list: importedList.join(', ') }))
+    showToast(t(result.pending ? 'skills.toast.imported_queued' : 'skills.toast.imported', { list: importedList.join(', ') }))
     skillFile = null
     document.getElementById('skillFileName').textContent = ''
     if (isGlobal) {
@@ -5673,7 +7535,7 @@ document.getElementById('importSkillBtn').addEventListener('click', async () => 
       loadSkills(agentApiName())
     }
   } catch (err) {
-    showToast(`Hiba: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`)
   } finally {
     btn.disabled = false
     btn.querySelector('.btn-text').hidden = false
@@ -5707,7 +7569,7 @@ document.getElementById('addScheduleBtn').addEventListener('click', () => {
     setTimeout(() => document.getElementById('scheduleName').focus(), 200)
   })
 })
-document.getElementById('scheduleModalClose').addEventListener('click', () => closeModal(scheduleModalOverlay))
+document.getElementById('scheduleModalClose').addEventListener('click', () => requestOverlayClose(scheduleModalOverlay))
 attachOverlayCloseGuard(scheduleModalOverlay)
 
 // Frequency change handler
@@ -5938,7 +7800,9 @@ async function loadScheduleAgents() {
 async function loadSchedules() {
   try {
     const [schedulesRes] = await Promise.all([
-      fetch('api/schedules'),
+      // include=prompt: the edit form fills its prompt from this list (openEditSchedule),
+      // and the list leaves prompts out by default (card 12b0f698).
+      fetch('api/schedules?include=prompt'),
       loadScheduleAgents(),
     ])
     schedules = await schedulesRes.json()
@@ -6017,13 +7881,25 @@ function renderPendingRetries(container, rows) {
       const row = e.currentTarget.closest('.pending-retry-row')
       const id = row?.dataset.id
       if (!id) return
-      if (!confirm(t('tasks.confirm.cancel_pending'))) return
+      const r = rows.find(x => String(x.id) === id)
+      const confirmed = await confirmDialog({
+        title: t('tasks.confirm.cancel_pending_title'),
+        // Without an agent name the text drops the parentheses instead of printing an empty pair.
+        message: (r && r.agentName)
+          ? t('tasks.confirm.cancel_pending', { name: r.taskName || id, agent: r.agentName })
+          : t('tasks.confirm.cancel_pending_no_agent', { name: (r && r.taskName) || id }),
+        okLabel: t('tasks.confirm.cancel_pending_ok'),
+        danger: true,
+      })
+      if (!confirmed) return
       try {
         const res = await fetch(`api/schedules/pending/${encodeURIComponent(id)}`, { method: 'DELETE' })
-        if (!res.ok) throw new Error('cancel failed')
+        // The server's reasons are English API texts ("Pending retry not found"): a translated toast instead,
+        // and the list is reloaded, since a 404 means the retry is already gone.
+        if (!res.ok) showToast(t('tasks.toast.cancel_pending_error'))
         loadPendingRetries()
-      } catch (err) {
-        console.error('Pending retry cancel hiba:', err)
+      } catch {
+        showToast(t('tasks.toast.cancel_pending_error'))
       }
     })
   })
@@ -6043,6 +7919,29 @@ function cronCadence(cron) {
 }
 const CADENCE_ICON = { 0: '⚡', 1: '☀️', 2: '📅', 3: '🗓️', 5: '•' }
 
+// A task the runner skips (#2429). GET /api/schedules carries `registry` per task:
+// 'ok' when the runner fires it, else the reason it does not ('unregistered',
+// 'hash-mismatch', 'no-hash', 'registry-error'). Such a row says "not firing"
+// in place of active/paused, with the reason and the fix in the row itself (a
+// tooltip alone is invisible on touch). An answer without the field (an older
+// server) renders as before.
+const SCHEDULE_REGISTRY_REASONS = ['unregistered', 'hash-mismatch', 'no-hash', 'registry-error']
+
+function scheduleNotFiring(task) {
+  return !!task && typeof task.registry === 'string' && task.registry !== 'ok'
+}
+
+function scheduleStatusBadge(task) {
+  if (scheduleNotFiring(task)) return `<span class="badge badge-not-firing">${t('tasks.status.not_firing')}</span>`
+  return `<span class="badge ${task.enabled ? 'badge-active' : 'badge-paused'}">${task.enabled ? t('tasks.status.active') : t('tasks.status.paused')}</span>`
+}
+
+function scheduleNotFiringNote(task) {
+  if (!scheduleNotFiring(task)) return ''
+  const reason = SCHEDULE_REGISTRY_REASONS.includes(task.registry) ? t('tasks.registry.' + task.registry) : task.registry
+  return `<div class="schedule-not-firing">${escapeHtml(t('tasks.status.not_firing_tip', { reason, name: task.dirName || task.name }))}</div>`
+}
+
 function makeScheduleRow(task) {
     const row = document.createElement('div')
     row.className = 'schedule-row'
@@ -6056,13 +7955,14 @@ function makeScheduleRow(task) {
         <div class="schedule-title">
           ${escapeHtml(task.description || task.name)}
           ${task.type === 'heartbeat' ? '<span class="badge badge-heartbeat">💓 heartbeat</span>' : ''}
-          <span class="badge ${task.enabled ? 'badge-active' : 'badge-paused'}">${task.enabled ? t('tasks.status.active') : t('tasks.status.paused')}</span>
+          ${scheduleStatusBadge(task)}
         </div>
         <div class="schedule-meta">
           <span class="schedule-cron">${escapeHtml(task.schedule)}</span>
-          <span>${describeCron(task.schedule)}</span>
+          <span>${escapeHtml(describeCron(task.schedule))}</span>
           <span class="schedule-agent-name">${escapeHtml(agent.label || agent.name)}</span>
         </div>
+        ${scheduleNotFiringNote(task)}
       </div>
       <div class="schedule-actions">
         <button class="btn-icon" data-action="run" title="${t('tasks.btn.run_now')}">
@@ -6093,7 +7993,7 @@ function makeScheduleRow(task) {
         const r = await fetch(`api/schedules/${encodeURIComponent(task.name)}/run`, { method: 'POST' })
         const data = await r.json().catch(() => ({}))
         if (r.ok) showToast(t('tasks.toast.run_started') + (data.result ? ': ' + data.result : ''))
-        else showToast('Hiba: ' + (data.error || r.status))
+        else showToast(t('common.not_done', { msg: refusalReason(r, data) }))
         loadSchedules()
       } catch { showToast(t('tasks.toast.run_error')) }
     })
@@ -6101,18 +8001,28 @@ function makeScheduleRow(task) {
     row.querySelector('[data-action="toggle"]').addEventListener('click', async (e) => {
       e.stopPropagation()
       try {
-        await fetch(`api/schedules/${encodeURIComponent(task.name)}/toggle`, { method: 'POST' })
-        showToast(task.enabled ? t('tasks.toast.toggled_paused') : t('tasks.toast.toggled_resumed'))
+        const res = await fetch(`api/schedules/${encodeURIComponent(task.name)}/toggle`, { method: 'POST' })
+        const reply = await readActionReply(res)
+        if (reply.ok) showToast(task.enabled ? t('tasks.toast.toggled_paused') : t('tasks.toast.toggled_resumed'))
+        else showToast(t('common.not_done', { msg: refusalReason(res, reply.body) }))
         loadSchedules()
       } catch { showToast(t('common.error')) }
     })
 
     row.querySelector('[data-action="delete"]').addEventListener('click', async (e) => {
       e.stopPropagation()
-      if (!confirm(t('tasks.confirm.task_delete'))) return
+      const confirmed = await confirmDialog({
+        title: t('tasks.confirm.task_delete_title'),
+        message: t('tasks.confirm.task_delete', { name: task.description || task.name }),
+        okLabel: t('tasks.confirm.task_delete_ok'),
+        danger: true,
+      })
+      if (!confirmed) return
       try {
-        await fetch(`api/schedules/${encodeURIComponent(task.name)}`, { method: 'DELETE' })
-        showToast(t('tasks.toast.deleted'))
+        const res = await fetch(`api/schedules/${encodeURIComponent(task.name)}`, { method: 'DELETE' })
+        const reply = await readActionReply(res)
+        if (reply.ok) showToast(t('tasks.toast.deleted'))
+        else showToast(t('common.not_done', { msg: refusalReason(res, reply.body) }))
         loadSchedules()
       } catch { showToast(t('common.error_delete')) }
     })
@@ -6146,7 +8056,7 @@ function renderScheduleList(tasks) {
 }
 
 const scheduleRunHistoryOverlay = document.getElementById('scheduleRunHistoryOverlay')
-document.getElementById('scheduleRunHistoryClose').addEventListener('click', () => closeModal(scheduleRunHistoryOverlay))
+document.getElementById('scheduleRunHistoryClose').addEventListener('click', () => requestOverlayClose(scheduleRunHistoryOverlay))
 attachOverlayCloseGuard(scheduleRunHistoryOverlay)
 
 const RUN_STATUS_LABEL = {
@@ -6440,7 +8350,7 @@ function openEditSchedule(task) {
 
     // Set agent
     const agentSel = document.getElementById('scheduleAgent')
-    if (agentSel.querySelector(`option[value="${task.agent}"]`)) {
+    if (agentSel.querySelector(`option[value="${CSS.escape(String(task.agent))}"]`)) {
       agentSel.value = task.agent
     }
 
@@ -6584,7 +8494,7 @@ saveScheduleBtn.addEventListener('click', async () => {
       })
       if (!res.ok) {
         const err = await res.json()
-        throw new Error(err.error || 'Hiba')
+        throw new Error(err.error || t('common.failed'))
       }
       showToast(t('tasks.toast.updated'))
     } else {
@@ -6596,14 +8506,14 @@ saveScheduleBtn.addEventListener('click', async () => {
       })
       if (!res.ok) {
         const err = await res.json()
-        throw new Error(err.error || 'Ismeretlen hiba')
+        throw new Error(err.error || t('common.failed'))
       }
       showToast(t('tasks.toast.created'))
     }
     closeModal(scheduleModalOverlay)
     loadSchedules()
   } catch (err) {
-    showToast(`Hiba: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`)
   } finally {
     saveScheduleBtn.disabled = false
     saveScheduleBtn.querySelector('.btn-text').hidden = false
@@ -6639,8 +8549,8 @@ async function loadMemAgents() {
     sel.innerHTML = `<option value="">${t('memories.agent_all')}</option>`
     memSel.innerHTML = ''
     for (const a of agents) {
-      sel.innerHTML += `<option value="${a.name}">${a.label}</option>`
-      memSel.innerHTML += `<option value="${a.name}">${a.label}</option>`
+      sel.innerHTML += `<option value="${escapeHtml(a.name)}">${escapeHtml(a.label)}</option>`
+      memSel.innerHTML += `<option value="${escapeHtml(a.name)}">${escapeHtml(a.label)}</option>`
     }
   } catch {}
 }
@@ -6705,11 +8615,13 @@ document.getElementById('memAddBtn').addEventListener('click', () => {
 })
 
 // Close memory modal
-document.getElementById('memModalClose').addEventListener('click', () => closeModal(memModalOverlay))
+document.getElementById('memModalClose').addEventListener('click', () => requestOverlayClose(memModalOverlay))
 attachOverlayCloseGuard(memModalOverlay)
 
-// Save memory (create or edit)
-document.getElementById('saveMemBtn').addEventListener('click', async () => {
+// Save memory (create or edit). A refused save (#2425) keeps the modal open with
+// the text: only a 2xx answer closes it. The destructive-edit refusal gets its own
+// text with the two lengths (the server's how_to_proceed is written for API callers).
+async function saveMemoryFromModal() {
   const content = document.getElementById('memContent').value.trim()
   if (!content) { document.getElementById('memContent').focus(); return }
 
@@ -6719,28 +8631,127 @@ document.getElementById('saveMemBtn').addEventListener('click', async () => {
   const keywords = document.getElementById('memKeywords').value.trim()
 
   try {
-    if (editId) {
-      await fetch(`api/memories/${editId}`, {
+    const res = editId
+      ? await fetch(`api/memories/${editId}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ content, tier, agent_id: agentId, keywords }),
       })
-      showToast(t('memories.toast.updated'))
-    } else {
-      await fetch('api/memories', {
+      : await fetch('api/memories', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ agent_id: agentId, content, tier, keywords }),
       })
-      showToast(t('memories.toast.created'))
+    const reply = await readActionReply(res)
+    if (!reply.ok) {
+      const b = reply.body
+      showToast(b.error === 'destructive_memory_write' && Number.isFinite(b.old_len) && Number.isFinite(b.new_len)
+        ? t('memories.toast.destructive_refused', { old_len: b.old_len, new_len: b.new_len })
+        : t('memories.toast.save_refused', { msg: refusalReason(res, b) }), 6000)
+      return
     }
+    showToast(t(editId ? 'memories.toast.updated' : 'memories.toast.created'))
     closeModal(memModalOverlay)
     loadMemories()
     loadMemStats()
   } catch {
     showToast(t('common.error_save'))
   }
-})
+}
+document.getElementById('saveMemBtn').addEventListener('click', saveMemoryFromModal)
+
+// Card ca046c9a (#570): nothing moves a hot memory down on its own, so hot rows
+// pile up. The stats endpoint counts the ones with no write for staleHotDays;
+// the Hot tab shows that count and lets the viewer list only those.
+let memStaleInfo = { count: 0, days: 7 }
+let memStaleOnly = false
+// Inline preview of a referenced memory under the chip row, toggled per id.
+async function toggleMemRefPreview(item, refId) {
+  const box = item.querySelector('.mem-ref-preview')
+  if (!box) return
+  if (!box.hidden && box.dataset.refId === String(refId)) {
+    box.hidden = true
+    return
+  }
+  box.hidden = false
+  box.dataset.refId = String(refId)
+  box.textContent = t('memories.chain.loading')
+  try {
+    const res = await fetch(`api/memories/${refId}`)
+    if (!res.ok) throw new Error(String(res.status))
+    const m = await res.json()
+    box.textContent = ''
+    const head = document.createElement('div')
+    head.className = 'mem-ref-preview-head'
+    head.textContent = `#${m.id} · ${tierLabels[m.category] || m.category} · ${m.agent_id || ''}`
+    const body = document.createElement('div')
+    body.className = 'mem-ref-preview-body'
+    body.textContent = m.content
+    box.append(head, body)
+  } catch {
+    box.textContent = t('memories.chain.not_found', { id: refId })
+  }
+}
+
+// #573: when the server began logging real uses (0 = nothing logged yet).
+let memUseSince = 0
+
+// The "used" chip: last real use by an agent (read by id, a top search hit
+// that matched as asked, a partial FELULIRJA reference), or that there is none
+// since logging began. Not the write age and not accessed_at.
+function memUseChip(mem) {
+  const since = memUseSince ? new Date(memUseSince * 1000).toLocaleDateString('hu-HU') : ''
+  if (!mem.last_used_at) {
+    return `<span class="mem-use-badge none" title="${escapeHtml(t('memories.use.none_title', { since: since || '-' }))}">${escapeHtml(t('memories.use.none'))}</span>`
+  }
+  const days = Math.floor((Date.now() / 1000 - Number(mem.last_used_at)) / 86400)
+  const label = days <= 0 ? t('memories.use.today', { count: mem.use_count }) : t('memories.use.days', { days, count: mem.use_count })
+  return `<span class="mem-use-badge" title="${escapeHtml(t('memories.use.title', { since: since || '-' }))}">${escapeHtml(label)}</span>`
+}
+
+function memLastWrite(mem) {
+  return Number(mem.updated_at || mem.created_at || 0)
+}
+
+function renderMemStaleBanner() {
+  const el = document.getElementById('memStaleBanner')
+  if (!el) return
+  const q = memSearchInput.value.trim()
+  if (currentMemTier !== 'hot' || q || (memStaleInfo.count === 0 && !memStaleOnly)) {
+    el.hidden = true
+    el.textContent = ''
+    return
+  }
+  el.hidden = false
+  el.textContent = ''
+  const text = document.createElement('span')
+  text.textContent = t('memories.stale.banner', { count: memStaleInfo.count, days: memStaleInfo.days })
+  const btn = document.createElement('button')
+  btn.className = 'btn-secondary btn-compact'
+  btn.id = 'memStaleToggle'
+  btn.textContent = memStaleOnly ? t('memories.stale.show_all') : t('memories.stale.only_stale')
+  btn.addEventListener('click', () => {
+    memStaleOnly = !memStaleOnly
+    loadMemories()
+  })
+  el.append(text, btn)
+}
+
+async function moveMemTier(mem, tier) {
+  try {
+    const res = await fetch(`api/memories/${mem.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tier, updated_by: 'dashboard' }),
+    })
+    if (!res.ok) throw new Error(String(res.status))
+    showToast(t('memories.stale.moved', { tier: tierLabels[tier] || tier }))
+    loadMemories()
+    loadMemStats()
+  } catch {
+    showToast(t('common.error_save'))
+  }
+}
 
 async function loadMemStats() {
   try {
@@ -6748,10 +8759,12 @@ async function loadMemStats() {
     const stats = await res.json()
     const embCount = stats.withEmbedding || 0
     const embPct = stats.total > 0 ? Math.round(embCount / stats.total * 100) : 0
+    memStaleInfo = { count: stats.staleHot || 0, days: stats.staleHotDays || 7 }
+    renderMemStaleBanner()
     memStats.innerHTML = `
       <div class="stat-card"><div class="stat-value">${stats.total}</div><div class="stat-label">${t('memories.stat.total')}</div></div>
       ${Object.entries(stats.byTier || {}).map(([tier, count]) =>
-        `<div class="stat-card"><div class="stat-value" style="color:${tierColors[tier] || 'var(--accent)'}">${count}</div><div class="stat-label">${tierLabels[tier] || tier}</div></div>`
+        `<div class="stat-card"><div class="stat-value" style="color:${tierColors[tier] || 'var(--accent)'}">${count}</div><div class="stat-label">${escapeHtml(tierLabels[tier] || tier)}</div></div>`
       ).join('')}
       <div class="stat-card"><div class="stat-value">${embCount}</div><div class="stat-label">${t('memories.stat.vectors_pct', { pct: embPct })}</div></div>
       <button class="btn-secondary btn-compact" id="memBackfillBtn" style="margin-left:auto;font-size:11px;padding:6px 12px;align-self:center">${t('memories.stat.vectors_btn')}</button>
@@ -6762,7 +8775,9 @@ async function loadMemStats() {
       try {
         const r = await fetch('api/memories/backfill', { method: 'POST' })
         const data = await r.json()
-        showToast(t('memories.toast.vector_count', { count: data.count }))
+        // ok:false = pending memories but the embedding backend answered none
+        if (data.ok === false) showToast(t('memories.toast.vector_error'))
+        else showToast(t('memories.toast.vector_count', { count: data.embedded ?? data.count }))
         loadMemStats()
       } catch { showToast(t('memories.toast.vector_error')) }
     })
@@ -6783,15 +8798,110 @@ async function loadMemories() {
   }
   if (agent) params.set('agent', agent)
   if (currentMemTier) params.set('tier', currentMemTier)
+  // stale_days is listing-only on the server (400 with q), so a search wins.
+  if (currentMemTier === 'hot' && memStaleOnly && !q) params.set('stale_days', String(memStaleInfo.days))
   params.set('limit', '50')
 
   try {
     const res = await fetch(`api/memories?${params}`)
     const memories = await res.json()
+    // MEMKERESVAK917: the search is deliberately forgiving. When no row matches
+    // the query as asked, the endpoint drops those terms and answers with what
+    // the leftover filler words pulled in -- a body that looks exactly like a
+    // real hit. The difference rides the X-Memory-Search header, and reading it
+    // with res.json() alone threw it away, so a viewer saw fifty rescued rows
+    // as fifty hits. The header is only set on a search (q), not on listing.
+    renderMemSearchLabel(q ? res.headers.get('X-Memory-Search') : null)
+    memUseSince = Number(res.headers.get('X-Memory-Use-Since')) || 0
+    renderMemStaleBanner()
     renderMemories(memories)
   } catch (err) {
     console.error('Memória betöltés hiba:', err)
   }
+}
+
+// Shown ONLY when the answer is a rescue. A banner on every search would be
+// noise the eye learns to skip, which is the same failure in a new costume.
+// Both header shapes are handled: the fts branch sends `strict=..; relaxed=..;
+// hits=..`, the hybrid branch (the dashboard default) sends `fts=..; vector=..;
+// relaxed=..; vector-only=..`.
+function renderMemSearchLabel(header) {
+  const el = document.getElementById('memSearchLabel')
+  if (!el) return
+  if (!header || !/relaxed=true/.test(header)) {
+    el.hidden = true
+    el.textContent = ''
+    return
+  }
+  el.hidden = false
+  el.textContent = ''
+  const strong = document.createElement('strong')
+  strong.textContent = t('memories.relaxed.title')
+  const body = document.createElement('div')
+  body.textContent = t('memories.relaxed.body')
+  const raw = document.createElement('code')
+  raw.textContent = header
+  el.append(strong, body, raw)
+}
+
+// #571: the chain chips of one memory card. Every interpolation is a
+// Number() or an escapeHtml(t(...)), so the HTML is safe by construction.
+function memChainChipsHtml(supersedes, supersededBy) {
+  let html = ''
+  for (const r of supersedes) {
+    const key = r.partial ? 'memories.chain.supersedes_part' : 'memories.chain.supersedes'
+    html += `<button type="button" class="mem-chain-chip${r.partial ? ' partial' : ''}" data-ref-id="${Number(r.id)}">${escapeHtml(t(key, { id: Number(r.id) }))}</button>`
+  }
+  if (supersededBy) {
+    html += `<button type="button" class="mem-chain-chip replaced" data-ref-id="${Number(supersededBy)}">${escapeHtml(t('memories.chain.superseded_by', { id: Number(supersededBy) }))}</button>`
+  }
+  return html
+}
+
+// Card 3ddb2b1d (#572): a short title line instead of the first 120 characters.
+// Measured 2026-10-17 on a copy of the owner store (1377 rows): the first
+// sentence or "HEADER:" segment of the first line is the title; median 58,
+// 90th percentile 87 characters. A leading "FELULIRJA <id>:" is dropped (the
+// chain chip says it). When the first segment is only a date, time or status
+// word ("2026-10-03 16:02", "LEZARVA 2026-09-09 03:3x") the next segment is
+// added, otherwise the title would say nothing.
+const MEM_TITLE_MAX = 90
+// The marker ends at the first '.' or ':' FOLLOWED BY A SPACE, so a time inside
+// it ("FELULIRJA a 20:35-os allapotot.") does not end it early.
+const MEM_TITLE_PREFIX = /^\s*(?:fel[uü]l[ií]rja\b[^\n]{0,40}?[:.](?=\s)\s*|aktu[aá]lis[,:]?\s*)/i
+const MEM_TITLE_SPLIT = /(?<=.{12})(?:[.:;!?](?=\s)| -- | — )/
+const MEM_TITLE_NOISE = /\d{4}-\d{2}-\d{2}|\d{1,2}:\d{2}(?::\d{2})?x?|\d{1,2}:\dx|\b(?:BST|GMT|UTC)\b|\b(?:lez[aá]rva|friss[ií]tve|aktu[aá]lis|[aá]llapot|k[eé]sz|nyitott|sz[aá]l)\b|[~()[\],.\-:]/gi
+
+function memTitleParts(content) {
+  const body = String(content || '').replace(MEM_TITLE_PREFIX, '')
+  const nl = body.indexOf('\n')
+  const line = (nl >= 0 ? body.slice(0, nl) : body).trim()
+  const lead = body.length - body.trimStart().length
+  let head = line
+  let consumed = line.length
+  const m = MEM_TITLE_SPLIT.exec(line)
+  if (m) {
+    head = line.slice(0, m.index)
+    consumed = m.index + m[0].length
+    if (head.replace(MEM_TITLE_NOISE, '').replace(/\s+/g, '').length < 10) {
+      const restLine = line.slice(consumed)
+      const m2 = MEM_TITLE_SPLIT.exec(restLine.trimStart())
+      const skip = restLine.length - restLine.trimStart().length
+      const next = m2 ? restLine.trimStart().slice(0, m2.index) : restLine.trimStart()
+      head = `${head}: ${next}`
+      consumed += skip + (m2 ? m2.index + m2[0].length : next.length)
+    }
+  }
+  let title = head.trim().replace(/[.:;]+$/, '')
+  if (title.length > MEM_TITLE_MAX) {
+    const cut = title.slice(0, MEM_TITLE_MAX)
+    const sp = cut.lastIndexOf(' ')
+    title = (sp > MEM_TITLE_MAX * 0.55 ? cut.slice(0, sp) : cut).replace(/[\s,;(-]+$/, '') + '…'
+    // A clipped title has not said all of its segment: the snippet repeats it.
+    consumed = 0
+  }
+  const rest = body.slice(lead + consumed).replace(/^[\s.:;!?—-]+/, '').replace(/\s+/g, ' ').trim()
+  return { title: title || String(content || '').slice(0, MEM_TITLE_MAX), rest }
 }
 
 function renderMemories(memories) {
@@ -6803,10 +8913,20 @@ function renderMemories(memories) {
     item.className = 'mem-item'
 
     const tier = mem.tier || mem.category || 'warm'
-    const tierBadge = tierLabels[tier] || tier
+    const tierBadge = escapeHtml(tierLabels[tier] || tier)
     const badgeClass = 'badge-' + tier
-    const shortContent = mem.content.length > 120 ? mem.content.slice(0, 120) + '...' : mem.content
+    const { title: memTitle, rest: memRest } = memTitleParts(mem.content)
     const agentLabel = mem.agent_id || mainAgentId()
+    const ageDays = Math.floor((Date.now() / 1000 - memLastWrite(mem)) / 86400)
+    const isStaleHot = tier === 'hot' && memLastWrite(mem) > 0 && ageDays >= memStaleInfo.days
+    const supersedes = Array.isArray(mem.chain_refs) ? mem.chain_refs : []
+    const supersededBy = mem.chain_replaced_by || null
+    // Move targets: a stale hot row may go to warm or cold; a fully replaced
+    // row that is not cold yet gets the cold button.
+    const moveTargets = []
+    if (isStaleHot) moveTargets.push('warm', 'cold')
+    else if (supersededBy && tier !== 'cold') moveTargets.push('cold')
+    const chainChips = memChainChipsHtml(supersedes, supersededBy)
 
     // Build keywords HTML
     let keywordsHtml = ''
@@ -6823,11 +8943,16 @@ function renderMemories(memories) {
         <span class="mem-agent-badge">${escapeHtml(agentLabel)}</span>
         <span class="mem-date">${escapeHtml(mem.created_label || '')}</span>
         ${typeof mem.salience === 'number' ? `<span class="mem-salience" title="Relevancia ertek">S: ${mem.salience.toFixed(2)}</span>` : ''}
+        ${memUseChip(mem)}
+        ${isStaleHot ? `<span class="mem-stale-badge" title="${escapeHtml(t('memories.stale.age_title'))}">${escapeHtml(t('memories.stale.age', { days: ageDays }))}</span>` : ''}
       </div>
-      <div class="mem-content-short">${escapeHtml(shortContent)}</div>
+      ${chainChips ? `<div class="mem-chain">${chainChips}</div><div class="mem-ref-preview" hidden></div>` : ''}
+      <div class="mem-title">${escapeHtml(memTitle)}</div>
+      ${memRest ? `<div class="mem-content-short">${escapeHtml(memRest)}</div>` : ''}
       <div class="mem-content-full">${escapeHtml(mem.content)}</div>
       ${keywordsHtml}
       <div class="mem-item-footer">
+        ${moveTargets.map(tg => `<button class="btn-secondary mem-move-btn" data-move-tier="${escapeHtml(tg)}" style="padding:6px 14px; font-size:12px;">${escapeHtml(t(tg === 'warm' ? 'memories.stale.to_warm' : 'memories.stale.to_cold'))}</button>`).join('')}
         <button class="btn-secondary" data-edit-memid="${mem.id}" style="padding:6px 14px; font-size:12px;">${t('common.btn.edit')}</button>
         <button class="btn-danger" data-memid="${mem.id}" style="padding:6px 14px; font-size:12px;">${t('common.btn.delete')}</button>
       </div>
@@ -6835,9 +8960,23 @@ function renderMemories(memories) {
 
     // Toggle expand
     item.addEventListener('click', (e) => {
-      if (e.target.closest('.btn-danger') || e.target.closest('.btn-secondary')) return
+      if (e.target.closest('.btn-danger') || e.target.closest('.btn-secondary') || e.target.closest('.mem-chain') || e.target.closest('.mem-ref-preview')) return
       item.classList.toggle('expanded')
     })
+
+    for (const chip of item.querySelectorAll('[data-ref-id]')) {
+      chip.addEventListener('click', (e) => {
+        e.stopPropagation()
+        toggleMemRefPreview(item, chip.dataset.refId)
+      })
+    }
+
+    for (const b of item.querySelectorAll('[data-move-tier]')) {
+      b.addEventListener('click', (e) => {
+        e.stopPropagation()
+        moveMemTier(mem, b.dataset.moveTier)
+      })
+    }
 
     // Edit
     const editBtn = item.querySelector('[data-edit-memid]')
@@ -6856,12 +8995,32 @@ function renderMemories(memories) {
     const delBtn = item.querySelector('.btn-danger')
     delBtn.addEventListener('click', async (e) => {
       e.stopPropagation()
-      if (!confirm('Biztosan torlod ezt az emleket?')) return
+      const confirmed = await confirmDialog({
+        title: t('memories.confirm.delete_title'),
+        message: t('memories.confirm.delete'),
+        okLabel: t('memories.confirm.delete_ok'),
+        danger: true,
+      })
+      if (!confirmed) return
       try {
-        await fetch(`api/memories/${mem.id}`, { method: 'DELETE' })
-        showToast(t('memories.toast.deleted'))
-        loadMemories()
-        loadMemStats()
+        // MARVEENGAPS1020 (a): below data_delete level 3 the first DELETE files
+        // an approval request (409 approval_required). Once it is approved, the
+        // same click finishes the delete with the one-shot approval id.
+        let res = await fetch(`api/memories/${mem.id}`, { method: 'DELETE' })
+        let body = await res.json().catch(() => ({}))
+        if (res.status === 409 && body.error === 'approval_required' && body.status === 'approved') {
+          res = await fetch(`api/memories/${mem.id}?approval_id=${encodeURIComponent(body.approval_id)}`, { method: 'DELETE' })
+          body = await res.json().catch(() => ({}))
+        }
+        if (res.ok) {
+          showToast(t('memories.toast.deleted'))
+          loadMemories()
+          loadMemStats()
+        } else if (body.error === 'approval_required') {
+          showToast(t('memories.toast.delete_pending'))
+        } else {
+          showToast(`${t('common.error_delete')}: ${body.error || res.status}`)
+        }
       } catch {
         showToast(t('common.error_delete'))
       }
@@ -7404,7 +9563,7 @@ function showGraphPanel(node) {
   const created = node.mem.created_label || ''
   panel.innerHTML = `
     <div class="graph-panel-header">
-      <span class="badge badge-${node.tier}">${tierLabelsMap[node.tier] || node.tier}</span>
+      <span class="badge badge-${escapeHtml(node.tier)}">${escapeHtml(tierLabelsMap[node.tier] || node.tier)}</span>
       <span class="graph-panel-agent">${escapeHtml(node.agent)}</span>
       <button class="graph-panel-close" id="graphPanelCloseBtn">&times;</button>
     </div>
@@ -7770,7 +9929,7 @@ document.querySelectorAll('.catalog-filter-btn').forEach(btn => {
 })
 
 // Catalog install modal
-document.getElementById('catalogInstallClose').addEventListener('click', () => closeModal(catalogInstallOverlay))
+document.getElementById('catalogInstallClose').addEventListener('click', () => requestOverlayClose(catalogInstallOverlay))
 attachOverlayCloseGuard(catalogInstallOverlay)
 
 async function loadCatalog() {
@@ -7800,20 +9959,20 @@ function renderCatalog() {
     const authHint = item.authType === 'oauth' && item.authNote ? `<span class="catalog-auth-hint">${escapeHtml(item.authNote)}</span>` : ''
     card.innerHTML = `
       <div class="catalog-card-header">
-        <div class="catalog-card-icon">${item.icon || '?'}</div>
+        <div class="catalog-card-icon">${escapeHtml(item.icon || '?')}</div>
         <div class="catalog-card-info">
           <div class="catalog-card-name">
             ${escapeHtml(item.name)}
-            <span class="catalog-card-type ${item.type}">${item.type}</span>
-            ${item.infoUrl ? `<a href="${escapeHtml(item.infoUrl)}" target="_blank" rel="noopener" class="catalog-card-link" title="${t('connectors.tooltip.docs')}" onclick="event.stopPropagation()">&#x2197;</a>` : ''}
+            <span class="catalog-card-type ${escapeHtml(item.type)}">${escapeHtml(item.type)}</span>
+            ${safeHref(item.infoUrl, { relative: true }) ? `<a href="${escapeHtml(safeHref(item.infoUrl, { relative: true }))}" target="_blank" rel="noopener" class="catalog-card-link" title="${t('connectors.tooltip.docs')}" onclick="event.stopPropagation()">&#x2197;</a>` : ''}
           </div>
           <div class="catalog-card-desc">${escapeHtml(item.description)}</div>
         </div>
       </div>
       <div class="catalog-card-footer">
         ${item.installed
-          ? `<span class="catalog-install-btn installed" title="${item.configMatch ? t('connectors.tooltip.installed_mcp') : t('connectors.tooltip.installed_src', { src: escapeHtml(item.installedSource || '') })}">Telepítve &#10003;${item.configMatch ? ' (.mcp.json)' : item.installedSource === 'claude.ai' ? ' (claude.ai)' : item.installedSource === 'plugin' ? ' (plugin)' : ''}</span>${(item.installedSource === 'claude.ai' || item.configMatch) ? '' : `<a class="catalog-uninstall-link" data-id="${item.id}">Eltávolítás</a>`}`
-          : `<button class="catalog-install-btn install" data-id="${item.id}">${t('connectors.catalog.install_btn')}</button>${authHint}`
+          ? `<span class="catalog-install-btn installed" title="${item.configMatch ? t('connectors.tooltip.installed_mcp') : t('connectors.tooltip.installed_src', { src: escapeHtml(item.installedSource || '') })}">Telepítve &#10003;${item.configMatch ? ' (.mcp.json)' : item.installedSource === 'claude.ai' ? ' (claude.ai)' : item.installedSource === 'plugin' ? ' (plugin)' : ''}</span>${(item.installedSource === 'claude.ai' || item.configMatch) ? '' : `<a class="catalog-uninstall-link" data-id="${escapeHtml(item.id)}">Eltávolítás</a>`}`
+          : `<button class="catalog-install-btn install" data-id="${escapeHtml(item.id)}">${t('connectors.catalog.install_btn')}</button>${authHint}`
         }
       </div>
     `
@@ -7903,15 +10062,17 @@ document.getElementById('catalogInstallBtn').addEventListener('click', async () 
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ env: envData }),
     })
-    const data = await res.json()
-    if (!res.ok) throw new Error(data.error || 'Hiba')
+    // OWNERGATE3-1104: a refusal (403 owner_session_required) is shown in the page language (refusalReason).
+    const reply = await readActionReply(res)
+    const data = reply.body
+    if (!reply.ok) throw new Error(refusalReason(res, data))
     closeModal(catalogInstallOverlay)
     showToast(data.message || t('connectors.toast.installed'))
     // Reload both views
     loadCatalog()
     loadConnectors()
   } catch (err) {
-    showToast(`Hiba: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`)
   } finally {
     btn.disabled = false
     btn.querySelector('.btn-text').hidden = false
@@ -7920,16 +10081,24 @@ document.getElementById('catalogInstallBtn').addEventListener('click', async () 
 })
 
 async function catalogUninstall(item) {
-  if (!confirm(t('connectors.confirm.remove', { name: item.name }))) return
+  const confirmed = await confirmDialog({
+    title: t('connectors.confirm.remove_title'),
+    message: t('connectors.confirm.remove', { name: item.name }),
+    okLabel: t('connectors.confirm.remove_ok'),
+    danger: true,
+  })
+  if (!confirmed) return
   try {
     const res = await fetch(`api/mcp-catalog/${encodeURIComponent(item.id)}/uninstall`, { method: 'DELETE' })
-    const data = await res.json()
-    if (!res.ok) throw new Error(data.error || 'Hiba')
+    // OWNERGATE3-1104: an owner-session refusal is shown in the page language (refusalReason).
+    const reply = await readActionReply(res)
+    const data = reply.body || {}
+    if (!reply.ok) throw new Error(refusalReason(res, reply.body))
     showToast(data.message || t('connectors.toast.removed'))
     loadCatalog()
     loadConnectors()
   } catch (err) {
-    showToast(`Hiba: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`)
   }
 }
 
@@ -7950,8 +10119,8 @@ document.getElementById('addConnectorBtn').addEventListener('click', () => {
   loadNewConnectorAgents()
   openModal(connectorModalOverlay)
 })
-document.getElementById('connectorModalClose').addEventListener('click', () => closeModal(connectorModalOverlay))
-document.getElementById('connectorDetailClose').addEventListener('click', () => closeModal(connectorDetailOverlay))
+document.getElementById('connectorModalClose').addEventListener('click', () => requestOverlayClose(connectorModalOverlay))
+document.getElementById('connectorDetailClose').addEventListener('click', () => requestOverlayClose(connectorDetailOverlay))
 attachOverlayCloseGuard(connectorModalOverlay)
 attachOverlayCloseGuard(connectorDetailOverlay)
 
@@ -8006,6 +10175,7 @@ async function loadConnectors() {
     renderConnectors()
     loadExternalPaths()
     loadGitHubRepos()
+    loadOssInventory()
     loadVault()
   } catch (err) {
     console.error('Connector betöltés hiba:', err)
@@ -8025,13 +10195,13 @@ const BUILTIN_MCPS = [
     name: 'computer-use',
     label: 'Computer Use',
     desc: () => t('connectors.builtin.computer_use'),
-    get detailHtml() { return t('connectors.builtin.computer_use_html') },
+    get detailHtml() { return tHtml('connectors.builtin.computer_use_html') },
   },
   {
     name: 'chrome',
     label: 'Claude in Chrome',
     desc: () => t('connectors.builtin.chrome'),
-    get detailHtml() { return t('connectors.builtin.chrome_html') },
+    get detailHtml() { return tHtml('connectors.builtin.chrome_html') },
   },
 ]
 
@@ -8040,9 +10210,9 @@ function openBuiltinDetail(item) {
   if (!overlay) return
   document.getElementById('builtinDetailTitle').textContent = item.label
   document.getElementById('builtinDetailDesc').textContent = typeof item.desc === 'function' ? item.desc() : item.desc
-  // Static strings only. Never interpolate user or server input here
-  // without passing it through escapeHtml first -- detailHtml is a
-  // raw HTML sink.
+  // detailHtml is a raw HTML sink: it comes from tHtml(), which escapes the
+  // {brand} token (.env BRAND_NAME / BOT_NAME) and every param. Never build it
+  // from plain t() or from unescaped user or server input.
   document.getElementById('builtinDetailBody').innerHTML = item.detailHtml
   openModal(overlay)
   // Move focus into the dialog so keyboard users land inside the new
@@ -8102,7 +10272,7 @@ function renderConnectors() {
   if (connectors.length > 0 && !connectorCacheWarming && connectorCacheError && hasClaudeAiEntries) {
     const banner = document.createElement('div')
     banner.className = 'connector-stale-banner'
-    banner.innerHTML = t('connectors.stale_banner', { msg: escapeHtml(connectorCacheError) })
+    banner.innerHTML = tHtml('connectors.stale_banner', { msg: connectorCacheError })
     connectorGrid.appendChild(banner)
   }
   if (connectors.length === 0 && !BUILTIN_MCPS.length) {
@@ -8263,6 +10433,27 @@ function renderConnectors() {
 }
 
 // --- GitHub repo management ---
+// Install/update ran with npm lifecycle scripts skipped and the repo (or a
+// dependency) declares some: say so, and offer the per-repo opt-in, which
+// re-runs the update with scripts and stores the choice for later updates.
+async function offerGitHubRepoScriptsOptIn(name, skipped) {
+  if (!Array.isArray(skipped) || skipped.length === 0) return
+  const ok = await confirmDialog({
+    title: t('connectors.scripts_skipped_confirm_title'),
+    message: t('connectors.scripts_skipped_confirm', { name: name.replace('--', '/'), list: skipped.join(', ') }),
+    okLabel: t('connectors.scripts_skipped_confirm_ok'),
+    danger: true,
+  })
+  if (!ok) return
+  const res = await fetch(`api/connectors/github-repos/${encodeURIComponent(name)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ runScripts: true }),
+  })
+  const data = await res.json()
+  if (data.error) showToast(data.error)
+}
+
 async function loadGitHubRepos() {
   try {
     const res = await fetch('api/connectors/github-repos')
@@ -8275,7 +10466,7 @@ async function loadGitHubRepos() {
       const item = document.createElement('div')
       item.className = 'connector-external-item github-repo-item'
       const date = new Date(r.installedAt).toLocaleDateString('hu-HU')
-      item.innerHTML = `<div class="github-repo-info"><span class="github-repo-name">${escapeHtml(r.name.replace('--', '/'))}</span><span class="github-repo-date">${date}</span></div><div class="github-repo-actions"><button class="github-repo-update" title="Frissites">&#x21bb;</button><button class="github-repo-delete" title="Torles">&times;</button></div>`
+      item.innerHTML = `<div class="github-repo-info"><span class="github-repo-name">${escapeHtml(r.name.replace('--', '/'))}</span><span class="github-repo-date">${date}</span></div><div class="github-repo-actions"><button class="github-repo-update" title="${t('common.btn.refresh')}">&#x21bb;</button><button class="github-repo-delete" title="${t('common.btn.delete')}">&times;</button></div>`
       item.querySelector('.github-repo-update').addEventListener('click', async (e) => {
         const btn = e.currentTarget
         btn.disabled = true
@@ -8283,12 +10474,19 @@ async function loadGitHubRepos() {
         try {
           const res = await fetch(`api/connectors/github-repos/${encodeURIComponent(r.name)}`, { method: 'PATCH' })
           const data = await res.json()
-          if (data.error) { alert(data.error); return }
+          if (data.error) { showToast(data.error); return }
+          await offerGitHubRepoScriptsOptIn(r.name, data.scriptsSkipped)
           loadConnectors()
         } finally { btn.disabled = false; btn.innerHTML = '&#x21bb;' }
       })
       item.querySelector('.github-repo-delete').addEventListener('click', async () => {
-        if (!confirm(`Torlod: ${r.name.replace('--', '/')}?`)) return
+        const confirmed = await confirmDialog({
+          title: t('connectors.confirm.repo_delete_title'),
+          message: t('connectors.confirm.repo_delete', { name: r.name.replace('--', '/') }),
+          okLabel: t('connectors.confirm.repo_delete_ok'),
+          danger: true,
+        })
+        if (!confirmed) return
         await fetch(`api/connectors/github-repos/${encodeURIComponent(r.name)}`, { method: 'DELETE' })
         loadGitHubRepos()
         loadExternalPaths()
@@ -8298,6 +10496,149 @@ async function loadGitHubRepos() {
     }
   } catch { /* ignore */ }
 }
+
+// --- Adopted open-source inventory ---
+// Read-only view of scripts/opensource-inventory.py's output. The header count
+// is the number of DIRECT entries (transitive pip and npm deps are behind the
+// checkbox), shown next to the GitHub repos counter, which counts dashboard installs.
+let ossInventory = null
+const OSS_TYPE_ORDER = ['skill', 'vendor', 'mcp', 'npm', 'pip']
+
+async function loadOssInventory(refresh = false) {
+  const countEl = document.getElementById('ossInventoryCount')
+  const errEl = document.getElementById('ossInventoryError')
+  if (!countEl || !errEl) return
+  try {
+    const res = await fetch('api/opensource-inventory' + (refresh ? '?refresh=1' : ''))
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok || !Array.isArray(data.entries)) {
+      throw new Error(data.detail || data.error || ('HTTP ' + res.status))
+    }
+    ossInventory = data
+    const regenError = data.cache && data.cache.regen_error
+    errEl.hidden = !regenError
+    errEl.textContent = regenError ? t('oss.regen_error', { msg: regenError }) : ''
+    renderOssInventory()
+  } catch (err) {
+    countEl.textContent = '?'
+    errEl.hidden = false
+    errEl.textContent = t('oss.load_error', { msg: err && err.message ? err.message : String(err) })
+  }
+}
+
+function renderOssInventory() {
+  const data = ossInventory
+  const list = document.getElementById('ossInventoryList')
+  const countEl = document.getElementById('ossInventoryCount')
+  const metaEl = document.getElementById('ossInventoryMeta')
+  const showTransitive = !!document.getElementById('ossInventoryTransitive')?.checked
+  if (!data || !list) return
+  const entries = data.entries
+  const transitive = entries.filter((e) => !e.direct).length
+  countEl.textContent = String(entries.length - transitive)
+  const when = data.generated_at ? new Date(data.generated_at).toLocaleString(window._lang === 'en' ? 'en-GB' : 'hu-HU') : '?'
+  metaEl.textContent = t('oss.meta', { total: entries.length, transitive, when })
+  // Clones the generator counts but does not list (no name, path or origin),
+  // one sentence per reason, saying what the generator checked: the clone's
+  // own origin owner name is in the OSS_INVENTORY_OWN_OWNERS setting, or the
+  // clone has no readable http(s) or ssh origin. Clones the scan reaches that
+  // have a readable http(s) or ssh origin are listed unless their origin owner
+  // name is in the setting; while it is empty, the hint says so. What the scan
+  // does not look inside: scripts/opensource-inventory.py, "Git clones".
+  const ownEl = document.getElementById('ossInventoryOwnClones')
+  const unlisted = data.summary && data.summary.unlisted_clones
+  if (ownEl) {
+    const num = (v) => (Number.isInteger(v) ? v : 0)
+    const byReason = (unlisted && unlisted.by_reason) || {}
+    const inSetting = num(byReason.owner_in_setting)
+    const noHttpSsh = num(byReason.no_http_ssh_origin)
+    const settingEmpty = num(unlisted && unlisted.owners_in_setting) === 0
+    const listedClones = num(unlisted && unlisted.listed_network_clones)
+    const lines = []
+    if (inSetting > 0) lines.push(t('oss.clones_owner_in_setting', { n: inSetting }))
+    if (noHttpSsh > 0) lines.push(t('oss.clones_no_http_ssh_origin', { n: noHttpSsh }))
+    if (unlisted && settingEmpty && listedClones > 0) lines.push(t('oss.own_owners_hint'))
+    ownEl.hidden = lines.length === 0
+    ownEl.textContent = lines.join(' · ')
+  }
+  list.innerHTML = ''
+  if (entries.length === 0) {
+    list.innerHTML = `<div class="oss-inv-sub">${escapeHtml(t('oss.empty'))}</div>`
+    return
+  }
+  const byAgent = new Map()
+  for (const e of entries) {
+    if (!byAgent.has(e.agent)) byAgent.set(e.agent, [])
+    byAgent.get(e.agent).push(e)
+  }
+  for (const [agent, rows] of [...byAgent.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    const visible = rows.filter((e) => showTransitive || e.direct)
+    const hidden = rows.length - visible.length
+    const typeCounts = OSS_TYPE_ORDER
+      .map((ty) => [ty, rows.filter((e) => e.type === ty && (showTransitive || e.direct)).length])
+      .filter(([, n]) => n > 0)
+      .map(([ty, n]) => `${ty} ${n}`)
+      .join(' · ')
+    const group = document.createElement('div')
+    group.className = 'oss-inv-agent'
+    group.innerHTML = `<div class="oss-inv-agent-head"><span>${escapeHtml(agent)}</span>`
+      + `<span class="oss-inv-agent-counts">${escapeHtml(t('oss.agent_count', { n: visible.length }))}`
+      + `${typeCounts ? ' · ' + escapeHtml(typeCounts) : ''}`
+      + `${hidden > 0 ? ' · ' + escapeHtml(t('oss.transitive_hidden', { n: hidden })) : ''}</span></div>`
+    for (const e of visible) group.appendChild(renderOssRow(e))
+    list.appendChild(group)
+  }
+}
+
+function renderOssRow(e) {
+  const item = document.createElement('div')
+  item.className = 'connector-external-item oss-inv-item'
+  const safeUrl = typeof e.source_url === 'string' && /^https:\/\//.test(e.source_url) ? e.source_url : null
+  const name = safeUrl
+    ? `<a class="oss-inv-name" href="${escapeHtml(safeHref(safeUrl))}" target="_blank" rel="noopener noreferrer">${escapeHtml(e.name)}</a>`
+    : `<span class="oss-inv-name">${escapeHtml(e.name)}</span>`
+  // An npx MCP spec without @version is its bare name: that is "not pinned",
+  // not a version string.
+  const version = e.version || (e.declared && e.declared !== e.name ? e.declared : t('oss.unpinned'))
+  const sub = []
+  if (e.license) {
+    const tip = e.license_source === 'skill-header' ? ` title="${escapeHtml(t('oss.license_header'))}"` : ''
+    sub.push(`<span${tip}>${escapeHtml(e.license)}${e.license_source === 'skill-header' ? '*' : ''}</span>`)
+  } else {
+    sub.push(escapeHtml(t('oss.license_unknown')))
+  }
+  if (e.stars) {
+    sub.push(`<span title="${escapeHtml(t('oss.source', { src: e.stars_source || '' }))}">${escapeHtml(t('oss.stars', { n: e.stars }))}</span>`)
+  }
+  if (e.used_in && e.used_in.length) sub.push(escapeHtml(t('oss.used_in', { list: e.used_in.join(', ') })))
+  sub.push(escapeHtml(e.path))
+  let html = `<div class="oss-inv-line">${name}<span class="oss-inv-type">${escapeHtml(e.type)}</span>`
+    + `<span class="oss-inv-version">${escapeHtml(version)}</span></div>`
+    + `<div class="oss-inv-sub">${sub.join(' · ')}</div>`
+  if (e.effect) {
+    html += `<div class="oss-inv-effect">${escapeHtml(t('oss.effect', { text: e.effect }))}`
+      + ` <span class="oss-inv-sub">(${escapeHtml(e.effect_source || '')})</span></div>`
+  }
+  item.innerHTML = html
+  return item
+}
+
+;(function wireOssInventory() {
+  const toggle = document.getElementById('ossInventoryToggle')
+  const body = document.getElementById('ossInventoryBody')
+  if (!toggle || !body) return
+  toggle.addEventListener('click', () => {
+    const arrow = toggle.querySelector('.connector-scope-toggle')
+    if (body.hidden) { body.hidden = false; arrow.textContent = '▼' }
+    else { body.hidden = true; arrow.textContent = '▶' }
+  })
+  document.getElementById('ossInventoryTransitive')?.addEventListener('change', renderOssInventory)
+  const refreshBtn = document.getElementById('ossInventoryRefresh')
+  refreshBtn?.addEventListener('click', async () => {
+    refreshBtn.disabled = true
+    try { await loadOssInventory(true) } finally { refreshBtn.disabled = false }
+  })
+})()
 
 ;(function wireGitHubRepos() {
   const toggle = document.getElementById('githubReposToggle')
@@ -8314,8 +10655,17 @@ async function loadGitHubRepos() {
   addBtn.addEventListener('click', async () => {
     const val = input.value.trim()
     if (!val) return
+    const runScriptsBox = document.getElementById('githubRepoRunScripts')
+    const runScripts = !!(runScriptsBox && runScriptsBox.checked)
+    const confirmed = await confirmDialog({
+      title: t('connectors.install_confirm_title'),
+      message: t(runScripts ? 'connectors.install_confirm_scripts' : 'connectors.install_confirm', { url: val }),
+      okLabel: t('connectors.install_confirm_ok'),
+      danger: runScripts,
+    })
+    if (!confirmed) return
     addBtn.disabled = true
-    addBtn.textContent = 'Telepites...'
+    addBtn.textContent = t('common.installing')
     status.hidden = false
     status.className = 'github-repo-status loading'
     status.textContent = t('connectors.cloning')
@@ -8323,7 +10673,7 @@ async function loadGitHubRepos() {
       const res = await fetch('api/connectors/github-repos', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: val }),
+        body: JSON.stringify({ url: val, runScripts }),
       })
       const data = await res.json()
       if (data.error) {
@@ -8331,6 +10681,10 @@ async function loadGitHubRepos() {
         status.textContent = data.error
         return
       }
+      // Installed, but npm install failed: keep it visible instead of reporting success.
+      // The opt-in is only offered after an install that completed.
+      const warning = data.installWarning ? t('connectors.install_warning', { msg: data.installWarning }) : ''
+      if (!warning) await offerGitHubRepoScriptsOptIn(data.repo.name, data.scriptsSkipped)
       if (data.requiredEnvVars && data.requiredEnvVars.length > 0) {
         status.className = 'github-repo-status loading'
         status.textContent = t('connectors.api_keys_needed')
@@ -8365,13 +10719,19 @@ async function loadGitHubRepos() {
       loadGitHubRepos()
       loadExternalPaths()
       loadConnectors()
-      setTimeout(() => { status.hidden = true }, 4000)
+      if (warning) {
+        // The failed npm install stays in the status line, in red, in place of the success text (the MCP
+        // servers may not start). A key-save failure is kept below it.
+        const keyError = status.className === 'github-repo-status error' ? '\n\n' + status.textContent : ''
+        status.className = 'github-repo-status error'
+        status.textContent = warning + keyError
+      } else setTimeout(() => { status.hidden = true }, 4000)
     } catch (err) {
       status.className = 'github-repo-status error'
       status.textContent = 'Hiba: ' + err.message
     } finally {
       addBtn.disabled = false
-      addBtn.textContent = 'Telepites'
+      addBtn.textContent = t('connectors.catalog.install_btn')
     }
   })
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') addBtn.click() })
@@ -8390,11 +10750,17 @@ async function loadVault() {
       const item = document.createElement('div')
       item.className = 'connector-external-item'
       const date = new Date(s.updatedAt).toLocaleDateString('hu-HU')
-      item.innerHTML = `<div class="github-repo-info"><span class="github-repo-name">${escapeHtml(s.label)}</span><span class="github-repo-date">${escapeHtml(s.id)} &middot; ${date}</span></div><button title="Torles" style="background:none;border:none;color:var(--danger);cursor:pointer;font-size:14px;padding:2px 6px">&times;</button>`
+      item.innerHTML = `<div class="github-repo-info"><span class="github-repo-name">${escapeHtml(s.label)}</span><span class="github-repo-date">${escapeHtml(s.id)} &middot; ${date}</span></div><button title="${t('common.btn.delete')}" style="background:none;border:none;color:var(--danger);cursor:pointer;font-size:14px;padding:2px 6px">&times;</button>`
       item.querySelector('button').addEventListener('click', async () => {
-        if (!confirm(`Torlod: ${s.label}?`)) return
+        const confirmed = await confirmDialog({
+          title: t('vault.confirm.delete_title'),
+          message: t('vault.confirm.delete', { name: s.label }),
+          okLabel: t('vault.confirm.delete_ok'),
+          danger: true,
+        })
+        if (!confirmed) return
         const res = await fetch(`api/vault/${encodeURIComponent(s.id)}`, { method: 'DELETE' })
-        if (!res.ok) { showToast('Törlés sikertelen'); return }
+        if (!res.ok) { showToast(t('vault.toast.delete_error')); return }
         loadVault()
       })
       list.appendChild(item)
@@ -8425,7 +10791,7 @@ async function loadVault() {
     })
     if (!res.ok) {
       const e = await res.json().catch(() => ({}))
-      showToast('Mentés sikertelen: ' + (e.error || res.status))
+      showToast(t('vault.toast.save_failed', { msg: e.error || res.status }))
       return
     }
     idInput.value = ''
@@ -8523,10 +10889,10 @@ function renderSshKeys() {
       <td class="ssh-table-mono" style="font-size:11px">${k.fingerprint ? escapeHtml(k.fingerprint.slice(0,28)) + '…' : ''}</td>
       <td class="ssh-table-mono">${k.createdAt ? new Date(k.createdAt).toLocaleDateString('hu-HU') : ''}</td>
       <td><div class="ssh-table-actions">
-        <button class="btn-secondary btn-compact ssh-key-copy-btn" data-id="${escapeHtml(k.id)}" title="Publikus kulcs másolása">
+        <button class="btn-secondary btn-compact ssh-key-copy-btn" data-id="${escapeHtml(k.id)}" title="${escapeHtml(t('vault.ssh.keys.copy_title'))}">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
         </button>
-        <button class="btn-secondary btn-compact ssh-key-delete-btn" data-id="${escapeHtml(k.id)}" title="Törlés">
+        <button class="btn-secondary btn-compact ssh-key-delete-btn" data-id="${escapeHtml(k.id)}" title="${escapeHtml(t('common.btn.delete'))}">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
         </button>
       </div></td>
@@ -8549,15 +10915,30 @@ function renderSshKeys() {
   })
   tbody.querySelectorAll('.ssh-key-delete-btn').forEach(btn => {
     btn.addEventListener('click', async () => {
-      if (!confirm('Biztosan törlöd ezt a kulcsot?')) return
-      await fetch(`api/vault/ssh-keys/${encodeURIComponent(btn.dataset.id)}`, { method: 'DELETE' })
+      const key = _sshKeys.find(k => k.id === btn.dataset.id)
+      // Deleting a key unassigns it server-side, so name the servers that lose it.
+      const servers = _sshServers
+        .filter(s => (s.sshKeyId || s.assignedKeyId || s.vaultKeyId) === btn.dataset.id)
+        .map(s => `"${s.name || s.id}"`)
+      let message = t('vault.ssh.confirm.key_delete', { name: (key && key.label) || btn.dataset.id })
+      if (servers.length) message += '\n\n' + t('vault.ssh.confirm.key_delete_servers', { servers: servers.join(', ') })
+      const confirmed = await confirmDialog({
+        title: t('vault.ssh.confirm.key_delete_title'),
+        message,
+        okLabel: t('vault.ssh.confirm.key_delete_ok'),
+        danger: true,
+      })
+      if (!confirmed) return
+      const res = await fetch(`api/vault/ssh-keys/${encodeURIComponent(btn.dataset.id)}`, { method: 'DELETE' })
+      if (!res.ok) showToast(t('vault.toast.delete_error'))
       await loadSshKeys()
+      await loadSshServers()
     })
   })
 }
 
 function _refreshKeySelects() {
-  const opts = ['<option value="">-- Nincs kulcs --</option>',
+  const opts = [`<option value="">${escapeHtml(t('vault.ssh.no_key'))}</option>`,
     ..._sshKeys.map(k => `<option value="${escapeHtml(k.id)}">${escapeHtml(k.label || k.id)} (${escapeHtml(k.username || '')})</option>`)
   ].join('')
   document.querySelectorAll('.ssh-key-select').forEach(sel => {
@@ -8568,28 +10949,28 @@ function _refreshKeySelects() {
 }
 
 function _sshKeyBadge(status) {
-  const labels = { ok: 'OK', missing: 'Hiányzó', expired: 'Lejárt' }
+  const labels = { ok: t('vault.ssh.status.ok'), missing: t('vault.ssh.status.missing'), expired: t('vault.ssh.status.expired') }
   const icons = {
     ok: '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>',
     missing: '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
     expired: '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
   }
-  return `<span class="ssh-key-badge ${status}">${icons[status] || ''} ${labels[status] || status}</span>`
+  return `<span class="ssh-key-badge ${escapeHtml(status)}">${icons[status] || ''} ${escapeHtml(labels[status] || status)}</span>`
 }
 
 function _sshKeyAssignSelect(s) {
   const currentKeyId = s.sshKeyId || s.assignedKeyId || s.vaultKeyId || ''
-  const opts = ['<option value="">-- Nincs kulcs --</option>',
+  const opts = [`<option value="">${escapeHtml(t('vault.ssh.no_key'))}</option>`,
     ..._sshKeys.map(k => {
       const sel = (currentKeyId && currentKeyId === k.id) ? ' selected' : ''
       return `<option value="${escapeHtml(k.id)}"${sel}>${escapeHtml(k.label || k.id)}</option>`
     })
   ].join('')
-  return `<select class="ssh-key-assign ssh-key-select" data-id="${escapeHtml(s.id)}" title="Kulcs hozzárendelése">${opts}</select>`
+  return `<select class="ssh-key-assign ssh-key-select" data-id="${escapeHtml(s.id)}" title="${escapeHtml(t('vault.ssh.assign_title'))}">${opts}</select>`
 }
 
 function _sshInfoBtn(s) {
-  return `<button class="ssh-info-btn" data-id="${escapeHtml(s.id)}" data-user="${escapeHtml(s.user)}" title="Telepítési útmutató">i</button>`
+  return `<button class="ssh-info-btn" data-id="${escapeHtml(s.id)}" data-user="${escapeHtml(s.user)}" title="${escapeHtml(t('vault.ssh.install_title'))}">i</button>`
 }
 
 function renderSshServers() {
@@ -8641,10 +11022,10 @@ function renderSshServers() {
         <div style="display:flex;align-items:center;gap:4px;width:100%">
           ${_sshKeyAssignSelect(s)}
           <div class="ssh-card-actions">
-            <button class="btn-secondary btn-compact ssh-edit-btn" data-id="${escapeHtml(s.id)}" title="Szerkesztés">
+            <button class="btn-secondary btn-compact ssh-edit-btn" data-id="${escapeHtml(s.id)}" title="${escapeHtml(t('common.btn.edit'))}">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
             </button>
-            <button class="btn-secondary btn-compact ssh-delete-btn" data-id="${escapeHtml(s.id)}" title="Törlés">
+            <button class="btn-secondary btn-compact ssh-delete-btn" data-id="${escapeHtml(s.id)}" title="${escapeHtml(t('common.btn.delete'))}">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
             </button>
           </div>
@@ -8663,10 +11044,10 @@ function renderSshServers() {
       <td>${_sshKeyAssignSelect(s)}</td>
       <td style="color:var(--text-muted)">${escapeHtml(s.desc || '')}</td>
       <td><div class="ssh-table-actions">
-        <button class="btn-secondary btn-compact ssh-edit-btn" data-id="${escapeHtml(s.id)}" title="Szerkesztés">
+        <button class="btn-secondary btn-compact ssh-edit-btn" data-id="${escapeHtml(s.id)}" title="${escapeHtml(t('common.btn.edit'))}">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
         </button>
-        <button class="btn-secondary btn-compact ssh-delete-btn" data-id="${escapeHtml(s.id)}" title="Törlés">
+        <button class="btn-secondary btn-compact ssh-delete-btn" data-id="${escapeHtml(s.id)}" title="${escapeHtml(t('common.btn.delete'))}">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
         </button>
       </div></td>
@@ -8677,11 +11058,18 @@ function renderSshServers() {
   document.querySelectorAll('.ssh-delete-btn').forEach(btn => {
     btn.addEventListener('click', async () => {
       const id = btn.getAttribute('data-id')
-      if (!confirm(`Törlöd: ${id}?`)) return
+      const server = _sshServers.find(s => s.id === id)
+      const confirmed = await confirmDialog({
+        title: t('vault.ssh.confirm.server_delete_title'),
+        message: t('vault.ssh.confirm.server_delete', { name: (server && server.name) || id }),
+        okLabel: t('vault.ssh.confirm.server_delete_ok'),
+        danger: true,
+      })
+      if (!confirmed) return
       try {
         await fetch(`api/vault/ssh-servers/${encodeURIComponent(id)}`, { method: 'DELETE' })
         await loadSshServers()
-      } catch { showToast('Törlés sikertelen') }
+      } catch { showToast(t('vault.toast.delete_error')) }
     })
   })
 
@@ -8702,7 +11090,7 @@ function renderSshServers() {
       if (keySel) keySel.value = server.sshKeyId || server.assignedKeyId || server.vaultKeyId || ''
 
       const titleEl = document.getElementById('sshAddPanelTitle')
-      if (titleEl) titleEl.textContent = `Szerver szerkesztése – ${server.name}`
+      if (titleEl) titleEl.textContent = t('vault.ssh.form.edit_title', { name: server.name })
 
       const panel = document.getElementById('sshAddPanel')
       panel.hidden = false
@@ -8738,6 +11126,8 @@ function openSshKeygenModal(callback) {
   document.getElementById('sshKeygenSpinner').hidden = true
   document.getElementById('sshKeygenResult').hidden = true
   document.getElementById('sshKeygenFooter').hidden = false
+  document.getElementById('sshKeygenSubmitBtn').hidden = false
+  document.getElementById('sshKeygenDoneBtn').hidden = true
   document.getElementById('sshKeygenForm').hidden = false
   document.getElementById('sshKeygenPubkeyBox').value = ''
   _sshKeygenCallback = callback || null
@@ -8750,15 +11140,17 @@ function openSshKeygenModal(callback) {
   const closeBtn = document.getElementById('sshKeygenClose')
   const submitBtn = document.getElementById('sshKeygenSubmitBtn')
   const copyBtn = document.getElementById('sshKeygenCopyBtn')
+  const doneBtn = document.getElementById('sshKeygenDoneBtn')
   if (!overlay) return
 
   overlay.addEventListener('click', e => { if (e.target === overlay) closeModal(overlay) })
   closeBtn.addEventListener('click', () => closeModal(overlay))
+  doneBtn.addEventListener('click', () => closeModal(overlay))
 
   submitBtn.addEventListener('click', async () => {
     const label = document.getElementById('sshKeygenLabelInput').value.trim()
     const username = document.getElementById('sshKeygenUserInput').value.trim()
-    if (!label || !username) { showToast('Cimke és felhasználónév megadása kötelező'); return }
+    if (!label || !username) { showToast(t('vault.ssh.toast.label_user_required')); return }
 
     document.getElementById('sshKeygenForm').hidden = true
     document.getElementById('sshKeygenSpinner').hidden = false
@@ -8772,23 +11164,33 @@ function openSshKeygenModal(callback) {
         body: JSON.stringify({ label, username }),
       })
       const data = await res.json()
-      if (!res.ok) { showToast(data.error || 'Generálás sikertelen'); resetKeygenForm(); return }
+      if (!res.ok) {
+        showToast(data.code === 'label_taken' ? t('vault.ssh.toast.label_taken', { name: label }) : (data.error || t('vault.ssh.keygen.failed')))
+        resetKeygenForm()
+        if (data.code === 'label_taken') document.getElementById('sshKeygenLabelInput').focus()
+        return
+      }
 
       const pubkey = data.publicKey || (data.key && data.key.publicKey) || ''
       document.getElementById('sshKeygenPubkeyBox').value = pubkey
       document.getElementById('sshKeygenSpinner').hidden = true
       document.getElementById('sshKeygenResult').hidden = false
+      // The key is made: the footer offers Close, not a second Generate.
+      submitBtn.hidden = true
+      doneBtn.hidden = false
+      document.getElementById('sshKeygenFooter').hidden = false
+      doneBtn.focus()
 
       await loadSshKeys()
       if (_sshKeygenCallback) _sshKeygenCallback(data.key || data)
-    } catch { showToast('Hálózati hiba'); resetKeygenForm() }
+    } catch { showToast(t('vault.toast.network_error')); resetKeygenForm() }
   })
 
   copyBtn?.addEventListener('click', () => {
     const val = document.getElementById('sshKeygenPubkeyBox').value
     navigator.clipboard.writeText(val).then(() => {
-      copyBtn.textContent = 'Másolva!'
-      setTimeout(() => { copyBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Másolás' }, 2000)
+      copyBtn.textContent = t('common.copied')
+      setTimeout(() => { copyBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> ' + escapeHtml(t('common.copy')) }, 2000)
     }).catch(() => {})
   })
 
@@ -8797,6 +11199,8 @@ function openSshKeygenModal(callback) {
     document.getElementById('sshKeygenSpinner').hidden = true
     document.getElementById('sshKeygenResult').hidden = true
     document.getElementById('sshKeygenFooter').hidden = false
+    submitBtn.hidden = false
+    doneBtn.hidden = true
   }
 })()
 
@@ -8835,9 +11239,9 @@ async function _sshInfoLoadKey(keyId, serverUser) {
 
   const cmd2text = pubkey
     ? `echo "${pubkey}" >> ~/.ssh/authorized_keys`
-    : `echo "<publikus kulcs ide>" >> ~/.ssh/authorized_keys`
+    : `echo "${t('vault.ssh.install.pubkey_here')}" >> ~/.ssh/authorized_keys`
   document.getElementById('sshInfoCmd2').textContent = cmd2text
-  document.getElementById('sshInfoPubkey').textContent = pubkey || '(kulcs nem elérhető)'
+  document.getElementById('sshInfoPubkey').textContent = pubkey || t('vault.ssh.install.pubkey_missing')
 
   const overlay = document.getElementById('sshInfoOverlay')
   overlay.querySelectorAll('.ssh-code-copy').forEach(btn => {
@@ -8860,7 +11264,7 @@ function _sshInfoLoadServer(serverId) {
   document.getElementById('sshInfoServerName').textContent = server ? server.name : (serverId || '')
 
   const keySel = document.getElementById('sshInfoKeySelect')
-  keySel.innerHTML = ['<option value="">-- Nincs kulcs --</option>',
+  keySel.innerHTML = [`<option value="">${escapeHtml(t('vault.ssh.no_key'))}</option>`,
     ..._sshKeys.map(k => `<option value="${escapeHtml(k.id)}">${escapeHtml(k.label || k.id)} (${escapeHtml(k.username || '')})</option>`)
   ].join('')
   const assignedKeyId = (server && (server.sshKeyId || server.assignedKeyId || server.vaultKeyId)) || ''
@@ -8876,11 +11280,11 @@ function openSshInfoModal(preselectedServerId, { keyOnly = false } = {}) {
     // Key-only mode: hide server selector, reset server context
     serverSection.hidden = true
     _sshInfoServerId = null
-    document.getElementById('sshInfoServerName').textContent = 'Új szerver'
+    document.getElementById('sshInfoServerName').textContent = t('vault.ssh.install.new_server')
 
     // Populate key selector without a pre-selected key
     const keySel = document.getElementById('sshInfoKeySelect')
-    keySel.innerHTML = ['<option value="">-- Válassz kulcsot --</option>',
+    keySel.innerHTML = [`<option value="">${escapeHtml(t('vault.ssh.choose_key'))}</option>`,
       ..._sshKeys.map(k => `<option value="${escapeHtml(k.id)}">${escapeHtml(k.label || k.id)} (${escapeHtml(k.username || '')})</option>`)
     ].join('')
     // Pre-select whatever is chosen in the form's key dropdown
@@ -8896,7 +11300,7 @@ function openSshInfoModal(preselectedServerId, { keyOnly = false } = {}) {
     // Normal mode: show server selector, pick first server by default
     serverSection.hidden = false
     const serverSel = document.getElementById('sshInfoServerSelect')
-    serverSel.innerHTML = ['<option value="">-- Válassz szervert --</option>',
+    serverSel.innerHTML = [`<option value="">${escapeHtml(t('vault.ssh.choose_server'))}</option>`,
       ..._sshServers.map(s => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.name)} (${escapeHtml(s.host)})</option>`)
     ].join('')
 
@@ -8963,7 +11367,7 @@ function openSshInfoModal(preselectedServerId, { keyOnly = false } = {}) {
   function resetSshAddForm() {
     _sshEditingId = null
     const titleEl = document.getElementById('sshAddPanelTitle')
-    if (titleEl) titleEl.textContent = 'Szerver hozzáadása'
+    if (titleEl) titleEl.textContent = t('vault.ssh.form.add_title')
     document.getElementById('sshNameInput').value = ''
     document.getElementById('sshHostInput').value = ''
     document.getElementById('sshUserInput').value = ''
@@ -9002,7 +11406,12 @@ function openSshInfoModal(preselectedServerId, { keyOnly = false } = {}) {
     const port = parseInt(document.getElementById('sshPortInput').value, 10) || 22
     const desc = document.getElementById('sshDescInput').value.trim()
     const sshKeyId = document.getElementById('sshKeySelectInput')?.value || null
-    if (!name || !host || !user) { showToast('Név, IP és felhasználó megadása kötelező'); return }
+    // Point at the first empty required field, as the new-skill form does.
+    const missing = !name ? ['sshNameInput', 'vault.ssh.form.name_required']
+      : !host ? ['sshHostInput', 'vault.ssh.form.host_required']
+      : !user ? ['sshUserInput', 'vault.ssh.form.user_required']
+      : null
+    if (missing) { document.getElementById(missing[0]).focus(); showToast(t(missing[1])); return }
     const isEdit = !!_sshEditingId
     try {
       const res = await fetch(
@@ -9015,13 +11424,13 @@ function openSshInfoModal(preselectedServerId, { keyOnly = false } = {}) {
       )
       if (!res.ok) {
         const err = await res.json().catch(() => ({}))
-        showToast(err.error || 'Hiba a mentéskor'); return
+        showToast(err.error || t('common.error_save')); return
       }
       resetSshAddForm()
       panel.hidden = true
       await loadSshServers()
-      showToast(isEdit ? 'Szerver frissítve' : 'Szerver hozzáadva')
-    } catch { showToast('Hálózati hiba') }
+      showToast(t(isEdit ? 'vault.ssh.toast.server_updated' : 'vault.ssh.toast.server_added'))
+    } catch { showToast(t('vault.toast.network_error')) }
   })
 
   cardViewBtn?.addEventListener('click', () => {
@@ -9040,7 +11449,7 @@ function openSshInfoModal(preselectedServerId, { keyOnly = false } = {}) {
     tableView.hidden = false
   })
 
-  // Kulcstároló "Új kulcs generálása" button
+  // SSH key store "New key" button
   document.getElementById('sshKeyNewBtn')?.addEventListener('click', () => {
     openSshKeygenModal()
   })
@@ -9084,7 +11493,7 @@ function renderVaultGrid(secrets) {
     card.className = 'vault-card'
     const date = new Date(s.updatedAt).toLocaleDateString('hu-HU')
     const bindingCount = _vaultBindings.filter(b => b.vaultSecretId === s.id).length
-    const bindingBadge = bindingCount > 0 ? `<span class="vault-binding-badge" title="${bindingCount} kotes">${bindingCount} kotes</span>` : ''
+    const bindingBadge = bindingCount > 0 ? `<span class="vault-binding-badge" title="${escapeHtml(t('vault.binding_count', { n: bindingCount }))}">${escapeHtml(t('vault.binding_count', { n: bindingCount }))}</span>` : ''
     card.innerHTML = `<div class="vault-card-header"><div class="vault-card-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div><div class="vault-card-title"><div class="vault-card-id">${escapeHtml(s.id)} ${bindingBadge}</div>${s.label !== s.id ? `<div class="vault-card-label">${escapeHtml(s.label)}</div>` : ''}</div><div class="vault-card-meta">${date}</div></div><div class="vault-card-actions"><button class="btn-secondary btn-compact vault-card-reveal" data-id="${escapeHtml(s.id)}"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>${t('vault.btn.show')}</button><button class="btn-secondary btn-compact vault-card-edit" data-id="${escapeHtml(s.id)}" data-label="${escapeHtml(s.label)}"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>${t('vault.btn.edit')}</button><button class="btn-secondary btn-compact vault-card-delete" data-id="${escapeHtml(s.id)}"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>${t('vault.btn.delete')}</button></div>`
     list.appendChild(card)
   }
@@ -9106,59 +11515,79 @@ function renderVaultGrid(secrets) {
     })
   })
   list.querySelectorAll('.vault-card-edit').forEach(btn => {
-    btn.addEventListener('click', async () => {
+    btn.addEventListener('click', () => {
       const id = btn.getAttribute('data-id')
-      const label = btn.getAttribute('data-label')
+      const label = (btn.getAttribute('data-label') || '').trim() || id
       const card = btn.closest('.vault-card')
       const existing = card.querySelector('.vault-card-edit-form')
       if (existing) { existing.remove(); return }
       card.querySelector('.vault-card-value')?.remove()
-      const res = await fetch(`api/vault/${encodeURIComponent(id)}`)
-      const data = await res.json()
-      if (!data.value) return
+      // The current value is never fetched here: leaving the value empty keeps it,
+      // and the card has its own Show button.
+      const initialLabel = label === id ? '' : label
       const form = document.createElement('div')
       form.className = 'vault-card-edit-form'
-      form.innerHTML = `<input type="password" class="input vault-edit-value" value="${escapeHtml(data.value)}" style="font-size:13px;margin-bottom:6px"><button class="btn-primary btn-compact vault-edit-save">${t('vault.btn.save')}</button> <button class="btn-secondary btn-compact vault-edit-cancel">${t('vault.btn.cancel')}</button>`
+      form.innerHTML = `<input type="text" class="input vault-edit-label" maxlength="200" value="${escapeHtml(initialLabel)}" placeholder="${escapeHtml(id)}" aria-label="${escapeHtml(t('vault.field.desc_label'))}" style="font-size:13px"><input type="password" class="input vault-edit-value" value="" placeholder="${escapeHtml(t('vault.edit.value_placeholder'))}" aria-label="${escapeHtml(t('vault.field.value_label'))}" autocomplete="new-password" style="font-size:13px"><button class="btn-primary btn-compact vault-edit-save">${t('vault.btn.save')}</button> <button class="btn-secondary btn-compact vault-edit-cancel">${t('vault.btn.cancel')}</button>`
       card.appendChild(form)
+      const labelInput = form.querySelector('.vault-edit-label')
       const input = form.querySelector('.vault-edit-value')
-      input.focus()
-      input.select()
+      labelInput.focus()
       form.querySelector('.vault-edit-cancel').addEventListener('click', () => form.remove())
       form.querySelector('.vault-edit-save').addEventListener('click', async () => {
         const newVal = input.value
-        if (!newVal) return
+        const newLabel = labelInput.value.trim() || id
+        if (!newVal && newLabel === label) { form.remove(); return }
         const saveBtn = form.querySelector('.vault-edit-save')
         saveBtn.disabled = true
         saveBtn.textContent = '...'
-        const res = await fetch('api/vault', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id, label, value: newVal }),
-        })
-        if (!res.ok) {
-          const e = await res.json().catch(() => ({}))
-          showToast('Frissítés sikertelen: ' + (e.error || res.status))
+        const request = newVal
+          ? ['api/vault', 'POST', { id, label: newLabel, value: newVal }]
+          : [`api/vault/${encodeURIComponent(id)}`, 'PATCH', { label: newLabel }]
+        let failure = null
+        try {
+          const res = await fetch(request[0], {
+            method: request[1],
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(request[2]),
+          })
+          if (!res.ok) {
+            const e = await res.json().catch(() => ({}))
+            failure = e.error || res.status
+          }
+        } catch (err) {
+          failure = err && err.message ? err.message : String(err)
+        }
+        if (failure !== null) {
+          showToast(t('vault.toast.update_error') + ': ' + failure)
           saveBtn.disabled = false
-          saveBtn.textContent = 'Mentés'
+          saveBtn.textContent = t('vault.btn.save')
           return
         }
         form.remove()
-        showToast('Kulcs frissitve es szinkronizalva')
+        showToast(t(newVal ? 'vault.toast.updated_synced' : 'vault.toast.label_updated'))
         loadVaultPage()
         loadVault()
       })
-      input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') form.querySelector('.vault-edit-save').click()
-        if (e.key === 'Escape') form.remove()
-      })
+      for (const el of [labelInput, input]) {
+        el.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') form.querySelector('.vault-edit-save').click()
+          if (e.key === 'Escape') form.remove()
+        })
+      }
     })
   })
   list.querySelectorAll('.vault-card-delete').forEach(btn => {
     btn.addEventListener('click', async () => {
       const id = btn.getAttribute('data-id')
-      if (!confirm(`Torlod: ${id}?`)) return
+      const confirmed = await confirmDialog({
+        title: t('vault.confirm.delete_title'),
+        message: t('vault.confirm.delete', { name: id }),
+        okLabel: t('vault.confirm.delete_ok'),
+        danger: true,
+      })
+      if (!confirmed) return
       const res = await fetch(`api/vault/${encodeURIComponent(id)}`, { method: 'DELETE' })
-      if (!res.ok) { showToast('Törlés sikertelen'); return }
+      if (!res.ok) { showToast(t('vault.toast.delete_error')); return }
       loadVaultPage()
       loadVault()
     })
@@ -9184,11 +11613,26 @@ function renderVaultGrid(secrets) {
     const value = document.getElementById('vaultPageValueInput').value
     if (!id || !value) return
     addBtn.disabled = true
-    await fetch('api/vault', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, label, value }),
-    })
+    let failure = null
+    try {
+      const res = await fetch('api/vault', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, label, value }),
+      })
+      if (!res.ok) {
+        const e = await res.json().catch(() => ({}))
+        failure = e.error || res.status
+      }
+    } catch (err) {
+      failure = err && err.message ? err.message : String(err)
+    }
+    if (failure !== null) {
+      // keep the inputs so the pasted value is not lost
+      showToast(t('vault.toast.save_error') + ': ' + failure)
+      addBtn.disabled = false
+      return
+    }
     document.getElementById('vaultPageIdInput').value = ''
     document.getElementById('vaultPageLabelInput').value = ''
     document.getElementById('vaultPageValueInput').value = ''
@@ -9242,7 +11686,7 @@ function renderVaultGrid(secrets) {
       }
       if (secrets.length === 0) {
         const opt = document.createElement('option')
-        opt.textContent = '-- Nincs vault kulcs --'
+        opt.textContent = t('vault.bind.no_secret')
         opt.disabled = true
         secretSelect.appendChild(opt)
       }
@@ -9257,7 +11701,7 @@ function renderVaultGrid(secrets) {
       }
       if (mcpConnectors.length === 0) {
         const opt = document.createElement('option')
-        opt.textContent = '-- Nincs MCP szerver --'
+        opt.textContent = t('vault.bind.no_server')
         opt.disabled = true
         serverSelect.appendChild(opt)
       }
@@ -9265,7 +11709,7 @@ function renderVaultGrid(secrets) {
       openModal(overlay)
     } catch (err) {
       console.error('Vault bind modal error:', err)
-      showToast('Hiba a hozzarendeles betoltesekor: ' + err.message)
+      showToast(t('vault.bind.load_error', { msg: err.message }))
     }
   })
 
@@ -9274,7 +11718,7 @@ function renderVaultGrid(secrets) {
     const serverName = serverSelect.value
     const envVar = envVarInput.value.trim()
     if (!vaultSecretId || !serverName || !envVar) {
-      statusEl.textContent = 'Minden mezo kitoltese kotelezo'
+      statusEl.textContent = t('vault.bind.all_required')
       statusEl.className = 'vault-bind-status error'
       statusEl.hidden = false
       return
@@ -9290,24 +11734,24 @@ function renderVaultGrid(secrets) {
       })
       const data = await res.json()
       if (data.ok) {
-        statusEl.textContent = `Hozzarendelve! ${data.synced || 0} fajl frissitve.`
+        statusEl.textContent = t('vault.bind.done', { n: data.synced || 0 })
         statusEl.className = 'vault-bind-status success'
         statusEl.hidden = false
         loadVaultPage()
         loadVault()
         setTimeout(() => { closeModal(overlay) }, 1500)
       } else {
-        statusEl.textContent = data.error || 'Hiba tortent'
+        statusEl.textContent = data.error || t('common.error')
         statusEl.className = 'vault-bind-status error'
         statusEl.hidden = false
       }
     } catch (err) {
-      statusEl.textContent = 'Halozati hiba'
+      statusEl.textContent = t('vault.toast.network_error')
       statusEl.className = 'vault-bind-status error'
       statusEl.hidden = false
     } finally {
       saveBtn.disabled = false
-      saveBtn.textContent = 'Hozzarendeles'
+      saveBtn.textContent = t('vault.btn.bind')
     }
   })
 })()
@@ -9323,7 +11767,7 @@ function renderVaultGrid(secrets) {
 
   scanBtn.addEventListener('click', async () => {
     scanBtn.disabled = true
-    scanBtn.textContent = 'Kereses...'
+    scanBtn.textContent = t('common.searching')
     try {
       const res = await fetch('api/vault/scan')
       const data = await res.json()
@@ -9332,7 +11776,7 @@ function renderVaultGrid(secrets) {
       openModal(overlay)
     } finally {
       scanBtn.disabled = false
-      scanBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg> Scan &amp; Import'
+      scanBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg> ' + escapeHtml(t('vault.btn.scan'))
     }
   })
 
@@ -9341,21 +11785,21 @@ function renderVaultGrid(secrets) {
 
   syncBtn?.addEventListener('click', async () => {
     syncBtn.disabled = true
-    syncBtn.textContent = 'Szinkron...'
+    syncBtn.textContent = t('vault.btn.syncing')
     try {
       const res = await fetch('api/vault/sync', { method: 'POST' })
       const data = await res.json()
       if (data.updated > 0) {
-        showToast(`${data.updated} .mcp.json frissitve`)
+        showToast(t('vault.sync.updated', { n: data.updated }))
       } else {
-        showToast('Nincs szinkronizalando kotes')
+        showToast(t('vault.sync.nothing'))
       }
       if (data.errors?.length) {
-        showToast('Hibak: ' + data.errors.join(', '))
+        showToast(t('vault.toast.errors', { list: data.errors.join(', ') }))
       }
     } finally {
       syncBtn.disabled = false
-      syncBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg> Szinkron'
+      syncBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg> ' + escapeHtml(t('vault.btn.sync'))
     }
   })
 
@@ -9369,9 +11813,8 @@ function renderVaultGrid(secrets) {
     if (actionable.length === 0) {
       empty.hidden = false
       footer.hidden = true
-      if (findings.length > 0) {
-        empty.textContent = `${findings.length} erzekeny ertek talalva, de mind mar a Vault-ban van.`
-      }
+      // Set both ways: an earlier all-in-the-Vault scan must not leave its count behind.
+      empty.textContent = findings.length > 0 ? t('vault.scan.all_in_vault', { n: findings.length }) : t('vault.scan.empty')
       return
     }
     empty.hidden = true
@@ -9379,7 +11822,8 @@ function renderVaultGrid(secrets) {
 
     const grouped = new Map()
     for (const f of actionable) {
-      const key = `${f.serverName}|${f.envVar}`
+      // JSON tuple: server names and env keys are free text and may contain '|'.
+      const key = JSON.stringify([f.serverName, f.envVar])
       if (!grouped.has(key)) grouped.set(key, { ...f, allTargets: [] })
       grouped.get(key).allTargets.push({ mcpFilePath: f.mcpFilePath, serverName: f.serverName })
     }
@@ -9394,7 +11838,7 @@ function renderVaultGrid(secrets) {
         <div class="vault-scan-info">
           <div class="vault-scan-server">${escapeHtml(f.serverName)}</div>
           <div class="vault-scan-env">${escapeHtml(f.envVar)} = <code>${escapeHtml(f.maskedValue)}</code></div>
-          <div class="vault-scan-targets">${f.allTargets.length} fajlban</div>
+          <div class="vault-scan-targets">${escapeHtml(t('vault.scan.in_files', { n: f.allTargets.length }))}</div>
         </div>
         <div class="vault-scan-id">
           <input type="text" class="input vault-scan-vault-id" value="${escapeHtml(f.suggestedVaultId)}" data-key="${escapeHtml(key)}" style="font-size:12px;width:180px">
@@ -9417,9 +11861,10 @@ function renderVaultGrid(secrets) {
       const cb = row.querySelector('input[type="checkbox"]')
       if (!cb?.checked) continue
       const key = cb.getAttribute('data-key')
-      const [serverName, envVar] = key.split('|')
+      let serverName, envVar
+      try { [serverName, envVar] = JSON.parse(key) } catch { continue }
       const vaultIdInput = row.querySelector('.vault-scan-vault-id')
-      const vaultId = vaultIdInput?.value?.trim() || key
+      const vaultId = vaultIdInput?.value?.trim() || `${serverName}|${envVar}`
 
       const matchingFindings = allFindings.filter(
         f => f.serverName === serverName && f.envVar === envVar && !f.alreadyInVault,
@@ -9436,10 +11881,10 @@ function renderVaultGrid(secrets) {
       })
     }
 
-    if (imports.length === 0) { showToast('Nincs kivalasztott elem'); return }
+    if (imports.length === 0) { showToast(t('vault.scan.none_selected')); return }
 
     importBtn.disabled = true
-    importBtn.textContent = 'Importalas...'
+    importBtn.textContent = t('common.importing')
 
     try {
       const res = await fetch('api/vault/import', {
@@ -9449,14 +11894,14 @@ function renderVaultGrid(secrets) {
       })
       const data = await res.json()
       if (data.imported > 0) {
-        showToast(`${data.imported} kulcs importalva, ${data.bound} kotes letrehozva`)
+        showToast(t('vault.scan.imported', { imported: data.imported, bound: data.bound }))
       }
       if (data.errors?.length) {
-        showToast('Hibak: ' + data.errors.join(', '))
+        showToast(t('vault.toast.errors', { list: data.errors.join(', ') }))
       }
     } finally {
       importBtn.disabled = false
-      importBtn.textContent = 'Kivalasztottak importalasa'
+      importBtn.textContent = t('vault.scan.import_btn')
     }
     closeModal(overlay)
     loadVaultPage()
@@ -9476,7 +11921,7 @@ async function loadExternalPaths() {
     for (const p of paths) {
       const item = document.createElement('div')
       item.className = 'connector-external-item'
-      item.innerHTML = `<span>${escapeHtml(p)}</span><button title="Torles">&times;</button>`
+      item.innerHTML = `<span>${escapeHtml(p)}</span><button title="${t('common.btn.delete')}">&times;</button>`
       item.querySelector('button').addEventListener('click', async () => {
         await fetch('api/connectors/external-paths', {
           method: 'DELETE',
@@ -9511,13 +11956,194 @@ async function loadExternalPaths() {
       body: JSON.stringify({ path: val }),
     })
     const data = await res.json()
-    if (data.error) { alert(data.error); return }
+    if (data.error) { showToast(data.error); return }
     input.value = ''
     loadExternalPaths()
     loadConnectors()
   })
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') addBtn.click() })
 })()
+
+// --- CLI inventory page ---
+// Read-only view of scripts/cli-inventory.py's output, built like the MCP page:
+// stat cards, one heading per configured folder, a card per tool, and a
+// detail modal. Every field comes from a CLI's own manifest, help text or
+// README, so each one is escaped before it reaches innerHTML.
+let cliInventory = null
+
+const CLI_PROBE_DOT = { ok: 'connected', no_binary: 'unknown', timeout: 'failed', failed: 'failed', unparsed: 'failed' }
+
+async function loadCliTools(refresh = false) {
+  const grid = document.getElementById('cliToolGrid')
+  const stats = document.getElementById('cliToolStats')
+  const errEl = document.getElementById('cliToolError')
+  if (!grid || !stats || !errEl) return
+  grid.innerHTML = `<div class="connector-loading"><span class="spinner"></span> ${escapeHtml(t('clitools.loading'))}</div>`
+  stats.innerHTML = ''
+  try {
+    const res = await fetch('api/cli-inventory' + (refresh ? '?refresh=1' : ''))
+    const data = await res.json().catch(() => ({}))
+    // Off (no folder configured) or no inventory yet for a caller that may not
+    // start the generator: a plain empty state, not an error.
+    if (res.ok && (data.enabled === false || data.pending === true)) {
+      cliInventory = null
+      errEl.hidden = true
+      errEl.textContent = ''
+      const meta = document.getElementById('cliToolMeta')
+      if (meta) meta.textContent = ''
+      grid.innerHTML = `<div class="connector-loading">${escapeHtml(t(data.enabled === false ? 'clitools.disabled' : 'clitools.pending'))}</div>`
+      return
+    }
+    // A refresh only the owner may start: the refusal is said, and the inventory already shown stays.
+    const refusal = ownerSessionText(data)
+    if (refusal) {
+      if (cliInventory) renderCliTools()
+      else grid.innerHTML = ''
+      errEl.hidden = false
+      errEl.textContent = refusal
+      return
+    }
+    if (!res.ok || !Array.isArray(data.tools)) {
+      throw new Error(data.detail || data.error || ('HTTP ' + res.status))
+    }
+    cliInventory = data
+    const regenError = data.cache && data.cache.regen_error
+    const regenSkipped = data.cache && data.cache.regen_skipped
+    errEl.hidden = !regenError && !regenSkipped
+    errEl.textContent = regenError ? t('clitools.regen_error', { msg: regenError })
+      : regenSkipped ? t('clitools.regen_skipped') : ''
+    renderCliTools()
+  } catch (err) {
+    cliInventory = null
+    grid.innerHTML = ''
+    errEl.hidden = false
+    errEl.textContent = t('clitools.load_error', { msg: err && err.message ? err.message : String(err) })
+  }
+}
+
+function renderCliTools() {
+  const grid = document.getElementById('cliToolGrid')
+  const stats = document.getElementById('cliToolStats')
+  const meta = document.getElementById('cliToolMeta')
+  if (!grid || !stats || !cliInventory) return
+  const tools = cliInventory.tools
+  const summary = cliInventory.summary || {}
+  const working = tools.filter((x) => x.probe && x.probe.status === 'ok').length
+  const noBinary = tools.filter((x) => x.probe && x.probe.status === 'no_binary').length
+  const failed = Number(summary.probe_failures) || 0
+  stats.innerHTML = `
+    <div class="stat-card"><div class="stat-value">${Number(tools.length)}</div><div class="stat-label">${escapeHtml(t('clitools.stat.total'))}</div></div>
+    <div class="stat-card"><div class="stat-value" style="color:var(--success)">${working}</div><div class="stat-label">${escapeHtml(t('clitools.stat.working'))}</div></div>
+    ${failed ? `<div class="stat-card"><div class="stat-value" style="color:var(--danger)">${failed}</div><div class="stat-label">${escapeHtml(t('clitools.stat.failed'))}</div></div>` : ''}
+    ${noBinary ? `<div class="stat-card"><div class="stat-value" style="color:var(--text-muted)">${noBinary}</div><div class="stat-label">${escapeHtml(t('clitools.stat.no_binary'))}</div></div>` : ''}
+  `
+  if (meta) {
+    const age = cliInventory.cache && cliInventory.cache.age_seconds
+    meta.textContent = age == null ? '' : t('clitools.meta_age', { min: Math.round(age / 60) })
+  }
+
+  grid.innerHTML = ''
+  const dirs = Array.isArray(summary.dirs) ? summary.dirs : []
+  if (tools.length === 0) {
+    grid.innerHTML = `<div class="connector-loading">${escapeHtml(t('clitools.empty', { dirs: dirs.map((d) => d.dir).join(', ') }))}</div>`
+    return
+  }
+  for (const d of dirs) {
+    const heading = document.createElement('div')
+    heading.className = 'connector-group-heading'
+    heading.textContent = d.found ? d.dir : t('clitools.dir_missing', { dir: d.dir })
+    grid.appendChild(heading)
+    const scopeGrid = document.createElement('div')
+    scopeGrid.className = 'connector-scope-grid'
+    for (const tool of tools.filter((x) => x.root === d.dir)) {
+      scopeGrid.appendChild(renderCliToolCard(tool))
+    }
+    if (scopeGrid.children.length > 0) grid.appendChild(scopeGrid)
+  }
+}
+
+function renderCliToolCard(tool) {
+  const card = document.createElement('div')
+  card.className = 'connector-card'
+  const status = (tool.probe && tool.probe.status) || 'failed'
+  const dotClass = CLI_PROBE_DOT[status] || 'failed'
+  const name = tool.display_name || tool.name
+  const version = tool.version ? `<span class="connector-source-badge">${escapeHtml(tool.version)}</span>` : ''
+  card.innerHTML = `
+    <div class="connector-status-dot ${escapeHtml(dotClass)}" title="${escapeHtml(t('clitools.probe.' + status))}"></div>
+    <div class="connector-info">
+      <div class="connector-name">${escapeHtml(name)} ${version}</div>
+      <div class="connector-endpoint">${escapeHtml(tool.description || tool.name)}</div>
+    </div>
+    <span class="connector-type-badge local">CLI</span>
+  `
+  card.addEventListener('click', () => openCliToolDetail(tool))
+  return card
+}
+
+// Both label and value are plain text; the row escapes them itself.
+function cliDetailRow(label, value, isMono = false) {
+  const style = isMono ? ' style="font-family:monospace;font-size:12px"' : ''
+  return `<div class="connector-detail-row"><span class="meta-label">${escapeHtml(label)}</span><span class="meta-value"${style}>${escapeHtml(value)}</span></div>`
+}
+
+function openCliToolDetail(tool) {
+  const overlay = document.getElementById('cliToolDetailOverlay')
+  if (!overlay) return
+  document.getElementById('cliToolDetailTitle').textContent = tool.display_name || tool.name
+  const mono = (s) => `<span style="font-family:monospace;font-size:12px">${escapeHtml(s)}</span>`
+  const status = (tool.probe && tool.probe.status) || 'failed'
+  const auth = tool.auth
+  const commands = Array.isArray(tool.commands) ? tool.commands : []
+  const rows = [
+    tool.binary ? cliDetailRow(t('clitools.field.binary'), tool.binary, true) : cliDetailRow(t('clitools.field.binary'), t('clitools.no_binary')),
+    cliDetailRow(t('clitools.field.status'), t('clitools.probe.' + status)),
+    tool.version ? cliDetailRow(t('clitools.field.version'), tool.version) : '',
+    tool.license ? cliDetailRow(t('clitools.field.license'), tool.license) : '',
+    cliDetailRow(t('clitools.field.dir'), tool.dir, true),
+    auth ? cliDetailRow(t('clitools.field.auth'), [auth.mode || '-', ...(auth.env_vars || [])].join(' · '), true) : '',
+    commands.length ? cliDetailRow(t('clitools.field.commands'), t('clitools.commands_count', {
+      n: commands.length, source: (tool.probe && tool.probe.command_source) || '-' })) : '',
+    tool.docs && tool.docs.length ? cliDetailRow(t('clitools.field.docs'), tool.docs.join(', '), true) : '',
+  ]
+  document.getElementById('cliToolDetailInfo').innerHTML = rows.join('')
+
+  const skills = Array.isArray(tool.skills) ? tool.skills : []
+  document.getElementById('cliToolDetailSkills').innerHTML = skills.length
+    ? skills.map((s) => `<div class="connector-agent-item"><label>${escapeHtml(s.scope === 'global' ? t('clitools.skill_global') : s.agent)}</label> ${mono(s.skill)}</div>`).join('')
+    : `<p style="color:var(--text-muted);font-size:13px;margin:0">${escapeHtml(t('clitools.no_skills'))}</p>`
+
+  document.getElementById('cliToolDetailCommands').innerHTML = commands.length
+    ? commands.map((c) => `<div class="connector-detail-row"><span class="meta-label">${mono(c.name)}</span><span class="meta-value">`
+      + escapeHtml(c.description || '')
+      + (c.subcommands && c.subcommands.length ? `<br>${mono(c.subcommands.join(' · '))}` : '')
+      + '</span></div>').join('')
+    : `<p style="color:var(--text-muted);font-size:13px;margin:0">${escapeHtml(t('clitools.no_commands'))}</p>`
+
+  const readme = document.getElementById('cliToolDetailReadme')
+  readme.textContent = tool.readme_excerpt || ''
+  document.getElementById('cliToolDetailReadmeGroup').hidden = !tool.readme_excerpt
+  openModal(overlay)
+  const closeBtn = document.getElementById('cliToolDetailClose')
+  if (closeBtn) setTimeout(() => closeBtn.focus(), 50)
+}
+
+function wireCliToolsPage() {
+  const overlay = document.getElementById('cliToolDetailOverlay')
+  const closeBtn = document.getElementById('cliToolDetailClose')
+  const refreshBtn = document.getElementById('cliToolRefreshBtn')
+  if (!overlay || !closeBtn || !refreshBtn) return
+  closeBtn.addEventListener('click', () => closeModal(overlay))
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) closeModal(overlay)
+  })
+  refreshBtn.addEventListener('click', () => loadCliTools(true))
+}
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', wireCliToolsPage)
+} else {
+  wireCliToolsPage()
+}
 
 async function openConnectorDetail(connector) {
   document.getElementById('connectorDetailTitle').textContent = connector.name
@@ -9530,10 +12156,12 @@ async function openConnectorDetail(connector) {
     const statusLabels = { connected: t('connectors.status.connected'), needs_auth: t('connectors.status.needs_auth'), failed: t('connectors.status.failed'), unknown: t('connectors.status.unknown') }
     const statusColors = { connected: 'var(--success)', needs_auth: 'var(--accent)', failed: 'var(--danger)', unknown: 'var(--text-muted)' }
 
+    // Every field here can come from an agent's, a project's or an external
+    // .mcp.json (routes/connectors.ts), so each one is escaped -- the env KEYS too.
     document.getElementById('connectorDetailInfo').innerHTML = `
       <div class="connector-detail-row">
         <span class="meta-label">Statusz</span>
-        <span class="meta-value" style="color:${statusColors[detail.status] || ''}">${statusLabels[detail.status] || detail.status}</span>
+        <span class="meta-value" style="color:${statusColors[detail.status] || ''}">${escapeHtml(statusLabels[detail.status] || detail.status || '')}</span>
       </div>
       <div class="connector-detail-row">
         <span class="meta-label">Hatokor</span>
@@ -9541,7 +12169,7 @@ async function openConnectorDetail(connector) {
       </div>
       ${detail.type ? `<div class="connector-detail-row"><span class="meta-label">Tipus</span><span class="meta-value">${escapeHtml(detail.type)}</span></div>` : ''}
       ${detail.command ? `<div class="connector-detail-row"><span class="meta-label">Parancs</span><span class="meta-value" style="font-family:monospace;font-size:12px">${escapeHtml(detail.command)} ${escapeHtml(detail.args || '')}</span></div>` : ''}
-      ${Object.keys(detail.env || {}).length ? `<div class="connector-detail-row"><span class="meta-label">Env</span><span class="meta-value" style="font-family:monospace;font-size:11px">${Object.entries(detail.env).map(([k,v]) => `${k}=${v}`).join(', ')}</span></div>` : ''}
+      ${Object.keys(detail.env || {}).length ? `<div class="connector-detail-row"><span class="meta-label">Env</span><span class="meta-value" style="font-family:monospace;font-size:11px">${Object.entries(detail.env).map(([k,v]) => `${escapeHtml(k)}=${escapeHtml(String(v))}`).join(', ')}</span></div>` : ''}
     `
   } catch {
     document.getElementById('connectorDetailInfo').innerHTML = `<p>${t('connectors.detail_error')}</p>`
@@ -9579,8 +12207,8 @@ async function openConnectorDetail(connector) {
       const item = document.createElement('div')
       item.className = 'connector-agent-item'
       item.innerHTML = `
-        <input type="checkbox" id="assign-${agent.name}" value="${agent.name}" ${isAssigned ? 'checked' : ''}>
-        <label for="assign-${agent.name}">${escapeHtml(agent.label || agent.name)}</label>
+        <input type="checkbox" id="assign-${escapeHtml(agent.name)}" value="${escapeHtml(agent.name)}" ${isAssigned ? 'checked' : ''}>
+        <label for="assign-${escapeHtml(agent.name)}">${escapeHtml(agent.label || agent.name)}</label>
       `
       listEl.appendChild(item)
     }
@@ -9593,7 +12221,13 @@ async function openConnectorDetail(connector) {
 
   // Delete button
   document.getElementById('connectorDeleteBtn').onclick = async () => {
-    if (!confirm(`Biztosan torlod: ${connector.name}?`)) return
+    const confirmed = await confirmDialog({
+      title: t('connectors.confirm.delete_title'),
+      message: t('connectors.confirm.delete', { name: connector.name }),
+      okLabel: t('connectors.confirm.delete_ok'),
+      danger: true,
+    })
+    if (!confirmed) return
     try {
       await fetch(`api/connectors/${encodeURIComponent(connector.name)}`, { method: 'DELETE' })
       closeModal(connectorDetailOverlay)
@@ -9650,8 +12284,8 @@ async function loadNewConnectorAgents() {
       const item = document.createElement('div')
       item.className = 'connector-agent-item'
       item.innerHTML = `
-        <input type="checkbox" id="new-assign-${agent.name}" value="${agent.name}">
-        <label for="new-assign-${agent.name}">${escapeHtml(agent.label || agent.name)}</label>
+        <input type="checkbox" id="new-assign-${escapeHtml(agent.name)}" value="${escapeHtml(agent.name)}">
+        <label for="new-assign-${escapeHtml(agent.name)}">${escapeHtml(agent.label || agent.name)}</label>
       `
       list.appendChild(item)
     }
@@ -9699,7 +12333,7 @@ document.getElementById('saveConnectorBtn').addEventListener('click', async () =
     })
     if (!res.ok) {
       const err = await res.json()
-      throw new Error(err.error || 'Hiba')
+      throw new Error(err.error || t('common.failed'))
     }
     const result = await res.json()
     const savedName = result.name || name
@@ -9722,7 +12356,7 @@ document.getElementById('saveConnectorBtn').addEventListener('click', async () =
     }
     loadConnectors()
   } catch (err) {
-    showToast(`Hiba: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`)
   } finally {
     btn.disabled = false
     btn.querySelector('.btn-text').hidden = false
@@ -9739,6 +12373,250 @@ function escapeHtml(str) {
   // renderers interpolate escapeHtml() output into data-*/title/value="..."
   // attributes, where a surviving " would allow an attribute breakout.
   return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+}
+
+// A value passed as a string argument of an inline handler
+// (onclick="fn(${jsArg(id)})"). escapeHtml alone is NOT enough there: the
+// HTML parser decodes &#39; back to ' before the handler's JavaScript is
+// parsed, so a quote in the value would end the JS string. JSON.stringify
+// makes it a JS string literal; escapeHtml then keeps it inside the attribute.
+function jsArg(v) {
+  return escapeHtml(JSON.stringify(String(v ?? '')))
+}
+
+// A shortened text for HTML: cut the RAW text, then escape it, and add the
+// ellipsis by the raw length. Escaping first and slicing after could split an
+// entity (&quot; -> &q) and would count entity bytes as visible characters.
+function escSnippet(raw, max) {
+  const s = String(raw ?? '')
+  return escapeHtml(s.slice(0, max)) + (s.length > max ? '…' : '')
+}
+
+// The one gate for a URL from data (a catalogue file, the API, CLI output, a
+// markdown doc) before it becomes an href. escapeHtml stops an attribute
+// breakout but not the scheme: only http(s) and mailto pass, or -- with
+// { relative: true } -- a scheme-less relative or fragment link. The URL
+// parser drops control characters and spaces, and a leading // or /\ means
+// another host, so the check judges the URL the same way. Returns the URL
+// unchanged when it passes, '' otherwise. HTML-encode the result in markup.
+function safeHref(raw, { relative = false } = {}) {
+  const s = String(raw ?? '')
+  const u = s.replace(/[\x00-\x20\x7f]/g, '')
+  if (!u) return ''
+  const scheme = /^[a-z][a-z0-9+.-]*:/i.exec(u)
+  if (scheme) return /^(https?|mailto):$/i.test(scheme[0]) ? s : ''
+  return relative && !/^[\\/][\\/]/.test(u) ? s : ''
+}
+
+// The dashboard's mirror of src/css-color.ts normalizeCssColor -- the same
+// colour table, regexes and arithmetic; both are checked against the same
+// vectors (src/__tests__/fixtures/css-color-vectors.json) and the table is
+// compared entry by entry, so the server and the page apply ONE policy:
+// hex kept, a CSS colour name or a strictly numeric rgb()/rgba()/hsl()/hsla()
+// becomes hex, anything else (url(), declarations, words, bad hex) is null.
+const CSS_NAMED_COLORS = {
+  aliceblue: '#f0f8ff', antiquewhite: '#faebd7', aqua: '#00ffff', aquamarine: '#7fffd4', azure: '#f0ffff',
+  beige: '#f5f5dc', bisque: '#ffe4c4', black: '#000000', blanchedalmond: '#ffebcd', blue: '#0000ff',
+  blueviolet: '#8a2be2', brown: '#a52a2a', burlywood: '#deb887', cadetblue: '#5f9ea0', chartreuse: '#7fff00',
+  chocolate: '#d2691e', coral: '#ff7f50', cornflowerblue: '#6495ed', cornsilk: '#fff8dc', crimson: '#dc143c',
+  cyan: '#00ffff', darkblue: '#00008b', darkcyan: '#008b8b', darkgoldenrod: '#b8860b', darkgray: '#a9a9a9',
+  darkgreen: '#006400', darkgrey: '#a9a9a9', darkkhaki: '#bdb76b', darkmagenta: '#8b008b', darkolivegreen: '#556b2f',
+  darkorange: '#ff8c00', darkorchid: '#9932cc', darkred: '#8b0000', darksalmon: '#e9967a', darkseagreen: '#8fbc8f',
+  darkslateblue: '#483d8b', darkslategray: '#2f4f4f', darkslategrey: '#2f4f4f', darkturquoise: '#00ced1', darkviolet: '#9400d3',
+  deeppink: '#ff1493', deepskyblue: '#00bfff', dimgray: '#696969', dimgrey: '#696969', dodgerblue: '#1e90ff',
+  firebrick: '#b22222', floralwhite: '#fffaf0', forestgreen: '#228b22', fuchsia: '#ff00ff', gainsboro: '#dcdcdc',
+  ghostwhite: '#f8f8ff', gold: '#ffd700', goldenrod: '#daa520', gray: '#808080', green: '#008000',
+  greenyellow: '#adff2f', grey: '#808080', honeydew: '#f0fff0', hotpink: '#ff69b4', indianred: '#cd5c5c',
+  indigo: '#4b0082', ivory: '#fffff0', khaki: '#f0e68c', lavender: '#e6e6fa', lavenderblush: '#fff0f5',
+  lawngreen: '#7cfc00', lemonchiffon: '#fffacd', lightblue: '#add8e6', lightcoral: '#f08080', lightcyan: '#e0ffff',
+  lightgoldenrodyellow: '#fafad2', lightgray: '#d3d3d3', lightgreen: '#90ee90', lightgrey: '#d3d3d3', lightpink: '#ffb6c1',
+  lightsalmon: '#ffa07a', lightseagreen: '#20b2aa', lightskyblue: '#87cefa', lightslategray: '#778899', lightslategrey: '#778899',
+  lightsteelblue: '#b0c4de', lightyellow: '#ffffe0', lime: '#00ff00', limegreen: '#32cd32', linen: '#faf0e6',
+  magenta: '#ff00ff', maroon: '#800000', mediumaquamarine: '#66cdaa', mediumblue: '#0000cd', mediumorchid: '#ba55d3',
+  mediumpurple: '#9370db', mediumseagreen: '#3cb371', mediumslateblue: '#7b68ee', mediumspringgreen: '#00fa9a', mediumturquoise: '#48d1cc',
+  mediumvioletred: '#c71585', midnightblue: '#191970', mintcream: '#f5fffa', mistyrose: '#ffe4e1', moccasin: '#ffe4b5',
+  navajowhite: '#ffdead', navy: '#000080', oldlace: '#fdf5e6', olive: '#808000', olivedrab: '#6b8e23',
+  orange: '#ffa500', orangered: '#ff4500', orchid: '#da70d6', palegoldenrod: '#eee8aa', palegreen: '#98fb98',
+  paleturquoise: '#afeeee', palevioletred: '#db7093', papayawhip: '#ffefd5', peachpuff: '#ffdab9', peru: '#cd853f',
+  pink: '#ffc0cb', plum: '#dda0dd', powderblue: '#b0e0e6', purple: '#800080', rebeccapurple: '#663399',
+  red: '#ff0000', rosybrown: '#bc8f8f', royalblue: '#4169e1', saddlebrown: '#8b4513', salmon: '#fa8072',
+  sandybrown: '#f4a460', seagreen: '#2e8b57', seashell: '#fff5ee', sienna: '#a0522d', silver: '#c0c0c0',
+  skyblue: '#87ceeb', slateblue: '#6a5acd', slategray: '#708090', slategrey: '#708090', snow: '#fffafa',
+  springgreen: '#00ff7f', steelblue: '#4682b4', tan: '#d2b48c', teal: '#008080', thistle: '#d8bfd8',
+  tomato: '#ff6347', turquoise: '#40e0d0', violet: '#ee82ee', wheat: '#f5deb3', white: '#ffffff',
+  whitesmoke: '#f5f5f5', yellow: '#ffff00', yellowgreen: '#9acd32', transparent: '#00000000',
+}
+
+const CSS_HEX_COLOR = /^#(?:[0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i
+// CSS <number>: optional sign, digits with an optional fraction or a leading
+// dot, optional exponent (1e2, -1, .5, +3.25E-1); nothing else
+const CSS_NUMBER = /^[+-]?(?:\d*\.\d+|\d+)(?:e[+-]?\d+)?$/i
+const CSS_HUE_UNIT = { deg: 1, grad: 0.9, rad: 180 / Math.PI, turn: 360 }
+
+const CSS_HUE_UNITS = ['grad', 'turn', 'deg', 'rad']
+// Input budget, as on the server: a resource bound
+// well above any real spelling (a full-precision JS number serialization is
+// ~85 characters); a longer value is not a colour, decided before parsing.
+const MAX_CSS_COLOR_LENGTH = 256
+
+function isCssWs(ch) {
+  return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f'
+}
+
+// Trim and split are plain character scans, one pass each, no regex (the
+// regex trim was quadratic on a long internal whitespace run)
+function cssTrim(s) {
+  let i = 0
+  let j = s.length
+  while (i < j && isCssWs(s[i])) i++
+  while (j > i && isCssWs(s[j - 1])) j--
+  return s.slice(i, j)
+}
+
+// the tokens of a TRIMMED string separated by runs of CSS whitespace
+function cssSplitWs(s) {
+  const out = []
+  let i = 0
+  while (i < s.length) {
+    let j = i
+    while (j < s.length && !isCssWs(s[j])) j++
+    out.push(s.slice(i, j))
+    while (j < s.length && isCssWs(s[j])) j++
+    i = j
+  }
+  return out
+}
+
+function cssHex2(n) {
+  // + 1e-7: a half-way channel that float arithmetic left at 127.4999999
+  // rounds up like the browser's 127.5 does
+  return Math.round(Math.min(255, Math.max(0, n)) + 1e-7).toString(16).padStart(2, '0')
+}
+
+function cssToHex(r, g, b, a) {
+  const rgb = `#${cssHex2(r)}${cssHex2(g)}${cssHex2(b)}`
+  return a >= 1 ? rgb : rgb + cssHex2(Math.max(0, a) * 255)
+}
+
+// a token: a number (pct=false) or a percentage (pct=true), else null
+function cssNum(token) {
+  const pct = token.endsWith('%')
+  const t = pct ? token.slice(0, -1) : token
+  if (!CSS_NUMBER.test(t)) return null
+  const n = Number(t)
+  return Number.isNaN(n) ? null : { n, pct }
+}
+
+// alpha: a number or a percentage, clamped to 0..1
+function cssAlpha(token) {
+  const v = cssNum(token)
+  if (!v) return null
+  const a = v.pct ? v.n / 100 : v.n
+  return Math.min(1, Math.max(0, a))
+}
+
+// hue: a number (degrees) or a number with deg / grad / rad / turn
+// (the unit is matched ASCII case-insensitively; 'grad' is tried before 'rad')
+function cssHue(token) {
+  const unit = CSS_HUE_UNITS.find((u) => token.slice(-u.length).replace(/[A-Z]/g, (c) => c.toLowerCase()) === u)
+  const v = cssNum(unit ? token.slice(0, -unit.length) : token)
+  if (!v || v.pct) return null
+  const deg = v.n * (unit ? CSS_HUE_UNIT[unit] : 1)
+  return Number.isFinite(deg) ? ((deg % 360) + 360) % 360 : null
+}
+
+function cssHslToRgb(hue, s, l) {
+  const h = hue / 360
+  const sat = Math.min(1, Math.max(0, s / 100))
+  const lig = Math.min(1, Math.max(0, l / 100))
+  if (sat === 0) return [lig * 255, lig * 255, lig * 255]
+  const q = lig < 0.5 ? lig * (1 + sat) : lig + sat - lig * sat
+  const p = 2 * lig - q
+  const ch = (t) => {
+    if (t < 0) t += 1
+    if (t > 1) t -= 1
+    if (t < 1 / 6) return p + (q - p) * 6 * t
+    if (t < 1 / 2) return q
+    if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6
+    return p
+  }
+  return [ch(h + 1 / 3) * 255, ch(h) * 255, ch(h - 1 / 3) * 255]
+}
+
+// rgb()/rgba()/hsl()/hsla() with numeric arguments (CSS Color 4):
+// - legacy comma syntax: 3 values (+ alpha); rgb channels all numbers or all
+//   percentages; hsl saturation / lightness must be percentages
+// - modern space syntax: 3 values (+ "/ alpha"); rgb channels may mix numbers
+//   and percentages; hsl saturation / lightness numbers or percentages
+// Numbers may carry a sign, a leading dot or an exponent; channels clamp to
+// 0..255, alpha to 0..1, saturation / lightness to 0..100. No nested
+// function, keyword (none, calc, var) or anything else is accepted.
+function cssColorFunction(c) {
+  const m = /^(rgba?|hsla?)\(([^()]*)\)$/i.exec(c)
+  if (!m) return null
+  const fn = m[1].toLowerCase()
+  const body = cssTrim(m[2])
+  let parts
+  let alphaToken
+  const legacy = body.includes(',')
+  if (legacy) {
+    parts = body.split(',').map(cssTrim)
+    if (parts.length === 4) alphaToken = parts.pop()
+  } else {
+    const slash = body.split('/')
+    if (slash.length > 2) return null
+    if (slash.length === 2) alphaToken = cssTrim(slash[1])
+    parts = cssSplitWs(cssTrim(slash[0]))
+  }
+  if (parts.length !== 3) return null
+  const a = alphaToken === undefined ? 1 : cssAlpha(alphaToken)
+  if (a === null) return null
+  if (fn.startsWith('rgb')) {
+    const ch = parts.map(cssNum)
+    if (ch.some((v) => v === null)) return null
+    if (legacy && !(ch.every((v) => v.pct) || ch.every((v) => !v.pct))) return null
+    const [r, g, b] = ch.map((v) => (v.pct ? (v.n * 255) / 100 : v.n))
+    return cssToHex(r, g, b, a)
+  }
+  const hue = cssHue(parts[0])
+  const s = cssNum(parts[1])
+  const l = cssNum(parts[2])
+  if (hue === null || !s || !l) return null
+  if (legacy && !(s.pct && l.pct)) return null
+  const [r, g, b] = cssHslToRgb(hue, s.n, l.n)
+  return cssToHex(r, g, b, a)
+}
+
+function normalizeCssColor(value) {
+  if (typeof value !== 'string' || value.length > MAX_CSS_COLOR_LENGTH) return null
+  const c = cssTrim(value)
+  if (CSS_HEX_COLOR.test(c)) return c
+  const named = /^[a-z]+$/i.test(c) && Object.prototype.hasOwnProperty.call(CSS_NAMED_COLORS, c.toLowerCase()) ? CSS_NAMED_COLORS[c.toLowerCase()] : undefined
+  if (named) return named
+  return cssColorFunction(c)
+}
+
+// A colour from data (settings files, label records) before it lands in a
+// style: escapeHtml keeps it inside the attribute, but a ';' or url(...) would
+// still add CSS declarations or fetch a resource. A colour normalizeCssColor
+// accepts comes back as hex; a var(--token) passes as is; anything else
+// becomes the fallback.
+function safeCssColor(v, fallback = '') {
+  const n = normalizeCssColor(v)
+  if (n) return n
+  const c = String(v ?? '').trim()
+  return /^var\(--[a-z0-9-]+\)$/i.test(c) ? c : fallback
+}
+
+// t() for a translation that is itself HTML (the *_html keys, data-i18n-html):
+// the template is trusted markup, but every substituted value -- the brand
+// tokens, which come from .env BRAND_NAME / BOT_NAME, and the caller's params
+// -- is text, so each one is HTML-escaped. Plain t() stays raw for its
+// textContent / confirm / toast callers.
+function tHtml(key, params = {}) {
+  const enc = {}
+  for (const [k, v] of Object.entries({ ...window._brandTokens, ...params })) enc[k] = v == null ? v : escapeHtml(String(v))
+  return t(key, enc)
 }
 
 // ============================================================
@@ -9814,11 +12692,12 @@ async function loadStatus() {
         }
         const div = document.createElement('div')
         div.className = `status-incident ${inc.status}`
-        const date = new Date(inc.pubDate).toLocaleString('hu-HU', { timeZone: 'Europe/Budapest' })
+        // The viewer's local time, like every other time on the dashboard (ISSUE1895 / #1895).
+        const date = new Date(inc.pubDate).toLocaleString('hu-HU')
         div.innerHTML = `
           <div class="status-incident-header">
             <span class="status-incident-title">${escapeHtml(inc.title)}</span>
-            <span class="status-incident-badge ${inc.status}">${(typeof statusLabels[inc.status] === 'function' ? statusLabels[inc.status]() : statusLabels[inc.status]) || inc.status}</span>
+            <span class="status-incident-badge ${escapeHtml(inc.status)}">${escapeHtml((typeof statusLabels[inc.status] === 'function' ? statusLabels[inc.status]() : statusLabels[inc.status]) || inc.status)}</span>
           </div>
           <div class="status-incident-desc">${escapeHtml(inc.description.slice(0, 300))}</div>
           <div class="status-incident-date">${date}</div>
@@ -9886,7 +12765,7 @@ async function loadCosts() {
       </table></div>`
     }
 
-    html += `<p style="${mutedStyle};margin-top:16px">${t('costs.token_usage_note')} (${(s.token_usage?.calls ?? 0)} ${t('costs.calls')}, ${(s.token_usage?.input_tokens ?? 0) + (s.token_usage?.output_tokens ?? 0)} tokens)</p>`
+    html += `<p style="${mutedStyle};margin-top:16px">${t('costs.token_usage_note')} (${Number(s.token_usage?.calls ?? 0)} ${t('costs.calls')}, ${Number(s.token_usage?.input_tokens ?? 0) + Number(s.token_usage?.output_tokens ?? 0)} tokens)</p>`
 
     el.innerHTML = html
   } catch (err) {
@@ -9927,7 +12806,7 @@ document.getElementById('memImportOpenBtn').addEventListener('click', () => {
 })
 
 // Close import modal
-document.getElementById('memImportClose').addEventListener('click', () => closeModal(memImportOverlay))
+document.getElementById('memImportClose').addEventListener('click', () => requestOverlayClose(memImportOverlay))
 attachOverlayCloseGuard(memImportOverlay)
 
 // File area click -> trigger file input
@@ -10042,7 +12921,7 @@ memImportSaveBtn.addEventListener('click', async () => {
       loadMemories()
       loadMemStats()
     } else {
-      showToast('Hiba: ' + (data.error || 'Ismeretlen'))
+      showToast(`${t('common.error')}: ${data.error || t('common.unknown')}`)
     }
   } catch (err) {
     memImportProgress.hidden = true
@@ -10092,7 +12971,7 @@ document.getElementById('migrateScanBtn').addEventListener('click', async () => 
       body: JSON.stringify({ sourcePath: path }),
     })
     const data = await res.json()
-    if (!res.ok) throw new Error(data.error || 'Hiba')
+    if (!res.ok) throw new Error(data.error || t('common.failed'))
 
     migrateFindings = data.findings
     renderMigrateFindings(data)
@@ -10100,7 +12979,7 @@ document.getElementById('migrateScanBtn').addEventListener('click', async () => 
     document.getElementById('migrateStep1').hidden = true
     document.getElementById('migrateStep2').hidden = false
   } catch (err) {
-    showToast(`Hiba: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`)
   } finally {
     btn.disabled = false
     btn.querySelector('.btn-text').hidden = false
@@ -10187,7 +13066,7 @@ document.getElementById('migrateRunBtn').addEventListener('click', async () => {
       body: JSON.stringify({ findings: migrateFindings, agentId }),
     })
     const data = await res.json()
-    if (!res.ok) throw new Error(data.error || 'Hiba')
+    if (!res.ok) throw new Error(data.error || t('common.failed'))
 
     // Show results
     document.getElementById('migrateStep2').hidden = true
@@ -10206,7 +13085,7 @@ document.getElementById('migrateRunBtn').addEventListener('click', async () => {
       ${data.details ? '<div class="migrate-result-details">' + data.details.map(d => escapeHtml(d)).join('<br>') + '</div>' : ''}
     `
   } catch (err) {
-    showToast(`Hiba: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`)
   } finally {
     btn.disabled = false
     btn.querySelector('.btn-text').hidden = false
@@ -10366,7 +13245,13 @@ document.getElementById('fleetDryRunBtn').addEventListener('click', async () => 
 document.getElementById('fleetApplyBtn').addEventListener('click', async () => {
   if (!fleetLastBody) return
 
-  if (!confirm(t('fleet.import.apply_confirm'))) return
+  const confirmed = await confirmDialog({
+    title: t('fleet.import.apply_confirm_title'),
+    message: t('fleet.import.apply_confirm'),
+    okLabel: t('fleet.import.apply_confirm_ok'),
+    danger: true,
+  })
+  if (!confirmed) return
 
   const btn = document.getElementById('fleetApplyBtn')
   btn.disabled = true
@@ -10445,8 +13330,8 @@ function formatMtime(ms) {
   return `${d.getFullYear()}.${pad(d.getMonth() + 1)}.${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
-document.getElementById('skillDetailClose').addEventListener('click', () => closeModal(skillDetailOverlay))
-attachOverlayCloseGuard(skillDetailOverlay)
+document.getElementById('skillDetailClose').addEventListener('click', () => requestOverlayClose(skillDetailOverlay))
+attachOverlayCloseGuard(skillDetailOverlay, _skillDetailConfirmDiscard)
 
 // Scope for the next skill create/import action. 'global' means the
 // Skills page opened the modal (write to ~/.claude/skills/); any other
@@ -10485,9 +13370,195 @@ async function loadGlobalSkills() {
     globalSkills = await globalRes.json()
     localAgentSkills = localRes.ok ? await localRes.json() : []
     renderGlobalSkills()
+    loadPendingSkills()
   } catch (err) {
     console.error('Skills betoltes hiba:', err)
     skillsGrid.innerHTML = `<div class="connector-loading">${t('skills.error')}</div>`
+  }
+}
+
+// MARVEENGAPS1020 (b): skills waiting for approval. A generated or imported
+// skill is not live until it is approved here. The approver sees every file
+// in FULL (the text of every non-binary file, size and sha256 of every file,
+// scripts and executables listed first), the scan's findings, and where the
+// skill will land; the approval is bound to the hash of exactly that content,
+// name and target. Everything below is built with textContent: the skill's
+// own text is untrusted data, never markup.
+async function loadPendingSkills() {
+  const box = document.getElementById('skillsPending')
+  if (!box) return
+  let list = []
+  try {
+    const res = await fetch('api/skills/pending')
+    list = res.ok ? await res.json() : []
+  } catch { list = [] }
+  if (!Array.isArray(list)) list = []
+  const details = await Promise.all(list.map(async (p) => {
+    try {
+      const r = await fetch(`api/skills/pending/${encodeURIComponent(p.id)}`)
+      return r.ok ? await r.json() : null
+    } catch { return null }
+  }))
+  renderPendingSkills(box, details.filter(Boolean))
+}
+
+function pendingEl(tag, cls, text) {
+  const el = document.createElement(tag)
+  if (cls) el.className = cls
+  if (text != null) el.textContent = String(text)
+  return el
+}
+
+// SKILLSPLIT1101 (Dani 65108): where a file of a proposal comes from, so on a 15-file replacement the approver
+// sees what to read: the proposal's own SKILL.md and references (new or overwriting), or copied from the live skill.
+function pendingFileOrigin(p, path) {
+  if (!p || p.source !== 'propose') return null
+  if (path === 'SKILL.md') return p.replaces ? 'proposed_replaced' : 'proposed_new'
+  const pf = Array.isArray(p.proposedFiles) ? p.proposedFiles.find((x) => x.path === path) : null
+  if (pf) return pf.replaced ? 'proposed_replaced' : 'proposed_new'
+  // Not the proposal's, yet not equal to the live file (Dani 65296): never "unchanged".
+  const drift = Array.isArray(p.liveDrift) ? p.liveDrift.find((x) => x.path === path) : null
+  if (drift) return drift.live === 'missing' ? 'not_proposed_missing' : 'not_proposed_changed'
+  return p.replaces ? 'from_live' : null
+}
+
+function pendingFileRow(f, origin) {
+  const det = pendingEl('details', 'skills-pending-file')
+  const flagged = f.kind === 'script' || f.kind === 'binary' || f.executable || (origin || '').startsWith('not_proposed')
+  const sum = pendingEl('summary', flagged ? 'is-flagged' : null)
+  const flags = [f.kind]
+  if (f.executable) flags.push(t('skills.pending.executable'))
+  if (f.shebang) flags.push(f.shebang)
+  if (origin) flags.push(t(`skills.pending.origin_${origin}`))
+  sum.appendChild(pendingEl('code', null, f.path))
+  sum.appendChild(pendingEl('span', null, ` ${f.size} B · ${flags.join(' · ')}`))
+  det.appendChild(sum)
+  det.appendChild(pendingEl('div', 'skills-pending-sha', `sha256 ${f.sha256 || '-'}`))
+  det.appendChild(f.text != null
+    ? pendingEl('pre', null, f.text)
+    : pendingEl('div', 'skills-pending-warn', t('skills.pending.binary_not_shown')))
+  // #2088 delta 3: the readable runs of an image (what `cat` would hand the model)
+  if (f.text == null && f.strings) {
+    det.appendChild(pendingEl('div', 'skills-pending-warn', t('skills.pending.image_strings')))
+    det.appendChild(pendingEl('pre', null, f.strings))
+    det.open = true
+  }
+  if (f.path === 'SKILL.md' || (origin && origin !== 'from_live')) det.open = true
+  return det
+}
+
+function renderPendingSkills(box, list) {
+  box.replaceChildren()
+  if (!list.length) { box.hidden = true; return }
+  box.hidden = false
+  box.appendChild(pendingEl('h2', 'skills-pending-title', t('skills.pending.title', { n: list.length })))
+  box.appendChild(pendingEl('p', 'skills-pending-intro', t('skills.pending.intro')))
+  for (const p of list) {
+    const card = pendingEl('div', 'skills-pending-card')
+    const head = pendingEl('div', 'skills-pending-head')
+    head.appendChild(pendingEl('strong', null, p.name))
+    const where = p.target && p.target.scope === 'agent'
+      ? t('skills.pending.target_agent', { agent: p.target.agent })
+      : p.target && p.target.scope === 'project' ? t('skills.pending.target_project')
+      : t('skills.pending.target_global')
+    const src = p.source === 'import' ? t('skills.pending.source_import')
+      : p.source === 'propose' ? t('skills.pending.source_propose', { agent: p.proposedBy || '?' })
+      : t('skills.pending.source_generate')
+    head.appendChild(pendingEl('span', 'skills-pending-meta', `${src} · ${new Date(p.createdAt).toLocaleString()}`))
+    card.appendChild(head)
+    card.appendChild(pendingEl('div', p.target && p.target.scope === 'agent' ? 'skills-pending-target' : 'skills-pending-target is-global', where))
+    if (p.replaces) card.appendChild(pendingEl('div', 'skills-pending-sub is-flagged', t('skills.pending.replaces', { name: p.name })))
+    if (p.reason) card.appendChild(pendingEl('div', 'skills-pending-intro', t('skills.pending.reason', { reason: p.reason })))
+    // SKILLSPLIT1101: which references/*.md the proposal brought, and which of them overwrite a live file.
+    if (Array.isArray(p.proposedFiles) && p.proposedFiles.length) {
+      const list = p.proposedFiles.map((f) => `${f.path} (${t(f.replaced ? 'skills.pending.proposed_file_replaced' : 'skills.pending.proposed_file_new')})`).join(', ')
+      card.appendChild(pendingEl('div', p.proposedFiles.some((f) => f.replaced) ? 'skills-pending-sub is-flagged' : 'skills-pending-sub', t('skills.pending.proposed_files', { n: p.proposedFiles.length, list })))
+    }
+    if (p.replaces && typeof p.liveSkillMd === 'string') {
+      const cur = pendingEl('details', 'skills-pending-file')
+      cur.appendChild(pendingEl('summary', null, t('skills.pending.current_version')))
+      cur.appendChild(pendingEl('pre', null, p.liveSkillMd))
+      card.appendChild(cur)
+    }
+
+    const report = p.report || { files: [], findings: [], truncated: false }
+    const files = Array.isArray(report.files) ? report.files : []
+    const risky = files.filter((f) => f.kind === 'script' || f.kind === 'binary' || f.executable)
+    const rest = files.filter((f) => !risky.includes(f))
+    if (risky.length) {
+      card.appendChild(pendingEl('div', 'skills-pending-sub is-flagged', t('skills.pending.scripts', { n: risky.length })))
+      for (const f of risky) card.appendChild(pendingFileRow(f, pendingFileOrigin(p, f.path)))
+    }
+    card.appendChild(pendingEl('div', 'skills-pending-sub', t('skills.pending.files', { n: rest.length })))
+    for (const f of rest) card.appendChild(pendingFileRow(f, pendingFileOrigin(p, f.path)))
+
+    card.appendChild(pendingEl('div', 'skills-pending-sub',
+      report.findings.length ? t('skills.pending.findings', { n: report.findings.length }) : t('skills.pending.no_findings')))
+    if (report.findings.length) {
+      const fl = pendingEl('ul', 'skills-pending-findings')
+      for (const f of report.findings) {
+        const li = pendingEl('li')
+        li.appendChild(pendingEl('span', 'skills-pending-pattern', f.pattern))
+        li.appendChild(pendingEl('code', null, `${f.file}:${f.line}`))
+        li.appendChild(pendingEl('span', 'skills-pending-excerpt', f.excerpt))
+        fl.appendChild(li)
+      }
+      card.appendChild(fl)
+    }
+    if (report.findingsTruncated) card.appendChild(pendingEl('div', 'skills-pending-warn', t('skills.pending.findings_truncated')))
+    if (Array.isArray(report.unreviewable) && report.unreviewable.length) {
+      card.appendChild(pendingEl('div', 'skills-pending-warn', t('skills.pending.unreviewable', { list: report.unreviewable.join(', ') })))
+    } else if (!p.approvable) {
+      card.appendChild(pendingEl('div', 'skills-pending-warn', t('skills.pending.not_approvable')))
+    }
+
+    const actions = pendingEl('div', 'skills-pending-actions')
+    const approve = pendingEl('button', 'btn-primary btn-compact', t('skills.pending.approve'))
+    const reject = pendingEl('button', 'btn-danger btn-compact', t('skills.pending.reject'))
+    approve.disabled = !p.approvable
+    approve.addEventListener('click', async () => {
+      const confirmed = await confirmDialog({
+        title: t('skills.pending.confirm_approve_title'),
+        message: t('skills.pending.confirm_approve', { name: p.name, where }),
+        okLabel: t('skills.pending.confirm_approve_ok'),
+      })
+      if (!confirmed) return
+      approve.disabled = true
+      try {
+        const res = await fetch(`api/skills/pending/${encodeURIComponent(p.id)}/approve`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ hash: p.hash }),
+        })
+        const body = await res.json().catch(() => ({}))
+        if (!res.ok) throw new Error(refusalReason(res, body))
+        showToast(t('skills.pending.approved', { name: p.name }))
+        loadGlobalSkills()
+      } catch (err) {
+        showToast(`${t('skills.pending.error')}: ${err.message}`)
+        loadPendingSkills()
+      } finally { approve.disabled = !p.approvable }
+    })
+    reject.addEventListener('click', async () => {
+      const confirmed = await confirmDialog({
+        title: t('skills.pending.confirm_reject_title'),
+        message: t('skills.pending.confirm_reject', { name: p.name }),
+        okLabel: t('skills.pending.confirm_reject_ok'),
+        danger: true,
+      })
+      if (!confirmed) return
+      reject.disabled = true
+      try {
+        const res = await fetch(`api/skills/pending/${encodeURIComponent(p.id)}/reject`, { method: 'POST' })
+        if (!res.ok) throw new Error(refusalReason(res, await res.json().catch(() => ({}))))
+        showToast(t('skills.pending.rejected', { name: p.name }))
+      } catch (err) {
+        showToast(`${t('skills.pending.error')}: ${err.message}`)
+      } finally { reject.disabled = false; loadPendingSkills() }
+    })
+    actions.append(approve, reject)
+    card.appendChild(actions)
+    box.appendChild(card)
   }
 }
 
@@ -10683,6 +13754,25 @@ let _skillDetailCurrentName = null
 let _skillDetailCurrentAgentId = null
 let _skillDetailIsPlugin = false
 
+// The content as last loaded or saved. An edit that differs from it is unsaved: Cancel and the close
+// button ask before dropping it, and a confirmed Cancel puts this back, so a later Edit starts clean.
+let _skillDetailSavedContent = ''
+
+function _skillDetailHasUnsavedEdit() {
+  const editor = document.getElementById('skillDetailEditor')
+  return !editor.hidden && editor.value !== _skillDetailSavedContent
+}
+
+async function _skillDetailConfirmDiscard() {
+  if (!_skillDetailHasUnsavedEdit()) return true
+  return confirmDialog({
+    title: t('skills.confirm.discard_edit_title'),
+    message: t('skills.confirm.discard_edit'),
+    okLabel: t('skills.confirm.discard_edit_ok'),
+    danger: true,
+  })
+}
+
 function _skillDetailExitEdit() {
   const editor = document.getElementById('skillDetailEditor')
   const contentEl = document.getElementById('skillDetailContent')
@@ -10789,6 +13879,7 @@ async function openSkillDetail(skillName, displayLabel, agentId = null) {
     // Prefill editor
     const editor = document.getElementById('skillDetailEditor')
     if (editor) editor.value = rawContent
+    _skillDetailSavedContent = rawContent
 
   } catch (err) {
     console.error('Skill detail hiba:', err)
@@ -10823,7 +13914,11 @@ async function openSkillDetail(skillName, displayLabel, agentId = null) {
   }
 
   if (cancelBtn) {
-    cancelBtn.addEventListener('click', _skillDetailExitEdit)
+    cancelBtn.addEventListener('click', async () => {
+      if (!(await _skillDetailConfirmDiscard())) return
+      editor.value = _skillDetailSavedContent
+      _skillDetailExitEdit()
+    })
   }
 
   if (saveBtn) {
@@ -10842,6 +13937,7 @@ async function openSkillDetail(skillName, displayLabel, agentId = null) {
         })
         if (!res.ok) throw new Error('PUT failed: ' + res.status)
         contentEl.innerHTML = renderMarkdown(newContent)
+        _skillDetailSavedContent = newContent
         _skillDetailExitEdit()
         showToast(t('skills.toast.saved'))
         // Refresh list to pick up new description/keywords
@@ -10865,9 +13961,12 @@ async function loadTeamGraph() {
     const res = await fetch('api/team/graph')
     if (!res.ok) throw new Error('HTTP ' + res.status)
     const data = await res.json()
-    renderTeamGraph(container, data, { editable: true })
+    // Seed the active border from the last poll so it is right on first paint,
+    // then let the 3s agents-page poll keep it current.
+    renderTeamGraph(container, data, { editable: true, activeIds: _workingAgentIds })
+    if (agentsBusyTimer) refreshAgentTerminalBusy()
   } catch (err) {
-    container.innerHTML = `<div class="team-empty">${t('team.error', { msg: err.message || err })}</div>`
+    container.innerHTML = `<div class="team-empty">${t('team.error', { msg: escapeHtml(String(err.message || err)) })}</div>`
   }
 }
 
@@ -10898,6 +13997,7 @@ async function saveTeamReportsTo(childId, parentId, ctx) {
 
 function renderTeamGraph(container, data, opts = {}) {
   const editable = !!opts.editable
+  const activeIds = opts.activeIds instanceof Set ? opts.activeIds : new Set()
   const { nodes, edges, mainAgentId } = data
   container.innerHTML = ''
   const byId = new Map(nodes.map(n => [n.id, n]))
@@ -10930,19 +14030,32 @@ function renderTeamGraph(container, data, opts = {}) {
     if (node.role === 'main') div.classList.add('main')
     else if (node.role === 'leader') div.classList.add('leader')
     const roleLabel = node.role === 'main' ? t('team.role.main') : (node.role === 'leader' ? t('team.role.leader') : t('team.role.member'))
-    const running = node.running ? t('team.running') : t('team.stopped')
+    // The owner-written tagline ("P+R", "JIRA ügyintéző") says what the agent
+    // does; when set it takes the role line, and the role moves to the tooltip.
+    const tagline = (node.tagline || '').trim()
+    if (tagline) div.title = roleLabel
+    // Same pulsing dot the agent cards use, instead of the '●' that used to be
+    // baked into the translation -- a static glyph read as "stopped" next to a
+    // card whose dot was breathing.
+    const runLabel = node.running ? t('team.running') : t('team.stopped')
+    const runDotClass = node.running ? 'running' : 'stopped'
+    // Marked by refreshTeamGraphActivity() from /api/agents/activity, so the
+    // node carries its id for the class toggle that runs without a re-render.
+    div.dataset.agentId = node.id
+    if (activeIds.has(node.id)) div.classList.add('team-node-active')
     const avatarUrl = node.id === mainAgentId
       ? `api/marveen/avatar${avatarBust()}`
       : `api/agents/${encodeURIComponent(node.id)}/avatar${avatarBust()}`
     div.innerHTML = `
       <div class="team-node-avatar"><img src="${avatarUrl}" alt="${escapeHtml(node.label || node.id)}" onerror="this.style.display='none'"></div>
       <div class="team-node-name">${escapeHtml(node.label || node.id)}</div>
-      <div class="team-node-meta">${escapeHtml(roleLabel)}</div>
-      <div class="team-node-meta">${running}</div>
+      <div class="team-node-meta${tagline ? ' team-node-tagline' : ''}">${escapeHtml(tagline || roleLabel)}</div>
+      <div class="team-node-meta team-node-status"><span class="process-dot ${runDotClass}"></span>${escapeHtml(runLabel)}</div>
     `
-    if (node.id !== mainAgentId) {
-      div.addEventListener('click', () => openAgentDetail(node.id))
-    }
+    // The main agent opens too: openAgentDetail() hands it to openMarveenDetail(). It used to be
+    // left without a click (from before the main agent had a detail view), so its card on the
+    // overview and in the org chart looked clickable but did nothing.
+    div.addEventListener('click', () => openAgentDetail(node.id))
     // Drag-and-drop reporting edit (Team page only). Any agent except the main
     // one can be dragged; any node can be a drop target (dropping onto the main
     // agent makes the report a direct report of it).
@@ -11047,30 +14160,49 @@ function renderTeamGraph(container, data, opts = {}) {
   }
 }
 
-// === Agents page: grid / org-chart view toggle ===
+// === Agents page: view toggle (cards / activity / org chart) ===
+// Three views, but only TWO layouts: 'grid' and 'activity' are the same card
+// grid with different card bodies ('grid' is the original card -- model badge,
+// run + channel status, actions; 'activity' replaces everything below the
+// avatar/name/description with the live pane status that used to be its own
+// Activity page), and 'tree' is the org chart. The card body follows from the
+// view, so the CSS keeps its data-card-mode hook without a second piece of
+// state to keep in sync.
 // Persists the chosen view for the session so navigating away and back keeps
 // the last selection. Defaults to 'grid'.
 let _agentsActiveView = 'grid'
 
-function _setAgentsView(view) {
-  _agentsActiveView = view
-  const gridView = document.getElementById('agentsGridView')
-  const treeView = document.getElementById('agentsTreeView')
-  const gridBtn  = document.getElementById('agentsViewGrid')
-  const treeBtn  = document.getElementById('agentsViewTree')
-  if (!gridView || !treeView) return
-  const showGrid = view === 'grid'
-  gridView.hidden = !showGrid
-  treeView.hidden = showGrid
-  if (gridBtn) gridBtn.classList.toggle('active', showGrid)
-  if (treeBtn) treeBtn.classList.toggle('active', !showGrid)
-  if (!showGrid) loadTeamGraph()
+// A card click means "open this agent" in card view and "look at what it is
+// doing" in activity view -- the same split the Activity page had, where only a
+// running agent's card was clickable.
+function onAgentCardClick(id, openDetail) {
+  if (_agentsActiveView === 'activity') {
+    if (id && _liveAgentIds.has(id)) openTerminalModal(id)
+    return
+  }
+  openDetail()
 }
 
-const _agentsViewGridBtn = document.getElementById('agentsViewGrid')
-const _agentsViewTreeBtn = document.getElementById('agentsViewTree')
-if (_agentsViewGridBtn) _agentsViewGridBtn.addEventListener('click', () => _setAgentsView('grid'))
-if (_agentsViewTreeBtn) _agentsViewTreeBtn.addEventListener('click', () => _setAgentsView('tree'))
+function _setAgentsView(view) {
+  _agentsActiveView = view === 'activity' || view === 'tree' ? view : 'grid'
+  const gridView = document.getElementById('agentsGridView')
+  const treeView = document.getElementById('agentsTreeView')
+  if (!gridView || !treeView) return
+  const showTree = _agentsActiveView === 'tree'
+  gridView.hidden = showTree
+  treeView.hidden = !showTree
+  if (agentsGrid) agentsGrid.dataset.cardMode = _agentsActiveView === 'activity' ? 'activity' : 'profile'
+  for (const btn of document.querySelectorAll('#agentsViewToggle [data-view]')) {
+    btn.classList.toggle('active', btn.dataset.view === _agentsActiveView)
+  }
+  // Repaint immediately rather than waiting up to 3s for the next tick.
+  if (!showTree && agentsBusyTimer) refreshAgentTerminalBusy()
+  if (showTree) loadTeamGraph()
+}
+
+for (const btn of document.querySelectorAll('#agentsViewToggle [data-view]')) {
+  btn.addEventListener('click', () => _setAgentsView(btn.dataset.view))
+}
 
 // === Team: inter-agent message log + compose ===
 // View the /api/messages queue and let the operator send a message to an agent
@@ -11084,6 +14216,9 @@ const MSG_STATUS_META = {
   delivered: { label: () => t('messages.status.delivered'), cls: 'badge-active' },
   done: { label: () => t('messages.status.done'), cls: 'badge-active' },
   failed: { label: () => t('messages.status.failed'), cls: 'badge-paused' },
+  // badges of the reply bubble chatWithReplies() adds after an owner's closed message
+  reply: { label: () => t('messages.conv.reply_label'), cls: 'badge-active' },
+  reply_failed: { label: () => t('messages.conv.reply_label'), cls: 'badge-paused' },
 }
 async function resolveOwnerName() {
   try {
@@ -11103,7 +14238,7 @@ const chatAgentHasAvatar = new Map() // name -> true|false
 let chatSelectedAgent = null
 
 function chatMonogramEl(agentName, size) {
-  const letter = agentName.charAt(0).toUpperCase()
+  const letter = escapeHtml(agentName.charAt(0).toUpperCase())
   const colors = ['#d97757','#00C2A8','#818cf8','#22c55e','#f59e0b','#ec4899']
   const color = colors[agentName.split('').reduce((a,c)=>a+c.charCodeAt(0),0) % colors.length]
   return `<div class="chat-avatar chat-avatar-mono" style="width:${size}px;height:${size}px;background:${color};font-size:${Math.round(size*0.4)}px">${letter}</div>`
@@ -11302,7 +14437,7 @@ async function loadChatAgentList() {
 }
 
 // Pagination state for the open thread
-const chatThreadState = { agent: null, minLoadedId: null, hasMore: true, loading: false }
+const chatThreadState = { agent: null, minLoadedId: null, hasMore: true, loading: false, liveSig: null, liveTimer: null, loadedCount: 0 }
 const CHAT_PAGE_SIZE = 10
 const CHAT_LOAD_MORE = 20
 
@@ -11314,6 +14449,7 @@ async function loadChatThread(agentName) {
   chatThreadState.minLoadedId = null
   chatThreadState.hasMore = true
   chatThreadState.loading = false
+  chatThreadState.loadedCount = 0
 
   const owner = chatOwnerName()
   const threadDisplayName = owner && agentName === owner ? owner + ' (te)' : chatDisplayName(agentName)
@@ -11322,7 +14458,7 @@ async function loadChatThread(agentName) {
     <div class="chat-thread-header">
       ${chatAvatarHtml(agentName, 32)}
       <span class="chat-thread-title">${escapeHtml(threadDisplayName)}</span>
-      <button class="btn-secondary btn-compact" style="margin-left:auto" onclick="loadChatThread('${escapeHtml(agentName)}')">
+      <button class="btn-secondary btn-compact" style="margin-left:auto" onclick="loadChatThread(${jsArg(agentName)})">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
       </button>
     </div>
@@ -11342,6 +14478,7 @@ async function loadChatThread(agentName) {
 
   // Initial load
   await fetchChatPage(agentName, null, CHAT_PAGE_SIZE, 'replace')
+  startChatLivePoll()
   // Mark thread as read (localStorage last-seen)
   const threadData = (await fetch('api/messages/threads').then(r => r.ok ? r.json() : []).catch(() => []))
     .find(t => t.agent === agentName)
@@ -11393,6 +14530,112 @@ function buildBubbleHtml(m) {
   </div>`
 }
 
+// The ANSWER to a closed message lives in its `result` column, not in a row
+// of its own, so this view used to end at the request: the badge turned
+// "done" and the reply was nowhere on screen (measured twice on 2026-10-30,
+// both times read as "the agent never answered" -- it had, in 24 s).
+//
+// Drawn ONLY for the owner's own messages, on purpose. Agent -> agent, the
+// close also creates a reverse `[Eredmeny]` message (shouldNotifyDelegator in
+// routes/messages.ts), which already renders as its own bubble further down
+// the thread -- rendering `result` there too would show the same answer
+// twice. That notification is skipped when the sender is not a registered
+// agent, which is exactly the owner's case (they send under OWNER_NAME), so
+// this is the one path where the answer has no row to appear in.
+//
+// The reply is a plain message object handed to buildBubbleHtml, so it goes
+// through the same template and escaping as every other bubble. It is sent by
+// the RECIPIENT, so from/to are swapped; it keeps the request's id.
+//
+// The shared id is deliberate: the reply is the result column of that same
+// message, not a message of its own, and the #id chip should name the message
+// the owner can look up. Two rows therefore carry one data-msg-id, the request
+// first and its reply right after it; a lookup that needs the reply must take
+// the LAST row with that id (or the one with the reply badge), not the first.
+// Giving the reply an id of its own would mean a non-numeric value in the
+// m.id sink, which the HTML-sink allowlist pins as the integer primary key.
+function chatWithReplies(sorted) {
+  const owner = chatOwnerName()
+  const out = []
+  for (const m of sorted) {
+    out.push(m)
+    const closed = m.status === 'done' || m.status === 'failed'
+    const replyText = closed && owner && m.from_agent === owner ? String(m.result || '').trim() : ''
+    if (!replyText) continue
+    out.push({
+      id: m.id,
+      from_agent: m.to_agent,
+      to_agent: m.from_agent,
+      content: replyText,
+      status: m.status === 'failed' ? 'reply_failed' : 'reply',
+      created_at: m.completed_at || null,
+    })
+  }
+  return out
+}
+
+// What the newest page shows that can change after it is drawn: new ids, the
+// status badge and the reply (result) of a closed message.
+function chatListSig(msgs) {
+  return msgs.map(m => `${m.id}:${m.status || ''}:${String(m.result || '').length}:${m.completed_at || ''}`).join(',')
+}
+
+// Oldest first. created_at is whole seconds, so a tie is broken by id: the API
+// pages newest first by (created_at, id), and with created_at alone the page
+// drawn and the page polled could hold different ids at a same-second boundary,
+// so the signatures would never match and every poll would redraw.
+function chatSortAsc(msgs) {
+  return [...msgs].sort((a, b) => (a.created_at || 0) - (b.created_at || 0) || a.id - b.id)
+}
+
+// Live refresh of the open thread. Before this the view only changed on the
+// manual reload button, so an agent's reply (or the done badge) stayed
+// invisible until the owner clicked. Polls the newest page; when it differs
+// from what was last drawn, the thread is redrawn through the normal initial
+// load (fetchChatPage 'replace'), so there is no second render path. Runs only
+// while a thread is open; skipped while the tab or the panel is hidden, a load
+// runs, or the owner has scrolled up to read older messages (the redraw would
+// jump the view -- the next poll catches up).
+//
+// The change check looks at the newest page only, but the redraw fetches as
+// many messages as are currently loaded (capped at the API's 200), so older
+// pages the owner paginated in survive the redraw instead of collapsing the
+// thread back to one page.
+const CHAT_LIVE_REDRAW_MAX = 200
+const CHAT_LIVE_POLL_MS = 5000
+function startChatLivePoll() {
+  stopChatLivePoll()
+  chatThreadState.liveTimer = setInterval(pollChatThread, CHAT_LIVE_POLL_MS)
+}
+function stopChatLivePoll() {
+  if (chatThreadState.liveTimer) clearInterval(chatThreadState.liveTimer)
+  chatThreadState.liveTimer = null
+}
+async function pollChatThread() {
+  const agent = chatThreadState.agent
+  const container = document.getElementById('chatBubbles')
+  if (!agent || !container) { stopChatLivePoll(); return }
+  if (document.hidden || container.offsetParent === null || chatThreadState.loading) return
+  if (container.scrollHeight - container.scrollTop - container.clientHeight >= 60) return
+  let msgs
+  try {
+    const res = await fetch(`api/messages?agent=${encodeURIComponent(agent)}&limit=${CHAT_PAGE_SIZE}`)
+    if (!res.ok) return
+    msgs = await res.json()
+  } catch { return }
+  if (!Array.isArray(msgs) || chatThreadState.agent !== agent || chatThreadState.loading) return
+  const sorted = chatSortAsc(msgs)
+  if (chatListSig(sorted) === chatThreadState.liveSig) return
+  // New messages push the oldest loaded ones out of a same-size window, so the
+  // redraw asks for that many more.
+  const drawnIds = new Set(String(chatThreadState.liveSig || '').split(',').map(s => s.split(':')[0]))
+  const added = sorted.filter(m => !drawnIds.has(String(m.id))).length
+  const limit = Math.min(Math.max(CHAT_PAGE_SIZE, chatThreadState.loadedCount + added), CHAT_LIVE_REDRAW_MAX)
+  chatThreadState.minLoadedId = null
+  chatThreadState.hasMore = true
+  await fetchChatPage(agent, null, limit, 'replace')
+}
+
 async function fetchChatPage(agentName, beforeId, limit, mode) {
   if (chatThreadState.loading) return
   chatThreadState.loading = true
@@ -11406,24 +14649,27 @@ async function fetchChatPage(agentName, beforeId, limit, mode) {
     const res = await fetch(url)
     if (!res.ok) throw new Error('HTTP ' + res.status)
     const msgs = await res.json()
-    const sorted = Array.isArray(msgs) ? [...msgs].sort((a, b) => (a.created_at || 0) - (b.created_at || 0)) : []
+    const sorted = Array.isArray(msgs) ? chatSortAsc(msgs) : []
 
     if (mode === 'replace') {
       if (sorted.length === 0) {
         container.innerHTML = '<p class="activity-empty">' + t('messages.empty_thread') + '</p>'
       } else {
         container.innerHTML = '<div class="chat-loading-indicator" id="chatLoadingTop" style="display:none;text-align:center;padding:8px;font-size:11px;color:var(--text-muted)">' + t('messages.loading') + '</div>'
-        container.insertAdjacentHTML('beforeend', sorted.map(buildBubbleHtml).join(''))
+        container.insertAdjacentHTML('beforeend', chatWithReplies(sorted).map(buildBubbleHtml).join(''))
         container.scrollTop = container.scrollHeight
       }
       if (sorted.length < limit) chatThreadState.hasMore = false
+      chatThreadState.liveSig = chatListSig(sorted.slice(-CHAT_PAGE_SIZE))
+      chatThreadState.loadedCount = sorted.length
     } else { // prepend
       if (loadingIndicator) loadingIndicator.style.display = 'none'
       if (!sorted.length) { chatThreadState.hasMore = false; chatThreadState.loading = false; return }
       if (sorted.length < limit) chatThreadState.hasMore = false
+      chatThreadState.loadedCount += sorted.length
       const prevHeight = container.scrollHeight
       const indicator = document.getElementById('chatLoadingTop')
-      const html = sorted.map(buildBubbleHtml).join('')
+      const html = chatWithReplies(sorted).map(buildBubbleHtml).join('')
       if (indicator) {
         indicator.insertAdjacentHTML('afterend', html)
       } else {
@@ -11456,8 +14702,8 @@ function renderChatBubbles(msgs, agentName) {
     container.innerHTML = '<p class="activity-empty">' + t('messages.empty_thread') + '</p>'
     return
   }
-  const sorted = [...msgs].sort((a,b) => (a.created_at||0) - (b.created_at||0))
-  container.innerHTML = sorted.map(buildBubbleHtml).join('')
+  const sorted = chatSortAsc(msgs)
+  container.innerHTML = chatWithReplies(sorted).map(buildBubbleHtml).join('')
   container.scrollTop = container.scrollHeight
 }
 
@@ -11474,9 +14720,12 @@ async function sendChatMessage(toAgent) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ from, to: toAgent, content }),
     })
-    if (!res.ok) { const err = await res.json(); throw new Error(err.error || 'Hiba') }
+    const reply = await readActionReply(res)
+    if (!reply.ok) throw new Error(refusalReason(res, reply.body))
     if (textarea) textarea.value = ''
-    showToast(t('messages.sent'))
+    // A stopped target (#2426): the server stores the message as pending and says
+    // queued; it is delivered when the agent starts, so "sent" would be wrong.
+    showToast(reply.body.queued === true ? t('messages.queued', { agent: toAgent }) : t('messages.sent'), reply.body.queued === true ? 6000 : 3000)
     await loadChatThread(toAgent)
     await loadChatAgentList()
   } catch (e) {
@@ -11494,6 +14743,8 @@ document.getElementById('chatRefreshBtn')?.addEventListener('click', () => {
 function renderTeamEditor(agent, allAgents) {
   const team = agent.team || { role: 'member', reportsTo: null, delegatesTo: [], autoDelegation: false, trustFrom: [] }
   document.getElementById('editTeamRole').value = team.role || 'member'
+  const taglineInput = document.getElementById('editTeamTagline')
+  if (taglineInput) taglineInput.value = agent.tagline || ''
   const reportsSel = document.getElementById('editTeamReportsTo')
   reportsSel.innerHTML = ''
   const emptyOpt = document.createElement('option')
@@ -11547,6 +14798,7 @@ document.getElementById('saveTeamBtn').addEventListener('click', async () => {
   const delegates = Array.from(document.querySelectorAll('#editTeamDelegatesList input[type=checkbox]:checked')).map(cb => cb.value)
   const trustFrom = Array.from(document.querySelectorAll('#editTeamTrustFromList input[type=checkbox]:checked')).map(cb => cb.value)
   const autoDelegation = document.getElementById('editTeamAutoDelegation').checked
+  const tagline = (document.getElementById('editTeamTagline')?.value || '').trim()
   const originalText = btn.textContent
   btn.disabled = true
   btn.textContent = t('team.save_saving')
@@ -11560,9 +14812,11 @@ document.getElementById('saveTeamBtn').addEventListener('click', async () => {
         delegatesTo: role === 'leader' ? delegates : [],
         trustFrom,
         autoDelegation: role === 'leader' ? autoDelegation : false,
+        tagline,
       }),
     })
     if (!res.ok) throw new Error()
+    markFieldSaved(document.getElementById('editTeamTagline'))
     // The server sanitizes the team config (strips self-references and
     // unknown agent ids) and reports what it dropped in `warnings`. Surface
     // that to the operator so a mistyped name isn't silently lost.
@@ -11604,6 +14858,480 @@ function formatRelative(ts) {
   return t('common.time.day_abbr', { n: day })
 }
 
+// === Projects overview page ===
+// Human-readable, project-grouped summary of the kanban board. Everything
+// except the free-text description is computed server-side straight from
+// kanban_cards (GET /api/kanban-projects/summary) -- this page never derives
+// card counts/status locally, so it can never disagree with the Kanban board
+// itself. Fetches its own assignee list rather than depending on
+// kanbanAssignees (populated by loadKanban()) so the page works correctly
+// even if the user opens Projects before ever visiting Kanban.
+let _projectsAssignees = []
+// Last fetched summaries, kept so the status filter toggles below can
+// re-render instantly without a round trip -- the summary endpoint already
+// carries everything the filter needs (cardTotal/cardDone), so this is a
+// pure client-side filter, no new API.
+let _projectsLastSummaries = []
+let projectsShowDone = true
+let projectsShowInProgress = true
+
+// A project's overall state, derived the same way the card-count badge is:
+// "done" once every one of its (non-archived) cards is done, and only once
+// it has at least one card -- a project with zero live cards never reaches
+// here anyway (listKanbanProjectSummaries excludes it), but cardTotal===0
+// is guarded regardless so a future zero-card summary can't misreport as done.
+function projectOverallStatus(p) {
+  return p.cardTotal > 0 && p.cardDone === p.cardTotal ? 'done' : 'in_progress'
+}
+
+async function loadProjects() {
+  const grid = document.getElementById('projectsGrid')
+  const empty = document.getElementById('projectsEmpty')
+  if (!grid) return
+  try {
+    const [summaryRes, assigneesRes] = await Promise.all([
+      fetch('api/kanban-projects/summary'),
+      fetch('api/kanban/assignees'),
+    ])
+    if (!summaryRes.ok) throw new Error('HTTP ' + summaryRes.status)
+    _projectsLastSummaries = await summaryRes.json()
+    _projectsAssignees = assigneesRes.ok ? await assigneesRes.json() : []
+    renderProjects()
+  } catch (err) {
+    console.error('loadProjects failed:', err)
+    grid.innerHTML = ''
+    if (empty) { empty.hidden = false; empty.textContent = t('projects.load_error') }
+  }
+}
+
+function setProjectsFilterBtn(btnId, active) {
+  const btn = document.getElementById(btnId)
+  if (btn) btn.classList.toggle('active', active)
+}
+
+document.getElementById('projectsFilterDone')?.addEventListener('click', () => {
+  projectsShowDone = !projectsShowDone
+  setProjectsFilterBtn('projectsFilterDone', projectsShowDone)
+  renderProjects()
+})
+document.getElementById('projectsFilterInProgress')?.addEventListener('click', () => {
+  projectsShowInProgress = !projectsShowInProgress
+  setProjectsFilterBtn('projectsFilterInProgress', projectsShowInProgress)
+  renderProjects()
+})
+
+// Case-insensitive match against the assignee list (mirrors
+// kanbanSwimlaneKeyFor's own resolution rule) so display names/avatar colors
+// are consistent with how the Kanban board itself labels the same assignee.
+// An assignee id with no match (e.g. one that predates the current agent
+// roster) falls back to the raw id with the neutral "unknown" dot color --
+// same fallback the Kanban board uses, not a worse one.
+function projectAssigneeMeta(rawName) {
+  const raw = String(rawName || '').trim()
+  const match = _projectsAssignees.find((a) => a.name.toLowerCase() === raw.toLowerCase())
+  return match
+    ? { label: match.displayName || match.name, type: match.type }
+    : { label: raw, type: 'unknown' }
+}
+
+function renderProjects() {
+  const grid = document.getElementById('projectsGrid')
+  const empty = document.getElementById('projectsEmpty')
+  if (!grid) return
+  grid.innerHTML = ''
+  const all = Array.isArray(_projectsLastSummaries) ? _projectsLastSummaries : []
+  if (all.length === 0) {
+    if (empty) { empty.hidden = false; empty.textContent = t('projects.empty') }
+    return
+  }
+  const summaries = all.filter((p) => {
+    const status = projectOverallStatus(p)
+    if (status === 'done') return projectsShowDone
+    return projectsShowInProgress
+  })
+  if (summaries.length === 0) {
+    // Projects exist, but the current filter combination hides all of
+    // them -- a different message from "no project at all", so the user
+    // does not read this as an empty board.
+    if (empty) { empty.hidden = false; empty.textContent = t('projects.filter_empty') }
+    return
+  }
+  if (empty) empty.hidden = true
+
+  for (const p of summaries) {
+    const pct = p.cardTotal > 0 ? Math.round((p.cardDone / p.cardTotal) * 100) : 0
+    const activity = p.lastActivityAt
+      ? t('projects.last_activity', { when: formatRelative(p.lastActivityAt * 1000) })
+      : t('projects.no_activity')
+    const assigneeChips = (p.activeAssignees || []).length
+      ? p.activeAssignees.map((name) => {
+          const meta = projectAssigneeMeta(name)
+          return `<span class="kanban-card-assignee"><span class="assignee-dot ${escapeAttr(meta.type)}">${escapeHtml((meta.label[0] || '?').toUpperCase())}</span>${escapeHtml(meta.label)}</span>`
+        }).join('')
+      : `<span class="kanban-card-assignee">${escapeHtml(t('projects.no_assignee'))}</span>`
+
+    const card = document.createElement('div')
+    card.className = 'overview-card'
+    card.dataset.project = p.project
+    card.innerHTML = `
+      <div class="overview-card-head">
+        <h3>${escapeHtml(p.project)}</h3>
+        <span class="overview-card-meta">${escapeHtml(t('projects.cards_done', { done: p.cardDone, total: p.cardTotal }))}</span>
+      </div>
+      <div class="project-card-progress"><div class="project-card-progress-fill" style="width:${pct}%"></div></div>
+      <div class="project-card-desc" data-role="desc-view" data-raw="${escapeHtml(p.description || '')}">${p.description ? escapeHtml(p.description) : `<em>${escapeHtml(t('projects.no_description'))}</em>`}</div>
+      <textarea class="project-card-desc-edit" data-role="desc-edit" hidden>${escapeHtml(p.description || '')}</textarea>
+      <div data-role="desc-actions" style="display:flex;gap:6px;margin:6px 0">
+        <button class="btn-secondary btn-compact" data-act="edit">${escapeHtml(t('projects.edit'))}</button>
+        <button class="btn-primary btn-compact" data-act="save" hidden>${escapeHtml(t('projects.save'))}</button>
+        <button class="btn-secondary btn-compact" data-act="cancel" hidden>${escapeHtml(t('projects.cancel'))}</button>
+      </div>
+      <div class="project-card-assignees">${assigneeChips}</div>
+      <div class="project-card-foot">
+        <span>${escapeHtml(activity)}</span>
+        <a href="#" data-act="view-kanban">${escapeHtml(t('projects.view_in_kanban'))}</a>
+      </div>
+    `
+    grid.appendChild(card)
+  }
+}
+
+// Delegated click handler (one listener for the whole grid, not one per
+// card): the grid is fully re-rendered on every loadProjects() call, so
+// per-card listeners would leak on each refresh. data-act encodes which
+// button was pressed; data-project on the ancestor card carries the key.
+document.getElementById('projectsGrid')?.addEventListener('click', async (e) => {
+  const card = e.target.closest('.overview-card[data-project]')
+  if (!card) return
+  const project = card.dataset.project
+  const view = card.querySelector('[data-role="desc-view"]')
+  const editArea = card.querySelector('[data-role="desc-edit"]')
+  const [editBtn, saveBtn, cancelBtn] = card.querySelectorAll('[data-role="desc-actions"] button')
+
+  if (e.target.closest('[data-act="edit"]')) {
+    view.hidden = true; editArea.hidden = false
+    editBtn.hidden = true; saveBtn.hidden = false; cancelBtn.hidden = false
+    editArea.focus()
+    return
+  }
+  if (e.target.closest('[data-act="cancel"]')) {
+    editArea.value = view.dataset.raw ?? editArea.value
+    view.hidden = false; editArea.hidden = true
+    editBtn.hidden = false; saveBtn.hidden = true; cancelBtn.hidden = true
+    return
+  }
+  if (e.target.closest('[data-act="save"]')) {
+    const text = editArea.value
+    try {
+      const res = await fetch(`api/kanban-projects/${encodeURIComponent(project)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ description: text }),
+      })
+      if (!res.ok) throw new Error('HTTP ' + res.status)
+      view.innerHTML = text.trim() ? escapeHtml(text.trim()) : `<em>${escapeHtml(t('projects.no_description'))}</em>`
+      view.dataset.raw = text.trim()
+      view.hidden = false; editArea.hidden = true
+      editBtn.hidden = false; saveBtn.hidden = true; cancelBtn.hidden = true
+      showToast(t('common.saved'))
+    } catch (err) {
+      console.error('save project description failed:', err)
+      showToast(t('projects.save_error'))
+    }
+    return
+  }
+  if (e.target.closest('[data-act="view-kanban"]')) {
+    e.preventDefault()
+    kanbanProjectFilter = project
+    const sel = document.getElementById('kanbanProjectFilter')
+    if (sel) sel.value = project
+    switchPage('kanban')
+  }
+})
+
+// Forward-looking duration, reusing the same abbreviations formatRelative uses
+// so the strip does not invent a second time vocabulary.
+function formatDurationShort(sec) {
+  if (sec < 60) return t('common.time.min_abbr', { n: 1 })
+  const min = Math.floor(sec / 60)
+  if (min < 60) return t('common.time.min_abbr', { n: min })
+  const hr = Math.floor(min / 60)
+  if (hr < 24) return t('common.time.hour_abbr', { h: hr })
+  return t('common.time.day_abbr', { n: Math.floor(hr / 24) })
+}
+
+// Same thresholds as the status line's rl_pct(): >=80 danger, >=60 caution.
+// The dashboard palette has no yellow token, so the accent stands in for it.
+function quotaLevelClass(pct) {
+  if (pct >= 80) return 'danger'
+  if (pct >= 60) return 'warn'
+  return ''
+}
+
+// Weekly quota row: one segment per CALENDAR day, day names underneath and a
+// "now" marker. The window is NOT a calendar week: it runs resetsAt-7d ->
+// resetsAt and the reset is rarely at midnight (measured: Monday 09:00 CEST
+// on 2026-09-29, Friday 22:00 CEST on 2026-10-20). Equal 24 h segments
+// labelled by their start day were therefore up to a day off: with a Friday
+// 22:00 reset the "Friday" segment was 22 h of Saturday, and Tuesday morning
+// sat in "Monday" (Guido, 2026-10-20). So the segment boundaries are the
+// local midnights inside the window: a partial first and last day around 6
+// whole ones (8 segments, or 7 when the reset is at midnight), each labelled
+// with the day it covers. A segment shorter than half a day keeps its width
+// but no label (renderQuotaStrip), as a 2 h sliver has no room for one.
+// Returns null when there is no usable current window -- the row then keeps
+// the plain bar instead of drawing a week it cannot place.
+// timeZone is for tests only; the dashboard uses the viewer's local time.
+function weekSegments(resetsAt, nowSec, lang, timeZone) {
+  const WEEK = 7 * 86400
+  if (typeof resetsAt !== 'number' || !Number.isFinite(resetsAt)) return null
+  if (typeof nowSec !== 'number' || !Number.isFinite(nowSec)) return null
+  const start = resetsAt - WEEK
+  if (resetsAt <= nowSec || nowSec < start) return null
+  const locale = lang === 'en' ? 'en-US' : 'hu-HU'
+  const fmt = new Intl.DateTimeFormat('en-US', { timeZone, year: 'numeric', month: 'numeric', day: 'numeric' })
+  // Local calendar date of an instant as one comparable number (YYYYMMDD).
+  const dateKey = (sec) => {
+    const p = {}
+    for (const x of fmt.formatToParts(new Date(sec * 1000))) p[x.type] = Number(x.value)
+    return p.year * 10000 + p.month * 100 + p.day
+  }
+  // The next day's first instant: the first second whose local DATE differs
+  // from sec's, found by binary search in (sec, sec + 26 h]. No wall-clock
+  // arithmetic, so a 23 h / 25 h DST day ends where it really ends, and on a
+  // day whose 00:00 does not exist (DST starting AT midnight, e.g.
+  // America/Santiago 2026-09-06) the cut is its real first instant, 01:00 --
+  // a 00:00 computed from offsets fell back to the previous day's 23:00 and
+  // left a zero-width segment (review of #2082).
+  const midnightAfter = (sec) => {
+    const day = dateKey(sec)
+    let lo = Math.floor(sec)
+    let hi = lo + 26 * 3600
+    while (hi - lo > 1) {
+      const mid = Math.floor((lo + hi) / 2)
+      if (dateKey(mid) === day) lo = mid
+      else hi = mid
+    }
+    return hi
+  }
+  const bounds = [start]
+  for (let m = midnightAfter(start); m < resetsAt && bounds.length < 9; m = midnightAfter(m)) bounds.push(m)
+  bounds.push(resetsAt)
+  const starts = bounds.slice(0, -1)
+  const name = (weekday) => starts.map((sec) => {
+    const s = new Date(sec * 1000).toLocaleDateString(locale, { weekday, timeZone })
+    return s.charAt(0).toUpperCase() + s.slice(1)
+  })
+  // Three widths, chosen by the CSS container query on .quota-bar-days, never
+  // by an ellipsis (a portrait phone showed "Hé… Ke… Sz… … Sz…": two
+  // indistinguishable "Sz…"). hu short = H K Sze Cs P Szo V. hu has no safe
+  // one-letter form (Szerda/Szombat both "Sz"), so hu has NO narrow tier:
+  // narrowLabels is null and the day-name row hides below that width (the
+  // separators and the now marker still show where the days are). Its short
+  // forms need ~140 px and ran together ("SzeCs") on a 390 px phone.
+  // en narrow = M T W T F S S.
+  const short = name('short')
+  return {
+    starts,
+    widths: starts.map((sec, i) => ((bounds[i + 1] - sec) / WEEK) * 100),
+    labels: name('long'),
+    shortLabels: short,
+    narrowLabels: lang === 'en' ? name('narrow') : null,
+    nowPct: ((nowSec - start) / WEEK) * 100,
+  }
+}
+
+// Render the subscription quota strip from /api/overview's `quota` block.
+//
+// The rule this follows: a quota reading is only worth showing while it is
+// fresh, and an absent strip must never look like a healthy one. So a missing
+// file still renders the strip -- with one quiet line saying why there is no
+// data -- and a stale or already-reset reading keeps its numbers but drops the
+// colour, because a green bar from six hours ago reassures exactly as much as
+// a green bar from six seconds ago.
+// "measured N ago" -- except for a reading under a minute old, where the
+// relative formatter says "now" and the sentence would read "measured now ago".
+function quotaMeasuredText(ageSec) {
+  if (ageSec < 60) return t('overview.quota.measured_now')
+  return t('overview.quota.measured', { age: formatRelative(Date.now() - ageSec * 1000) })
+}
+
+function renderQuotaStrip(q, fable) {
+  const strip = document.getElementById('quotaStrip')
+  const bars = document.getElementById('quotaBars')
+  const note = document.getElementById('quotaStripNote')
+  const age = document.getElementById('quotaStripAge')
+  if (!strip || !bars || !note || !age) return
+  strip.hidden = false
+  bars.innerHTML = ''
+  note.hidden = true
+  note.className = 'quota-strip-note'
+  age.textContent = ''
+
+  if (!q || q.status === 'missing') {
+    const reason = q && q.reason ? q.reason : 'no-file'
+    note.textContent = t('overview.quota.none.' + reason.replace(/-/g, '_'))
+    note.hidden = false
+    return
+  }
+
+  const stale = q.status === 'stale'
+  const nowSec = Math.floor(Date.now() / 1000)
+  const windows = [
+    ['overview.quota.five_hour', q.fiveHour, stale, null],
+    ['overview.quota.seven_day', q.sevenDay, stale, null],
+  ]
+  // Fable/Opus comes from a different collector with its own freshness --
+  // muted independently of the statusLine-sourced `stale` above. Silently
+  // omitted (like any other null window here) when there's simply no
+  // reading yet -- non-tiered accounts never get one.
+  if (fable && fable.window) {
+    windows.push(['overview.quota.fable', fable.window, fable.status !== 'ok', fable.ageSec])
+  }
+  for (const [labelKey, w, muted0, ageSecForRow] of windows) {
+    if (!w) continue
+    const pct = Math.max(0, Math.min(100, Math.round(w.usedPercentage)))
+    const muted = muted0 || w.expired
+    const row = document.createElement('div')
+    row.className = 'quota-bar' + (muted ? ' muted' : '')
+    let tail = ''
+    if (w.expired) {
+      tail = ' · ' + t('overview.quota.expired')
+    } else if (typeof w.resetsAt === 'number' && w.resetsAt > nowSec) {
+      tail = ' · ' + t('overview.quota.resets_in', { d: formatDurationShort(w.resetsAt - nowSec) })
+    }
+    // This row's own collector age travels with it: the shared age line
+    // below (q.ageSec) only covers the statusLine source, so it says nothing
+    // about a row fed by a different collector -- without this a muted row
+    // reads as "might be old" with no way to tell minutes from days.
+    if (typeof ageSecForRow === 'number') {
+      tail += ' · ' + quotaMeasuredText(ageSecForRow)
+    }
+    // QUOTAMOD1005: with the mod source each window names its own agent -- the
+    // 5-hour and the weekly reading may come from different sessions.
+    if (q.source === 'mod' && w.sourceAgent) {
+      tail += ' · ' + w.sourceAgent
+    }
+    const week = labelKey === 'overview.quota.seven_day' && !w.expired
+      ? weekSegments(w.resetsAt, nowSec, window._lang)
+      : null
+    // Day separators sit on the inner boundaries; a segment under half a day
+    // (100/14 %) keeps its column but gets no label.
+    let seps = ''
+    if (week) {
+      let left = 0
+      for (const w of week.widths.slice(0, -1)) {
+        left += w
+        seps += `<div class="quota-bar-sep" style="left:${left.toFixed(2)}%"></div>`
+      }
+    }
+    const trackHtml = `<div class="quota-bar-track${week ? ' week' : ''}"><div class="quota-bar-fill ${muted ? '' : quotaLevelClass(pct)}" style="width:${pct}%"></div>${seps}</div>`
+    row.innerHTML = `
+      <div class="quota-bar-label">${escapeHtml(t(labelKey))}</div>
+      ${week ? `<div class="quota-bar-col">
+        ${trackHtml}
+        <div class="quota-bar-now" style="left:${week.nowPct.toFixed(2)}%"></div>
+        <div class="quota-bar-days${week.narrowLabels ? '' : ' no-narrow'}" style="grid-template-columns:${week.widths.map((w) => w.toFixed(3) + 'fr').join(' ')}">${week.labels.map((d, i) => week.widths[i] < 100 / 14 ? '<span></span>' : `<span><span class="day-full">${escapeHtml(d)}</span><span class="day-short">${escapeHtml(week.shortLabels[i])}</span>${week.narrowLabels ? `<span class="day-narrow">${escapeHtml(week.narrowLabels[i])}</span>` : ''}</span>`).join('')}</div>
+      </div>` : trackHtml}
+      <div class="quota-bar-value">${pct}%<span class="quota-bar-reset">${escapeHtml(tail)}</span></div>
+    `
+    bars.appendChild(row)
+  }
+
+  if (typeof q.ageSec === 'number') {
+    age.textContent = quotaMeasuredText(q.ageSec)
+  }
+  // QUOTAMOD1005: say where the numbers come from -- the statusLine block, or
+  // the observer mod on a named agent (whose session's last API answer it is).
+  if (q.source === 'mod') {
+    const agents = Array.isArray(q.sourceAgents) ? q.sourceAgents : []
+    const label = agents.length === 1
+      ? t('overview.quota.source_mod', { agent: agents[0] })
+      : t('overview.quota.source_mod_many', { n: agents.length })
+    age.textContent += (age.textContent ? ' · ' : '') + label
+  } else if (q.source === 'statusline') {
+    age.textContent += (age.textContent ? ' · ' : '') + t('overview.quota.source_statusline')
+  }
+  if (stale) {
+    // The warning names the source it is about: the status line, or the
+    // observed sessions (whose numbers are their last API answer).
+    note.textContent = q.source === 'mod'
+      ? t(typeof q.ageSec === 'number' ? 'overview.quota.stale_mod' : 'overview.quota.stale_mod_unknown')
+      : t('overview.quota.stale')
+    note.className = 'quota-strip-note warn'
+    note.hidden = false
+  }
+}
+
+// === Overview: token usage card (last 24h, per agent) ===
+// Reads the same /api/token-usage/summary the Token Monitor page uses. The
+// server only auto-collects hourly, so the overview triggers the incremental
+// collect itself (cursor-based, cheap), at most every 5 minutes, before reading.
+let _overviewTokensCollectedAt = 0
+async function loadOverviewTokens() {
+  const box = document.getElementById('overviewTokens')
+  if (!box) return
+  try {
+    if (Date.now() - _overviewTokensCollectedAt > 5 * 60_000) {
+      _overviewTokensCollectedAt = Date.now()
+      await fetch('api/token-usage/collect', { method: 'POST' }).catch(() => {})
+    }
+    const now = Math.floor(Date.now() / 1000)
+    const [res, agentsRes] = await Promise.all([
+      fetch(`api/token-usage/summary?from=${now - 86400}&to=${now}`),
+      fetch('api/agents').catch(() => null),
+    ])
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    const rows = await res.json()
+    // Rows are keyed by agent id; show the display name instead (the id stays
+    // in the tooltip). The main agent is not in /api/agents, so it goes through
+    // mainAgentDisplayName() like the Messages view. A failed /api/agents only
+    // costs the names, not the card.
+    const names = new Map()
+    try {
+      const agents = agentsRes && agentsRes.ok ? await agentsRes.json() : []
+      for (const a of Array.isArray(agents) ? agents : []) {
+        if (a && a.name) names.set(a.name, a.displayName || a.name)
+      }
+    } catch {}
+    const label = (id) => (id === mainAgentId() ? mainAgentDisplayName() : names.get(id) || id)
+    const list = (Array.isArray(rows) ? rows : []).map((r) => {
+      const read = r.totalCacheRead || 0
+      const ctxIn = (r.totalInput || 0) + read + (r.totalCacheCreation || 0)
+      return { agent: r.agent, name: label(r.agent), calls: r.totalCalls || 0, read, out: r.totalOutput || 0, ctxIn, total: ctxIn + (r.totalOutput || 0) }
+    }).filter((r) => r.total > 0).sort((a, b) => b.total - a.total)
+    if (list.length === 0) {
+      box.innerHTML = `<div class="overview-token-total">${escapeHtml(t('overview.tokens.empty'))}</div>`
+      return
+    }
+    const max = list[0].total
+    let sum = 0, sumRead = 0
+    box.innerHTML = list.map((r) => {
+      sum += r.total; sumRead += r.read
+      const pct = Math.max(2, Math.round((r.total / max) * 100))
+      const sub = t('overview.tokens.row_sub', {
+        calls: r.calls,
+        ctx: tuFormatTokens(r.calls ? Math.round(r.ctxIn / r.calls) : 0),
+        out: tuFormatTokens(r.out),
+      })
+      return `<div class="overview-token-row">
+        <div class="overview-token-name" title="${escapeHtml(r.agent)}">${escapeHtml(r.name)}</div>
+        <div class="overview-token-bar"><div class="overview-token-bar-fill" style="width:${pct}%"></div></div>
+        <div class="overview-token-value">${escapeHtml(tuFormatTokens(r.total))}</div>
+        <div class="overview-token-sub">${escapeHtml(sub)}</div>
+      </div>`
+    }).join('') + `<div class="overview-token-total">${escapeHtml(t('overview.tokens.total', {
+      total: tuFormatTokens(sum), pct: sum ? Math.round((sumRead / sum) * 100) : 0,
+    }))}</div>`
+  } catch {
+    box.innerHTML = `<div class="overview-token-total">${escapeHtml(t('overview.tokens.error'))}</div>`
+  }
+}
+{
+  const more = document.getElementById('overviewTokensMore')
+  if (more) more.addEventListener('click', (e) => { e.preventDefault(); switchPage('tokenUsage') })
+}
+
 async function loadOverview() {
   try {
     const res = await fetch('api/overview')
@@ -11616,16 +15344,20 @@ async function loadOverview() {
     const taskDiff = d.tasksToday - d.tasksYesterday
     document.getElementById('statTasksSub').textContent = taskDiff === 0 ? t('overview.stat.same_as_yesterday') : (taskDiff > 0 ? '+' + taskDiff + ' ' + t('overview.stat.change', { n: '' }).trim() : taskDiff + ' ' + t('overview.stat.change', { n: '' }).trim())
     document.getElementById('statMemories').textContent = d.memories.count.toLocaleString('hu-HU').replace(/,/g, ' ')
-    document.getElementById('statMemoriesSub').textContent = `${t('overview.stat.sub.memories')} · ${d.memories.categories} category`
+    document.getElementById('statMemoriesSub').textContent = `${t('overview.stat.sub.memories')} · ${t('overview.stat.sub.categories', { n: d.memories.categories })}`
     document.getElementById('statSkills').textContent = d.skills.count
     document.getElementById('statSkillsSub').textContent = d.skills.today > 0 ? t('overview.stat.skills_today', { n: d.skills.today }) : ''
+    renderQuotaStrip(d.quota, d.quotaFable)
+    loadOverviewTokens()
     // Team: reuse the hierarchy graph renderer so the overview card shows
     // exactly what the Csapat page does (avatars + reports-to tree).
     try {
       const tg = await fetch('api/team/graph')
       if (tg.ok) {
         const graph = await tg.json()
-        renderTeamGraph(document.getElementById('overviewTeamGrid'), graph)
+        // Seed the working border from the last poll; the 3s poll keeps it current.
+        renderTeamGraph(document.getElementById('overviewTeamGrid'), graph, { activeIds: _workingAgentIds })
+        if (agentsBusyTimer) refreshAgentTerminalBusy()
       }
     } catch {}
     // Activity
@@ -11738,7 +15470,16 @@ function renderUpdatesBadge(status) {
 // Dev machines follow develop on purpose; one dismissal silences the banner
 // for them while the Updates-page notice stays as the quiet ground truth.
 const BRANCH_DRIFT_DISMISS_PREFIX = 'marveen.branch-drift-dismissed.'
-const BRANCH_HEAL_COMMAND = 'git checkout main && bash update.sh'
+// The heal command has to work in BOTH states, and `git checkout main` works in
+// neither of them reliably here: with two remotes that both carry main (origin
+// and a fork) git cannot infer the branch to follow and exits 128, and
+// `checkout -b main --track origin/main` only works the FIRST time -- run it
+// again on an install that already has a local main and it exits 128 with
+// "a branch named 'main' already exists". Measured 2026-09-25 in an isolated
+// two-remote repo, git 2.53.0. `switch` then `switch -c` covers both, and the
+// `(A || B) && C` precedence is what keeps update.sh from running when neither
+// switch succeeded.
+const BRANCH_HEAL_COMMAND = 'git switch main || git switch -c main --track origin/main && bash update.sh'
 
 function branchDriftDismissed(branch) {
   try { return localStorage.getItem(BRANCH_DRIFT_DISMISS_PREFIX + branch) === '1' } catch { return false }
@@ -11773,6 +15514,74 @@ function wireBranchDriftBanner() {
   })
 }
 
+// === Main channel not configured (CHANNELUNCONF1110) ===
+// /api/marveen carries `mainChannelUnconfigured`: the provider whose token is missing, or null. The main session then
+// runs WITHOUT its channel (channels.sh), so nobody can message the main agent; the dashboard, the scheduled tasks and
+// the other agents keep working. One sentence plus the way to the main agent's Channel tab. Not dismissible.
+const MAIN_CHANNEL_PROVIDER_LABELS = { telegram: 'Telegram', discord: 'Discord', slack: 'Slack', teams: 'Microsoft Teams' }
+function updateMainChannelUnconfBanner(m) {
+  const banner = document.getElementById('mainChannelUnconfBanner')
+  if (!banner) return
+  const provider = m && typeof m.mainChannelUnconfigured === 'string' ? m.mainChannelUnconfigured : null
+  if (!provider) { banner.hidden = true; return }
+  const textEl = document.getElementById('mainChannelUnconfBannerText')
+  if (textEl) textEl.textContent = t('main_channel.unconfigured.banner', { provider: MAIN_CHANNEL_PROVIDER_LABELS[provider] || provider })
+  banner.hidden = false
+}
+async function refreshMainChannelUnconfBanner() {
+  try {
+    const r = await fetch('api/marveen')
+    if (!r.ok) return
+    const m = await r.json()
+    window._marveen = { ...(window._marveen || {}), ...m }
+    updateMainChannelUnconfBanner(m)
+  } catch { /* the banner keeps its last state */ }
+}
+function wireMainChannelUnconfBanner() {
+  const btn = document.getElementById('mainChannelUnconfSetup')
+  if (!btn) return
+  btn.addEventListener('click', async () => {
+    // openMarveenDetail draws from window._marveen and returns silently while it is empty, and only the Agents page
+    // fills it: on a fresh install the owner lands on the overview, so the click opened nothing (live acceptance,
+    // measured in a browser). Fetch it first.
+    await refreshMainChannelUnconfBanner()
+    if (!window._marveen) return
+    await openAgentDetail(mainAgentId())
+    switchAgentTab('channel')
+  })
+}
+
+// === Update-conflict guard (UPDATECONFLICT1105) ===
+// scripts/update-conflict-guard.sh (run by start.sh) repairs, or refuses to repair, what a conflicted auto-stash pop
+// left in a tracked file, and writes a report; /api/updates carries it as `conflictGuard`. One sentence: what
+// happened and where the backup is. Dismissal persists per browser and per guard run (`at`), so a later run re-warns.
+// textContent only: the paths are file names from the install, never markup.
+const UPDATE_CONFLICT_DISMISS_PREFIX = 'marveen.update-conflict-dismissed.'
+function updateConflictGuardUI(status) {
+  const banner = document.getElementById('updateConflictBanner')
+  if (!banner) return
+  const g = status && status.conflictGuard
+  let dismissed = false
+  try { dismissed = !!(g && localStorage.getItem(UPDATE_CONFLICT_DISMISS_PREFIX + g.at) === '1') } catch { /* storage blocked */ }
+  if (!g || !g.state || dismissed) { banner.hidden = true; return }
+  const paths = Array.isArray(g.paths) && g.paths.length ? g.paths.join(', ') : '?'
+  const stash = typeof g.stash === 'string' ? g.stash.split(':')[0] : 'git stash'
+  const textEl = document.getElementById('updateConflictBannerText')
+  if (textEl) textEl.textContent = t('update_conflict.banner.' + g.state, { paths, backup: g.backup || 'store/', stash })
+  banner.dataset.at = String(g.at)
+  banner.hidden = false
+}
+function wireUpdateConflictBanner() {
+  const dismiss = document.getElementById('updateConflictDismiss')
+  if (!dismiss) return
+  dismiss.addEventListener('click', () => {
+    const banner = document.getElementById('updateConflictBanner')
+    const at = banner && banner.dataset.at
+    try { if (at) localStorage.setItem(UPDATE_CONFLICT_DISMISS_PREFIX + at, '1') } catch { /* storage blocked */ }
+    if (banner) banner.hidden = true
+  })
+}
+
 function renderBranchNotice(status) {
   const el = document.getElementById('updatesBranchNotice')
   if (!el) return
@@ -11798,6 +15607,7 @@ async function pollUpdatesBadge() {
     window._updatesStatus = data
     renderUpdatesBadge(data)
     updateBranchDriftUI(data)
+    updateConflictGuardUI(data)
   } catch {}
 }
 
@@ -11843,13 +15653,18 @@ async function loadUpdates() {
     renderUpdatesVersion(data)
     updateBranchDriftUI(data)
     renderBranchNotice(data)
-    if (data.error) {
+    if (data.deployment === 'docker') {
+      // HOSTINGERDOCKER1107: the image owns the version (no git checkout here): say how to update instead of a failure.
+      summary.className = 'updates-summary'
+      summary.textContent = t('updates.docker_managed')
+      applyBtn.hidden = true
+    } else if (data.error) {
       summary.className = 'updates-summary error'
       summary.innerHTML = `<strong>${t('updates.check_failed')}:</strong> ${escapeHtmlUpdates(data.error)}`
       applyBtn.hidden = true
     } else if (data.behind === 0) {
       summary.className = 'updates-summary up-to-date'
-      summary.innerHTML = `<strong>${t('updates.up_to_date_html')}</strong>. ${t('updates.no_changes')}`
+      summary.innerHTML = `<strong>${tHtml('updates.up_to_date_html')}</strong>. ${t('updates.no_changes')}`
       applyBtn.hidden = true
     } else {
       summary.className = 'updates-summary behind'
@@ -11903,6 +15718,83 @@ async function loadUpdates() {
     applyBtn.hidden = true
   }
   renderDiagnoseOffer()
+  renderCliUpdateOffer()
+}
+
+// Claude Code CLI update OFFER (CLIFRISSAJANLAS923). Reads /api/updates/cli:
+// installed vs offered target (latest, or the AVX-safe pin on an AVX-less
+// host), a button that only POSTs the exact offered target, and the note that
+// running sessions keep the old binary until their next start.
+let _cliUpdatePoll = null
+async function renderCliUpdateOffer(fresh) {
+  const box = document.getElementById('updatesCli')
+  if (!box) return
+  let d
+  try { d = await (await fetch('api/updates/cli' + (fresh ? '?fresh=1' : ''))).json() } catch { box.hidden = true; return }
+  // HOSTINGERDOCKER1107: in the container the claude CLI comes with the image; nothing to install from here.
+  if (d.deployment === 'docker') { box.hidden = true; return }
+  const esc = escapeHtmlUpdates
+  const lines = []
+  lines.push(`<strong>${esc(t('updates.cli.title'))}</strong>`)
+  lines.push(`<p>${esc(t('updates.cli.installed', { v: d.installed || t('updates.cli.unmeasured') }))}`
+    + (d.avxLess
+      ? ` · ${esc(t('updates.cli.avx_target', { v: d.avxSafePin || '—' }))}`
+      : ` · ${esc(t('updates.cli.latest', { v: d.latest || (d.latestError ? t('updates.cli.unknown') : '…') }))}`)
+    + `</p>`)
+  if (d.avxLess) lines.push(`<p class="muted">${esc(t('updates.cli.avx_note'))}</p>`)
+  const job = d.job || {}
+  if (job.running) {
+    lines.push(`<p><span class="spinner"></span> ${esc(t('updates.cli.running', { v: (job.result && job.result.target) || d.target || '' }))}</p>`)
+  } else if (job.result && job.result.status === 'done' && job.result.installedAfter === d.installed) {
+    lines.push(`<p class="updates-cli-done">${esc(t('updates.cli.done', { v: job.result.installedAfter || '' }))}</p>`)
+    lines.push(`<p class="muted">${esc(t('updates.cli.sessions_note'))}</p>`)
+  } else if (job.result && job.result.status === 'failed' && !d.offer) {
+    lines.push(`<p class="updates-cli-failed">${esc(t('updates.cli.failed', { msg: job.result.message || '' }))}</p>`)
+  }
+  if (d.offer && !job.running) {
+    lines.push(`<p>${esc(t('updates.cli.offer', { v: d.target }))}</p>`)
+    lines.push(`<p class="muted">${esc(t('updates.cli.sessions_note'))}</p>`)
+    lines.push(`<button class="btn-secondary btn-compact" id="updatesCliBtn">${esc(t('updates.cli.btn', { v: d.target }))}</button>`)
+    if (d.manualCommand) lines.push(`<p class="muted">${esc(t('updates.cli.manual'))} <code>${esc(d.manualCommand)}</code></p>`)
+  } else if (!d.offer && !job.running && d.installed && (d.avxLess ? d.avxSafePin : d.latest)) {
+    if (!(job.result && job.result.status === 'done' && job.result.installedAfter === d.installed)) lines.push(`<p class="muted">${esc(t('updates.cli.up_to_date'))}</p>`)
+  }
+  box.hidden = false
+  box.className = 'updates-diagnose updates-cli'
+  box.innerHTML = lines.join('')
+  const btn = document.getElementById('updatesCliBtn')
+  if (btn) btn.addEventListener('click', () => applyCliUpdate(d.target))
+  if (job.running) {
+    if (!_cliUpdatePoll) _cliUpdatePoll = setTimeout(() => { _cliUpdatePoll = null; renderCliUpdateOffer(true) }, 5000)
+  }
+}
+
+async function applyCliUpdate(target) {
+  if (!target) return
+  const confirmed = await confirmDialog({
+    title: t('updates.cli.confirm_title'),
+    message: t('updates.cli.confirm', { v: target }),
+    okLabel: t('updates.cli.confirm_ok'),
+  })
+  if (!confirmed) return
+  const btn = document.getElementById('updatesCliBtn')
+  if (btn) btn.disabled = true
+  try {
+    const res = await fetch('api/updates/cli/apply', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ target }),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) {
+      if (btn) btn.disabled = false
+      showToast(t('updates.cli.failed', { msg: data.error || ('HTTP ' + res.status) }))
+      return
+    }
+    showToast(t('updates.cli.started', { v: target }))
+    renderCliUpdateOffer(true)
+  } catch (err) {
+    if (btn) btn.disabled = false
+    showToast(t('updates.cli.failed', { msg: err.message || err }))
+  }
 }
 
 // Post-rollback diagnosis offer (PR-D). Reads /api/updates/status: if the last
@@ -11929,7 +15821,14 @@ async function renderDiagnoseOffer() {
 }
 
 async function runDiagnose() {
-  if (!confirm(t('updates.diagnose.consent'))) return
+  // The post-rollback-diagnose task runs on the main agent: it reads the update log, fixes what it safely can, never
+  // drops local changes and never restarts the services (seed-scheduled-tasks/post-rollback-diagnose/SKILL.md).
+  const confirmed = await confirmDialog({
+    title: t('updates.diagnose.consent_title'),
+    message: t('updates.diagnose.consent'),
+    okLabel: t('updates.diagnose.consent_ok'),
+  })
+  if (!confirmed) return
   const btn = document.getElementById('updatesDiagnoseBtn')
   if (btn) btn.disabled = true
   try {
@@ -11956,7 +15855,80 @@ document.getElementById('updatesCheckBtn').addEventListener('click', async () =>
   btn.disabled = false
 })
 
-async function runUpdate(autoStash) {
+// AUTOUPDATEDIVERG1110: a diverged install (local commits AND a newer upstream) used to end in a "not started"
+// toast. Now the dialog shows the plan (GET /api/updates/rebase-plan, read-only): the local commits that would be
+// replayed and the upstream commit. The owner approves exactly that plan: its hash goes back, and the server
+// refuses when the plan changed meanwhile. Then the update runs with that approval. Every text goes in through
+// textContent (commit subjects are free text from the install).
+async function offerRebaseUpdate() {
+  let plan
+  try {
+    const r = await fetch('api/updates/rebase-plan')
+    plan = await r.json().catch(() => ({}))
+    if (!r.ok || !plan || typeof plan.hash !== 'string') {
+      showToast(t('updates.rebase.plan_error', { msg: (plan && plan.error) || ('HTTP ' + r.status) }), 12000)
+      return
+    }
+  } catch (err) {
+    showToast(t('updates.rebase.plan_error', { msg: err.message || String(err) }), 12000)
+    return
+  }
+  if (plan.willFail) {
+    showToast(plan.willFail === 'local-dependency-without-lock'
+      ? t('updates.rebase.will_fail_lock')
+      : t('updates.rebase.will_fail', { reason: plan.willFail }), 20000)
+    return
+  }
+  const content = document.createElement('div')
+  const list = document.createElement('ul')
+  list.className = 'settings-reset-confirm-keys update-rebase-commits'
+  list.dataset.testid = 'update-rebase-commits'
+  for (const c of plan.commits || []) {
+    const li = document.createElement('li')
+    const sha = document.createElement('span')
+    sha.className = 'settings-reset-confirm-key'
+    sha.textContent = String(c.sha || '').slice(0, 7)
+    const subject = document.createElement('span')
+    subject.textContent = String(c.subject || '')
+    li.append(sha, subject)
+    list.appendChild(li)
+  }
+  if ((plan.commits || []).length < plan.ahead) {
+    const li = document.createElement('li')
+    li.textContent = t('updates.rebase.more', { n: plan.ahead - plan.commits.length })
+    list.appendChild(li)
+  }
+  const target = document.createElement('p')
+  target.textContent = plan.targetSource === 'ls-remote'
+    ? t('updates.rebase.target_now', { target: String(plan.target).slice(0, 12) })
+    : t('updates.rebase.target_fetch', { target: String(plan.target).slice(0, 12), age: Math.round((plan.localRefAgeS || 0) / 60) })
+  const windowNote = document.createElement('p')
+  windowNote.textContent = t('updates.rebase.window')
+  const agentNote = document.createElement('p')
+  agentNote.textContent = t('updates.rebase.agent_path')
+  content.append(list, target, windowNote, agentNote)
+  const ok = await confirmDialog({
+    title: t('updates.rebase.title'),
+    message: t('updates.rebase.message', { n: plan.ahead }),
+    okLabel: t('updates.rebase.ok'),
+    content,
+    wide: true,
+  })
+  if (!ok) return
+  const a = await fetch('api/updates/rebase-approve', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ hash: plan.hash }),
+  })
+  const approval = await a.json().catch(() => ({}))
+  if (!a.ok || typeof approval.id !== 'string') {
+    showToast(t('updates.rebase.approve_failed', { msg: approval.error || ('HTTP ' + a.status) }), 12000)
+    return
+  }
+  await runUpdate(false, approval.id)
+}
+
+async function runUpdate(autoStash, rebaseApproval) {
   const btn = document.getElementById('updatesApplyBtn')
   btn.disabled = true
   btn.querySelector('.btn-text').hidden = true
@@ -11970,7 +15942,9 @@ async function runUpdate(autoStash) {
     const res = await fetch('api/updates/apply', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ autoStash: autoStash === true }),
+      body: JSON.stringify(typeof rebaseApproval === 'string'
+        ? { autoStash: autoStash === true, rebaseApproval }
+        : { autoStash: autoStash === true }),
     })
     // Parse the body regardless of status so preflight reasons
     // (not-on-main / dirty-tree / detached-head returned as 409 by
@@ -11980,9 +15954,20 @@ async function runUpdate(autoStash) {
       resetBtn()
       // dirty-tree without autoStash: offer the auto-stash retry inline.
       if (data.reason === 'dirty-tree' && !autoStash) {
-        if (confirm(t('updates.confirm.stash'))) {
-          await runUpdate(true)
-        }
+        // update.sh stashes, updates and pops; a path whose pop conflicts stays on the updated version and the
+        // local change is left in the stash only (ANETTUPDATESTASH1102), hence the danger dialog.
+        const stash = await confirmDialog({
+          title: t('updates.confirm.stash_title'),
+          message: t('updates.confirm.stash'),
+          okLabel: t('updates.confirm.stash_ok'),
+          danger: true,
+        })
+        if (stash) await runUpdate(true)
+        return
+      }
+      // A diverged install: not a dead end, the approval dialog opens (AUTOUPDATEDIVERG1110).
+      if (data.reason === 'local-commits' && typeof rebaseApproval !== 'string') {
+        await offerRebaseUpdate()
         return
       }
       showToast(t('updates.toast.not_started', { msg: data.error || ('HTTP ' + res.status) }))
@@ -12024,6 +16009,14 @@ async function pollUpdateOutcome(resetBtn) {
         setTimeout(() => window.location.reload(), 2000)
         return
       }
+      if (st === 'warning') {
+        // ANETTUPDATESTASH1102: the update applied, but something needs a
+        // human (stash conflict, settings.json gate). No auto-reload: it
+        // would wipe this message before anyone reads it.
+        if (resetBtn) resetBtn()
+        showToast(t('updates.toast.warning', { old: result.old || '', new: result.new || '', msg: result.message || '' }), 30000)
+        return
+      }
       if (st === 'rolled-back') {
         if (resetBtn) resetBtn()
         showToast(t('updates.toast.rolled_back', { old: result.old || '', msg: result.message || '' }))
@@ -12041,8 +16034,15 @@ async function pollUpdateOutcome(resetBtn) {
   showToast(t('updates.toast.status_timeout'))
 }
 
+// update.sh stops and starts the dashboard and the channels unit (scripts/stop.sh, start.sh), and channels.sh
+// always starts a fresh conversation; a dashboard that does not come up is rolled back to the previous version.
 document.getElementById('updatesApplyBtn').addEventListener('click', async () => {
-  if (!confirm(t('updates.confirm.apply'))) return
+  const confirmed = await confirmDialog({
+    title: t('updates.confirm.apply_title'),
+    message: t('updates.confirm.apply'),
+    okLabel: t('updates.confirm.apply_ok'),
+  })
+  if (!confirmed) return
   await runUpdate(false)
 })
 
@@ -12089,43 +16089,134 @@ function onboardingCurrentStep(s) {
 // Operator can dismiss the wizard (skip/close). A false positive must never
 // lock the dashboard, so the choice persists across reloads; normal UI still
 // covers any real setup that remains.
+// ONBOARDNOTG1108 (b): the close is remembered on the machine too (POST /api/onboarding/dismiss, the status's
+// `dismissed`). localStorage is bound to the origin, and the Bridge opens the dashboard on a new local port on every
+// connect, so a close kept only there was lost on every Bridge open. localStorage stays as the fallback for a caller the
+// server refuses (no owner session yet): that close holds on this origin, as before.
 const ONBOARDING_DISMISS_KEY = 'mvOnboardingDismissed'
+let onboardingDismissedOnServer = false
 function onboardingDismissed() {
+  if (onboardingDismissedOnServer) return true
   try { return localStorage.getItem(ONBOARDING_DISMISS_KEY) === '1' } catch { return false }
+}
+// Best effort: a refusal or a network error leaves the browser-local close in place.
+async function saveOnboardingDismissed(dismissed) {
+  try { await fetch('api/onboarding/dismiss', { method: dismissed ? 'POST' : 'DELETE' }) } catch { /* offline */ }
 }
 function dismissOnboarding() {
   try { localStorage.setItem(ONBOARDING_DISMISS_KEY, '1') } catch { /* private mode */ }
+  onboardingDismissedOnServer = true
+  saveOnboardingDismissed(true)
   const overlay = document.getElementById('onboardingOverlay')
   if (overlay) { overlay.classList.remove('active'); overlay.hidden = true }
   document.body.style.overflow = ''
+  showSetupResumeBanner()
+}
+// The owner reopens the wizard (the auth banner, the setup-resume banner): both records are cleared.
+function undismissOnboarding() {
+  try { localStorage.removeItem(ONBOARDING_DISMISS_KEY) } catch { /* storage blocked */ }
+  onboardingDismissedOnServer = false
+  saveOnboardingDismissed(false)
+}
+// DOCKERFIXES1109 (2): a closed wizard had only one way back, the auth banner, and that one shows only while no
+// dashboard login exists. Whoever closed the wizard after creating the login (measured on the Docker trial, step 4)
+// had none. This banner shows while the wizard is closed AND the server still says the setup is unfinished; its
+// close hides it for this browser session only, so it cannot become the next dead end.
+const SETUP_RESUME_HIDE_KEY = 'mvSetupResumeHidden'
+async function showSetupResumeBanner(known) {
+  const banner = document.getElementById('setupResumeBanner')
+  if (!banner) return
+  let hidden = false
+  try { hidden = sessionStorage.getItem(SETUP_RESUME_HIDE_KEY) === '1' } catch { /* storage blocked */ }
+  if (hidden || !onboardingDismissed()) { banner.hidden = true; return }
+  // DOCKERFIXES1109 follow-up (Dani's review of #2649, point 2): while the auth banner is actually SHOWN (no login yet),
+  // it is the one way back (its button opens the wizard too), so this one stays out of the way. Only while it is shown:
+  // once the owner closes it, initAuthBanner's dismiss re-runs this check and this banner comes back.
+  const auth = document.getElementById('authSetupBanner')
+  if (auth && !auth.hidden) { banner.hidden = true; return }
+  const s = known || await fetchOnboardingStatus()
+  banner.hidden = !(s && s.needsOnboarding)
+}
+function setupResumeMessage(text) {
+  const msg = document.getElementById('setupResumeMsg')
+  if (!msg) return
+  msg.textContent = text || ''
+  msg.hidden = !text
+}
+function wireSetupResumeBanner() {
+  const banner = document.getElementById('setupResumeBanner')
+  if (!banner) return
+  const go = document.getElementById('setupResumeGoBtn')
+  const close = document.getElementById('setupResumeDismiss')
+  if (close) close.addEventListener('click', () => {
+    try { sessionStorage.setItem(SETUP_RESUME_HIDE_KEY, '1') } catch { /* storage blocked */ }
+    banner.hidden = true
+  })
+  if (go) go.addEventListener('click', async () => {
+    const s = await fetchOnboardingStatus()
+    // DOCKERFIXES1109 follow-up (Dani's review of #2649, point 1): an unreadable status (offline, a 5xx) used to hide
+    // the banner and open nothing, so there was no way back until a reload. The banner now stays, with a message.
+    if (!s) { setupResumeMessage(t('onboarding.resume.status_error')); return }
+    setupResumeMessage('')
+    banner.hidden = true
+    if (!s.needsOnboarding) return
+    undismissOnboarding()
+    renderOnboarding(s, await fetchOnboardingAuth())
+  })
 }
 async function initOnboarding() {
-  if (onboardingDismissed()) return
+  wireSetupResumeBanner()
+  if (onboardingDismissed()) { await showSetupResumeBanner(); return }
   const s = await fetchOnboardingStatus()
-  if (!s || !s.needsOnboarding) return
-  renderOnboarding(s)
+  if (!s) return
+  if (s.dismissed === true) { onboardingDismissedOnServer = true; await showSetupResumeBanner(s); return }
+  if (!s.needsOnboarding) return
+  renderOnboarding(s, await fetchOnboardingAuth())
 }
 async function refreshOnboarding() {
   const s = await fetchOnboardingStatus()
-  if (s) renderOnboarding(s)
+  if (s) renderOnboarding(s, await fetchOnboardingAuth())
+}
+// ONBOARDOWNERPW1107 (owner decision, 11-07): the wizard's FIRST step is the dashboard login, so every later step runs
+// in the owner's session (the Bridge key or the token plus the owner cookie) and never stops on a "go to Settings"
+// text. owner_session is in the status only for a caller that could hold it (the shared token, a FULL device key, a
+// session); false means this window can become the owner by creating or signing in to the login. An operator key or a
+// sub-agent token gets no such field, so no sign-in step it could never complete; an unreadable status skips the step
+// too, and the server's gate decides.
+async function fetchOnboardingAuth() {
+  try {
+    const r = await fetch('api/auth/status', { cache: 'no-store' })
+    return r.ok ? await r.json() : null
+  } catch {
+    return null
+  }
+}
+function onboardingNeedsLogin(auth) {
+  return !!auth && auth.owner_session === false
+}
+// The bar's step for an onboarding step (onboardingCurrentStep, 1-4): the login is 1, the rest move one along.
+function onboardingDisplayStep(base, auth) {
+  return onboardingNeedsLogin(auth) ? 1 : base + 1
 }
 let onboardingChannelProvider = 'telegram'
 let onboardingAgentId = null
 // The step-3 tab is a static HTML label ("Telegram bot") that renderStaticI18n's generic data-i18n sweep would otherwise reset
 // to the Telegram wording on every language switch, so both call sites re-apply the provider-specific text here.
 function applyOnboardingProviderTab() {
-  const el = document.querySelector('#onboardingSteps .onboarding-step[data-ostep="3"] span:last-child')
+  const el = document.querySelector('#onboardingSteps .onboarding-step[data-ostep="4"] span:last-child')
   if (el) el.textContent = onboardingChannelProvider === 'slack' ? t('onboarding.step2.tab_slack') : t('onboarding.step2.tab')
 }
-function renderOnboarding(s) {
+function renderOnboarding(s, auth) {
   if (onboardingDismissed()) return
   const overlay = document.getElementById('onboardingOverlay')
   if (!overlay) return
   if (s.channelProvider) onboardingChannelProvider = s.channelProvider
   if (s.agentId) onboardingAgentId = s.agentId
   applyOnboardingProviderTab()
-  const step = onboardingCurrentStep(s)
-  if (step === 0) { overlay.classList.remove('active'); overlay.hidden = true; document.body.style.overflow = ''; return }
+  const base = onboardingCurrentStep(s)
+  if (base === 0) { overlay.classList.remove('active'); overlay.hidden = true; document.body.style.overflow = ''; return }
+  const loginStep = onboardingNeedsLogin(auth)
+  const step = onboardingDisplayStep(base, auth)
   overlay.hidden = false
   overlay.classList.add('active')
   document.body.style.overflow = 'hidden'
@@ -12138,20 +16229,121 @@ function renderOnboarding(s) {
   // of step 4 -- say so, or a fresh installer reads step 2's "saved" as "done"
   // and every later "bot token not found" as a failure (BK bootcamp, 07-28).
   const flowNote = document.getElementById('onbFlowNote')
-  if (flowNote) flowNote.textContent = step === 4 ? t('onboarding.flow_note_last') : t('onboarding.flow_note')
+  if (flowNote) flowNote.textContent = step === 5 ? t('onboarding.flow_note_last') : t('onboarding.flow_note')
   const body = document.getElementById('onboardingBody')
-  if (step === 1) body.innerHTML = onbIdentityHtml(s)
-  else if (step === 2) body.innerHTML = onbStep1Html(s)
-  else if (step === 3) body.innerHTML = onbStep2Html(s)
+  if (loginStep) {
+    body.innerHTML = onbLoginHtml(auth)
+    wireOnboardingLogin(auth)
+    return
+  }
+  if (base === 1) body.innerHTML = onbIdentityHtml(s)
+  else if (base === 2) body.innerHTML = onbStep1Html(s)
+  else if (base === 3) body.innerHTML = onbStep2Html(s)
   else body.innerHTML = onbStep3Html(s)
-  wireOnboarding(step)
+  wireOnboarding(base)
   // Step 3, token already on disk, managed-settings.json still missing: the status GET already knows this (no probe/write/restart triggered),
   // so show the sudo command right away instead of waiting for a Save click. Retry just re-polls status -- no token POST, no channel restart.
-  if (step === 3 && s.sudoCommand) showSudoModal(s.sudoCommand, () => refreshOnboarding())
+  if (base === 3 && s.sudoCommand) showSudoModal(s.sudoCommand, () => refreshOnboarding())
 }
 function onbMsg(text, isErr) {
   const el = document.getElementById('onbMsg')
   if (el) { el.textContent = text; el.className = 'onb-msg' + (isErr ? ' err' : ' ok') }
+}
+// ONBOARDOWNERPW1107: the login step, three forms. (a) no login yet: create it, then sign in with it at once;
+// (b) a login exists but this window holds no owner session: sign in; (c) only disabled logins: neither works over HTTP,
+// the machine-local CLI is the way. Own ids (onbLogin*): the Settings auth card has its own create form.
+function onbLoginHtml(auth) {
+  if (auth && auth.setup_required) {
+    return `<p>${escapeHtml(t('onboarding.login.create_desc'))}</p>`
+      + `<label class="form-label-sm">${escapeHtml(t('auth.login.username'))}</label>`
+      + `<input id="onbLoginUser" type="text" class="onb-input" maxlength="64" autocomplete="username" autocapitalize="off" spellcheck="false">`
+      + `<label class="form-label-sm">${escapeHtml(t('auth.card.new_password'))}</label>`
+      + `<input id="onbLoginPass" type="password" class="onb-input" autocomplete="new-password">`
+      + `<label class="form-label-sm">${escapeHtml(t('auth.card.repeat_password'))}</label>`
+      + `<input id="onbLoginPass2" type="password" class="onb-input" autocomplete="new-password">`
+      + `<button class="btn-primary btn-compact" id="onbLoginCreateBtn">${escapeHtml(t('onboarding.login.create_btn'))}</button>`
+      + `<div id="onbMsg" class="onb-msg"></div>`
+  }
+  if (auth && auth.login_available) {
+    return `<p>${escapeHtml(t('onboarding.login.signin_desc'))}</p>`
+      + `<label class="form-label-sm">${escapeHtml(t('auth.login.username'))}</label>`
+      + `<input id="onbLoginUser" type="text" class="onb-input" maxlength="64" autocomplete="username" autocapitalize="off" spellcheck="false">`
+      + `<label class="form-label-sm">${escapeHtml(t('auth.login.password'))}</label>`
+      + `<input id="onbLoginPass" type="password" class="onb-input" autocomplete="current-password">`
+      + `<button class="btn-primary btn-compact" id="onbLoginSignInBtn">${escapeHtml(t('auth.login.submit'))}</button>`
+      + `<div id="onbMsg" class="onb-msg"></div>`
+  }
+  return `<p>${escapeHtml(t('onboarding.login.disabled_only'))}</p><div id="onbMsg" class="onb-msg"></div>`
+}
+// The sign-in after a create, or on its own. On success the page reloads, like the login overlay: the cookie and the
+// stored token or key stay, and the wizard comes back on its next step with the whole page in the owner's session.
+async function onbSignIn(username, password) {
+  const r = await window.mvPasswordLogin(username, password)
+  if (r.ok) { window.location.reload(); return true }
+  if (r.status === 429) onbMsg(t('auth.login.err_throttled') + (r.retryAfter ? ` (${r.retryAfter}s)` : ''), true)
+  else if (r.status === 401) onbMsg(t('auth.login.err_invalid'), true)
+  else onbMsg(t('auth.login.err_network'), true)
+  return false
+}
+function wireOnboardingLogin(auth) {
+  const field = (id) => document.getElementById(id)
+  const clearPasswords = () => { for (const id of ['onbLoginPass', 'onbLoginPass2']) { const el = field(id); if (el) el.value = '' } }
+  const createBtn = field('onbLoginCreateBtn')
+  if (createBtn) createBtn.addEventListener('click', async () => {
+    const username = (field('onbLoginUser').value || '').trim()
+    const p1 = field('onbLoginPass').value || ''
+    const p2 = field('onbLoginPass2').value || ''
+    if (!username || !p1) { onbMsg(t('auth.login.err_empty'), true); return }
+    if (p1 !== p2) { onbMsg(t('auth.card.err_mismatch'), true); return }
+    createBtn.disabled = true; onbMsg(t('onboarding.saving'))
+    try {
+      const r = await fetch('api/auth/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password: p1 }) })
+      const d = await r.json().catch(() => ({}))
+      if (r.ok) {
+        const signedIn = await onbSignIn(username, p1)
+        clearPasswords()
+        if (!signedIn) {
+          // The login exists, this window is not signed in: the step turns into the sign-in form.
+          await refreshOnboarding()
+          onbMsg(t('onboarding.login.created_signin'), true)
+        }
+        return
+      }
+      clearPasswords()
+      if (r.status === 403 || r.status === 409) {
+        // Another window created the login meanwhile (the server creates only one): sign in with it instead.
+        await refreshOnboarding()
+        onbMsg(t('onboarding.login.taken_signin'), true)
+        return
+      }
+      createBtn.disabled = false
+      onbMsg(d.error || t('auth.card.err_generic'), true)
+    } catch {
+      clearPasswords()
+      createBtn.disabled = false
+      onbMsg(t('auth.login.err_network'), true)
+    }
+  })
+  const signInBtn = field('onbLoginSignInBtn')
+  if (signInBtn) signInBtn.addEventListener('click', async () => {
+    const username = (field('onbLoginUser').value || '').trim()
+    const password = field('onbLoginPass').value || ''
+    if (!username || !password) { onbMsg(t('auth.login.err_empty'), true); return }
+    signInBtn.disabled = true
+    const ok = await onbSignIn(username, password)
+    clearPasswords()
+    if (!ok) signInBtn.disabled = false
+  })
+}
+// ONBOARDOWNERPW1107: an owner refusal inside the wizard. When this window can become the owner, the wizard goes back
+// to its login step (true). Otherwise (an operator key, a sub-agent token, an unreadable status, or a session the gate
+// still refused) the caller shows the server's own reason, and nothing jumps to Settings: ownerSessionText would open
+// the Settings page and hide the wizard, the very stop the owner ruled out.
+async function onbOwnerRefused(d) {
+  if (!d || d.code !== 'owner_session_required') return false
+  if (!onboardingNeedsLogin(await fetchOnboardingAuth())) return false
+  await refreshOnboarding()
+  return true
 }
 function onbIdentityHtml(s) {
   return `<p>${escapeHtml(t('onboarding.identity.desc'))}</p>`
@@ -12208,7 +16400,9 @@ function onbStep3Html(s) {
     : `<p class="onb-hint">${escapeHtml(t('onboarding.step3.svc_starting'))}</p>`
   return `<p>${escapeHtml(t('onboarding.step3.desc'))}</p>`
     + svcLine
-    + `<ol class="onb-list"><li>${escapeHtml(t('onboarding.step3.li1'))}</li><li>${escapeHtml(t('onboarding.step3.li2'))}</li></ol>`
+    + (onboardingChannelProvider === 'teams'
+      ? `<ol class="onb-list"><li>${escapeHtml(t('onboarding.step3.li1_teams'))}</li><li>${escapeHtml(t('onboarding.step3.li2_teams'))}</li></ol>`
+      : `<ol class="onb-list"><li>${escapeHtml(t('onboarding.step3.li1'))}</li><li>${escapeHtml(t('onboarding.step3.li2'))}</li></ol>`)
     + `<div id="onbPending" class="onb-pending"></div>`
     + `<button class="btn-secondary btn-compact" id="onbRefreshBtn">${escapeHtml(t('onboarding.step3.refresh_btn'))}</button>`
     + `<div id="onbMsg" class="onb-msg"></div>`
@@ -12224,13 +16418,14 @@ function wireOnboarding(step) {
       try {
         const res = await fetch('api/onboarding/identity', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ agentName, ownerName }) })
         const d = await res.json().catch(() => ({}))
-        if (!res.ok) { idBtn.disabled = false; onbMsg(d.error || t('onboarding.error'), true); return }
+        // ONBOARDOWNERPW1107: an owner refusal takes the wizard back to its login step (onbOwnerRefused); otherwise the reason.
+        if (!res.ok) { idBtn.disabled = false; if (await onbOwnerRefused(d)) return; onbMsg(d.error || t('onboarding.error'), true); return }
         // The name is live in the .env now -- repaint the chrome from
         // /api/marveen so the sidebar/title reflect it immediately, and
         // surface the automatic channels restart (same pattern as the
         // claude-auth step) instead of silently advancing.
         if (typeof initSidebarBrand === 'function') initSidebarBrand()
-        if (d.restartError) { idBtn.disabled = false; onbMsg(t('onboarding.identity.saved_restart_failed'), true); setTimeout(refreshOnboarding, 6000); return }
+        if (d.restartError) { idBtn.disabled = false; onbMsg(t('onboarding.identity.saved_restart_failed', { cmd: d.restartCommand || '' }), true); setTimeout(refreshOnboarding, 6000); return }
         if (d.restarted) { onbMsg(t('onboarding.identity.saved_restarted')); setTimeout(refreshOnboarding, 2500); return }
         if (d.restartNeeded) { onbMsg(t('onboarding.identity.saved_restart_needed')); await refreshOnboarding(); return }
         onbMsg(t('onboarding.identity.saved'))
@@ -12248,12 +16443,12 @@ function wireOnboarding(step) {
       try {
         const res = await fetch('api/onboarding/claude-auth', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }) })
         const d = await res.json().catch(() => ({}))
-        if (!res.ok) { authBtn.disabled = false; onbMsg(d.error || t('onboarding.error'), true); return }
+        if (!res.ok) { authBtn.disabled = false; if (await onbOwnerRefused(d)) return; onbMsg(d.code === 'owner_session_required' ? t('onboarding.step1.owner_login_required') : (d.error || t('onboarding.error')), true); return }
         // Fresh-install path: the server restarts the (previously
         // unauthenticated) channels session right after the first auth save --
         // surface that, and on failure show the manual restart step instead of
         // silently advancing.
-        if (d.restartError) { authBtn.disabled = false; onbMsg(t('onboarding.step1.saved_restart_failed'), true); setTimeout(refreshOnboarding, 6000); return }
+        if (d.restartError) { authBtn.disabled = false; onbMsg(t('onboarding.step1.saved_restart_failed', { cmd: d.restartCommand || '' }), true); setTimeout(refreshOnboarding, 6000); return }
         if (d.restarted) { onbMsg(t('onboarding.step1.saved_restarted')); setTimeout(refreshOnboarding, 2500); return }
         onbMsg(d.verified ? t('onboarding.step1.saved_verified') : t('onboarding.step1.saved_unverified'))
         await refreshOnboarding()
@@ -12308,7 +16503,8 @@ function wireOnboarding(step) {
           showSudoModal(d.sudoCommand, () => botBtn.click())
           return
         }
-        if (!res.ok) { botBtn.disabled = false; onbMsg(d.error || t('onboarding.error'), true); return }
+        // ONBOARDOWNERPW1107: an owner refusal takes the wizard back to its login step (onbOwnerRefused); otherwise the reason.
+        if (!res.ok) { botBtn.disabled = false; if (await onbOwnerRefused(d)) return; onbMsg(d.error || t('onboarding.error'), true); return }
         // The server restarts the channels session so the new bot token goes
         // live. Do NOT advance on a timer: the restart response is a dispatch
         // receipt, and the cold start is ~minutes. Wait for the MEASURED
@@ -12316,6 +16512,8 @@ function wireOnboarding(step) {
         // and on timeout stay on this step with an honest "still starting"
         // message -- the old fixed 4s opened the pairing step against a
         // booting session, which looked done-and-empty (WIZFLOW809).
+        // #1878 (6): a failed restart is said at once, not after the ~2 min wait below.
+        if (d.restartError) { botBtn.disabled = false; onbMsg(t('onboarding.step2.saved_restart_failed', { cmd: d.restartCommand || '' }), true); return }
         onbMsg(d.restarted ? t('onboarding.step2.saved_restarted') : t('onboarding.step2.saved'))
         onbMsg(t('onboarding.step2.waiting_channel'))
         const outcome = await waitForChannelLive(fetchOnboardingStatus, 3000, 40)  // ~2 min bound
@@ -12376,7 +16574,8 @@ function wireOnboarding(step) {
           try {
             const res = await fetch(`api/agents/${encodeURIComponent(onboardingAgentId || mainAgentId())}/channels/${onboardingChannelProvider}/approve`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: b.dataset.code }) })
             const d = await res.json().catch(() => ({}))
-            if (!res.ok) { b.disabled = false; onbMsg(d.error || t('onboarding.error'), true); return }
+            // ONBOARDOWNERPW1107: an owner refusal takes the wizard back to its login step (onbOwnerRefused); otherwise the reason.
+            if (!res.ok) { b.disabled = false; if (await onbOwnerRefused(d)) return; onbMsg(d.error || t('onboarding.error'), true); return }
             onbMsg(t('onboarding.step3.approved'))
             setTimeout(refreshOnboarding, 1500)
           } catch (e) { b.disabled = false; onbMsg((e && e.message) || t('onboarding.error'), true) }
@@ -12397,6 +16596,10 @@ function wireOnboarding(step) {
 populateAvatarGrid()
 loadMemAgents()
 loadOverview()
+// The overview is the landing page without going through switchPage(), so its
+// live team-graph border needs the busy poll started here too. A tab opened in
+// the background starts it on its first visibilitychange instead.
+if (!document.hidden && !document.getElementById('overviewPage').hidden) startAgentsBusyPoll()
 loadAvailableModels()
 loadOllamaModels()
 {
@@ -12701,9 +16904,9 @@ function renderRecallTimeline(el, data) {
 
 function esc(s) {
   if (!s) return ''
-  const d = document.createElement('div')
-  d.textContent = String(s)
-  return d.innerHTML
+  // Quote-safe like escapeHtml: esc() output also lands in attributes
+  // (data-cat, style), where a bare " would break out of the attribute.
+  return escapeHtml(String(s))
 }
 
 // ============================================================
@@ -12790,26 +16993,26 @@ async function loadBgTasks() {
       return
     }
 
-    list.innerHTML = tasks.map(t => {
+    list.innerHTML = tasks.map(task => {
       const statusColors = { running: '#f59e0b', done: '#22c55e', failed: '#ef4444', timeout: '#6b7280' }
       const statusLabels = { running: () => t('bgTasks.status.running'), done: () => t('bgTasks.status.done'), failed: () => t('bgTasks.status.failed'), timeout: () => t('bgTasks.status.timeout') }
-      const color = statusColors[t.status] || '#6b7280'
-      const labelRaw = statusLabels[t.status]; const label = labelRaw ? (typeof labelRaw === 'function' ? labelRaw() : labelRaw) : t.status
-      const output = t.output ? `<pre style="margin-top:8px;padding:8px;background:var(--bg);border-radius:6px;font-size:12px;max-height:200px;overflow:auto;white-space:pre-wrap;">${esc(t.output.slice(-2000))}</pre>` : ''
+      const color = statusColors[task.status] || '#6b7280'
+      const labelRaw = statusLabels[task.status]; const label = labelRaw ? (typeof labelRaw === 'function' ? labelRaw() : labelRaw) : task.status
+      const output = task.output ? `<pre style="margin-top:8px;padding:8px;background:var(--bg);border-radius:6px;font-size:12px;max-height:200px;overflow:auto;white-space:pre-wrap;">${esc(task.output.slice(-2000))}</pre>` : ''
       return `<div style="margin-bottom:12px;padding:12px 16px;border-radius:8px;background:var(--surface);border:1px solid var(--border);border-left:3px solid ${color};">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
           <div style="display:flex;gap:8px;align-items:center;">
-            <span style="font-weight:600;font-size:13px;">${esc(t.id)}</span>
-            <span class="badge" style="font-size:11px;background:${color};color:#fff;padding:2px 8px;border-radius:12px;">${label}</span>
-            <span class="badge" style="font-size:11px;background:var(--primary);color:#fff;padding:2px 8px;border-radius:12px;">${esc(t.agent_id)}</span>
+            <span style="font-weight:600;font-size:13px;">${esc(task.id)}</span>
+            <span class="badge" style="font-size:11px;background:${color};color:#fff;padding:2px 8px;border-radius:12px;">${escapeHtml(label)}</span>
+            <span class="badge" style="font-size:11px;background:var(--primary);color:#fff;padding:2px 8px;border-radius:12px;">${esc(task.agent_id)}</span>
           </div>
           <div style="display:flex;gap:8px;align-items:center;">
-            <span style="font-size:12px;color:var(--text-muted)">${esc(t.started_label)}</span>
-            ${t.status === 'running' ? `<button class="btn btn-sm" onclick="viewBgTask('${esc(t.id)}')" style="font-size:11px;padding:2px 8px;">${t('bgTasks.output_btn')}</button><button class="btn btn-sm" onclick="cancelBgTask('${esc(t.id)}')" style="font-size:11px;padding:2px 8px;color:var(--danger)">${t('bgTasks.stop_btn')}</button>` : ''}
+            <span style="font-size:12px;color:var(--text-muted)">${esc(task.started_label)}</span>
+            ${task.status === 'running' ? `<button class="btn btn-sm" onclick="viewBgTask(${jsArg(task.id)})" style="font-size:11px;padding:2px 8px;">${t('bgTasks.output_btn')}</button><button class="btn btn-sm" onclick="cancelBgTask(${jsArg(task.id)}, ${jsArg(task.agent_id)})" style="font-size:11px;padding:2px 8px;color:var(--danger)">${t('bgTasks.stop_btn')}</button>` : ''}
           </div>
         </div>
-        <div style="font-size:13px;color:var(--text-primary);margin-bottom:4px;">${esc(t.prompt)}</div>
-        ${t.finished_label ? `<div style="font-size:12px;color:var(--text-muted);">${t('bgTasks.finished_label')} ${esc(t.finished_label)}</div>` : ''}
+        <div style="font-size:13px;color:var(--text-primary);margin-bottom:4px;">${esc(task.prompt)}</div>
+        ${task.finished_label ? `<div style="font-size:12px;color:var(--text-muted);">${t('bgTasks.finished_label')} ${esc(task.finished_label)}</div>` : ''}
         ${output}
       </div>`
     }).join('')
@@ -12837,14 +17040,21 @@ async function viewBgTask(id) {
     modal.addEventListener('click', e => { if (e.target === modal) modal.remove() })
     document.getElementById('bgModalClose').addEventListener('click', () => modal.remove())
   } catch {
-    showToast('Hiba')
+    showToast(t('bgTasks.load_error'))
   }
 }
 
-async function cancelBgTask(id) {
-  if (!confirm(t('bgTasks.cancel.confirm'))) return
+async function cancelBgTask(id, agent) {
+  // The server kills the task's tmux session; the output so far is kept on the task.
+  const confirmed = await confirmDialog({
+    title: t('bgTasks.cancel.title'),
+    message: agent ? t('bgTasks.cancel.confirm', { id, agent }) : t('bgTasks.cancel.confirm_no_agent', { id }),
+    okLabel: t('bgTasks.cancel.ok'),
+    danger: true,
+  })
+  if (!confirmed) return
   try {
-    const res = await fetch(`api/background-tasks/${id}`, { method: 'DELETE' })
+    const res = await fetch(`api/background-tasks/${encodeURIComponent(id)}`, { method: 'DELETE' })
     if (res.ok) {
       showToast(t('bgTasks.toast.stopped'))
       loadBgTasks()
@@ -12852,7 +17062,7 @@ async function cancelBgTask(id) {
       showToast(t('bgTasks.toast.stop_error'))
     }
   } catch {
-    showToast('Hiba')
+    showToast(t('bgTasks.toast.stop_error'))
   }
 }
 
@@ -12933,7 +17143,7 @@ async function setAutonomyLevel(key, level) {
     })
     if (!res.ok) {
       const data = await res.json().catch(() => ({}))
-      showToast(data.error || 'Hiba')
+      showToast(data.error || t('common.error_save'))
       return
     }
     // Refresh the settings tab autonomy grid if it is visible
@@ -13061,7 +17271,11 @@ function _renderApprovalsTable() {
            <button class="btn-danger btn-compact approvals-decide" data-id="${escapeAttr(a.id)}" data-decision="rejected" style="font-size:11px">${t('approvals.btn.reject')}</button>
          </div>`
       : (() => {
-          const resolvedBy = escapeHtml(a.resolved_by || '')
+          // APPROVALSLACK1030 B: a decision taken in Slack gets a readable label; the raw value stays beside it.
+          const rawBy = a.resolved_by || ''
+          const byLabel = rawBy.startsWith('slack_reply:') ? t('approvals.by.slack_reply')
+            : rawBy.startsWith('slack_reaction:') ? t('approvals.by.slack_reaction') : ''
+          const resolvedBy = byLabel ? `${escapeHtml(byLabel)} <span style="opacity:0.7">(${escapeHtml(rawBy)})</span>` : escapeHtml(rawBy)
           if (!a.resolved_at) return `<span style="font-size:12px;color:var(--text-muted)">${resolvedBy}</span>`
           const resolvedDate = new Date(a.resolved_at * 1000)
           const requestedDate = a.requested_at ? new Date(a.requested_at * 1000) : null
@@ -13091,7 +17305,7 @@ function _renderApprovalsTable() {
 function _approvalBadge(status) {
   const colors = { pending: 'var(--warning)', approved: 'var(--success)', rejected: 'var(--danger)', timeout: 'var(--text-muted)' }
   const color = colors[status] || 'var(--text-muted)'
-  return `<span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;background:color-mix(in srgb,${color} 15%,transparent);color:${color}">${t('approvals.status.' + status) || status}</span>`
+  return `<span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;background:color-mix(in srgb,${color} 15%,transparent);color:${color}">${escapeHtml(t('approvals.status.' + status) || status)}</span>`
 }
 
 function _updateCountdowns() {
@@ -13141,7 +17355,7 @@ async function _resolveApproval(id, decision) {
       body: JSON.stringify({ status: decision, resolved_by: 'dashboard' }),
     })
     const data = await res.json()
-    if (!res.ok) { showToast(t('approvals.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+    if (!res.ok) { showToast(t('approvals.toast.error', { msg: refusalReason(res, data) })); return }
     showToast(t(decision === 'approved' ? 'approvals.toast.approved' : 'approvals.toast.rejected'))
     // Update in-place to avoid full reload flicker
     const idx = _approvalsAll.findIndex(a => a.id === id)
@@ -13167,7 +17381,7 @@ window.addEventListener('beforeunload', (e) => {
 // entry never requires a frontend change just to render a sane heading.
 function settingsModuleLabel(mod) {
   const key = `settings.module.${mod}`
-  const known = { kanban: true, system: true, heartbeat: true, audit: true, ideabox: true, channels: true, security: true, autonomy: true }
+  const known = { kanban: true, system: true, heartbeat: true, audit: true, ideabox: true, channels: true, security: true, autonomy: true, 'claude-plans': true }
   return known[mod] ? t(key) : (mod.charAt(0).toUpperCase() + mod.slice(1))
 }
 
@@ -13222,15 +17436,20 @@ async function renderAuthCard() {
   const body = document.getElementById('authCardBody')
   if (!body) return
   const status = await fetchAuthStatus()
+  // ONBOARDFOLLOW1107: the card may have left the page while the status was on its way; a newer render owns it then.
+  if (!body.isConnected) return
   if (!status) { body.innerHTML = `<p class="auth-muted">${t('auth.card.unavailable')}</p>`; return }
   if (status.setup_required) { renderCreateLoginForm(body) }
   else if (status.method === 'session') { renderSessionPanel(body, status) }
-  else renderTokenModePanel(body)
+  else renderTokenModePanel(body, status)
   // Device keys are managed by token/session operators only (a device key
   // itself gets 403 from the management endpoints, so don't render the panel).
-  if (status.method === 'token' || status.method === 'session') {
+  // Once a login exists, issuing keys and pairing take the owner's session
+  // (DEVKEYMINT1022), so a token-mode browser gets the sign-in button above instead.
+  if (status.method === 'session' || (status.method === 'token' && status.setup_required)) {
     renderDeviceKeysSection(body)
     renderBridgeEnrollSection(body)
+    renderOperatorAccessSection(body)
   }
 }
 
@@ -13262,6 +17481,21 @@ function renderBridgeEnrollSection(body) {
   document.getElementById('authBridgeEnrollBtn').addEventListener('click', bridgeEnrollFromUi)
 }
 
+// The pairing endpoint answers with a stable `code` beside its English
+// `error` sentence. Translate on the code, never on the sentence: the wording
+// is free to change, the code is the contract. An unknown code falls back to
+// the server's own sentence rather than to a blank line or a raw key, so a
+// server error added later degrades to English instead of disappearing.
+function bridgeEnrollErrorText(data) {
+  const code = data && typeof data.code === 'string' ? data.code : ''
+  if (code) {
+    const key = `auth.bridge.err.${code}`
+    const translated = t(key, (data && data.params) || {})
+    if (translated !== key) return translated
+  }
+  return (data && data.error) || t('auth.card.err_generic')
+}
+
 async function bridgeEnrollFromUi() {
   const msg = document.getElementById('authBridgeMsg')
   const out = document.getElementById('authBridgeBundle')
@@ -13272,8 +17506,14 @@ async function bridgeEnrollFromUi() {
   msg.textContent = ''
   out.hidden = true
   if (!keyLine || !name) { msg.classList.add('err'); msg.textContent = t('auth.bridge.err_empty'); return }
-  // The confirm step: pairing grants the device SSH-tunnel + dashboard access.
-  if (!confirm(t('auth.bridge.confirm', { name }))) return
+  // The confirm step: pairing writes a restricted authorized_keys line (a tunnel to the dashboard port only) and mints
+  // a device key; a Bridge paired before (the same install id) loses its old key (mintBridgeDeviceKey).
+  const confirmed = await confirmDialog({
+    title: t('auth.bridge.confirm_title'),
+    message: t('auth.bridge.confirm', { name }),
+    okLabel: t('auth.bridge.confirm_ok'),
+  })
+  if (!confirmed) return
   msg.textContent = t('auth.bridge.working')
   try {
     const r = await fetch('api/security/bridge-enroll', {
@@ -13281,7 +17521,7 @@ async function bridgeEnrollFromUi() {
       body: JSON.stringify(hostOverride ? { key_line: keyLine, name, host: hostOverride } : { key_line: keyLine, name }),
     })
     const data = await r.json().catch(() => ({}))
-    if (!r.ok) { msg.classList.add('err'); msg.textContent = data.error || t('auth.card.err_generic'); return }
+    if (!r.ok) { msg.classList.add('err'); msg.textContent = bridgeEnrollErrorText(data); return }
     msg.classList.add('ok')
     msg.textContent = (data.action === 'replaced' ? t('auth.bridge.repaired') : t('auth.bridge.paired')) +
       (data.warnings && data.warnings.length ? ` (${data.warnings.join('; ')})` : '')
@@ -13343,6 +17583,7 @@ async function refreshDeviceKeyList() {
       const lastUsed = k.lastUsedAt ? new Date(k.lastUsedAt * 1000).toLocaleString() : t('auth.devices.never_used')
       const expires = k.expiresAt ? ` &middot; ${t('auth.devices.expires', { date: new Date(k.expiresAt * 1000).toLocaleDateString() })}` : ''
       const bridge = k.installId ? ` <span class="auth-device-bridge-badge">${t('auth.devices.bridge_badge')}</span>` : ''
+        + (k.scope === 'operator' ? ` <span class="auth-device-bridge-badge">${t('auth.operator.badge')}</span>` : '')
       return `<div class="auth-session-row auth-device-row" data-key-id="${k.id}">` +
         `<span class="auth-device-name">${escapeHtml(k.name)}${bridge}</span>` +
         `<span class="auth-device-meta">${created} &middot; ${t('auth.devices.last_used', { date: lastUsed })}${expires}</span>` +
@@ -13351,7 +17592,17 @@ async function refreshDeviceKeyList() {
     }).join('')
     el.querySelectorAll('.auth-device-revoke').forEach((btn) => {
       btn.addEventListener('click', async () => {
-        if (!confirm(t('auth.devices.revoke_confirm'))) return
+        // Name the device; a Bridge-paired one loses its SSH tunnel line too (the server removes both halves).
+        const key = keys.find((x) => String(x.id) === btn.dataset.keyId)
+        let message = t('auth.devices.revoke_confirm', { name: (key && key.name) || btn.dataset.keyId })
+        if (key && key.installId) message += ' ' + t('auth.devices.revoke_confirm_bridge')
+        const confirmed = await confirmDialog({
+          title: t('auth.devices.revoke_confirm_title'),
+          message,
+          okLabel: t('auth.devices.revoke_confirm_ok'),
+          danger: true,
+        })
+        if (!confirmed) return
         // A Bridge-paired revoke means BOTH halves (dashboard key + ssh line).
         // The key is dead either way, but ssh_removed:false means the
         // authorized_keys line survived (fs error) and the device can still
@@ -13406,6 +17657,124 @@ async function mintDeviceKey() {
         await navigator.clipboard.writeText(data.key)
         document.getElementById('authDevCopyBtn').textContent = t('auth.devices.copied')
       } catch { document.getElementById('authDevMintedKey').select() }
+    })
+    refreshDeviceKeyList()
+  } catch { msg.classList.add('err'); msg.textContent = t('auth.login.err_network') }
+}
+
+// === IT operator access (DASHOPERATOR1005) ===
+// The owner decides what an IT operator may do: one switch per capability,
+// all OFF by default, and the whole surface OFF until "enabled". An operator
+// key reaches /operator and /api/operator/* only (the server enforces it), and
+// it always expires.
+
+const OPERATOR_CAPS = ['agentControl', 'mainAgentRestart', 'update', 'vaultWrite', 'vaultOverwrite', 'paneView', 'commands']
+const OPERATOR_CMDS = ['login', 'mcp']
+
+function renderOperatorAccessSection(body) {
+  const wrap = document.createElement('div')
+  wrap.className = 'auth-device-keys'
+  wrap.id = 'authOperatorAccess'
+  wrap.innerHTML =
+    `<div class="auth-sessions-title">${t('auth.operator.title')}</div>` +
+    `<p class="auth-muted">${t('auth.operator.desc')}</p>` +
+    `<label class="auth-operator-switch"><input type="checkbox" id="opAccEnabled"> <strong>${t('auth.operator.enabled')}</strong></label>` +
+    `<div id="opAccCaps">` +
+      OPERATOR_CAPS.map((c) => `<label class="auth-operator-switch"><input type="checkbox" data-op-cap="${escapeHtml(c)}"> ${escapeHtml(t('auth.operator.cap.' + c))}</label>`).join('') +
+      `<div class="auth-muted" style="margin-left:1.5em">` +
+        OPERATOR_CMDS.map((c) => `<label class="auth-operator-switch"><input type="checkbox" data-op-cmd="${escapeHtml(c)}"> /${escapeHtml(c)}</label>`).join(' ') +
+      `</div>` +
+    `</div>` +
+    `<div class="auth-form-msg" id="opAccMsg"></div>` +
+    `<div class="auth-form auth-device-mint">` +
+      `<input id="opKeyName" type="text" autocapitalize="off" spellcheck="false" maxlength="64" placeholder="${t('auth.operator.name_placeholder')}">` +
+      `<input id="opKeyExpiry" type="number" min="1" max="365" placeholder="${t('auth.operator.expiry_placeholder')}">` +
+      `<button class="btn-secondary" id="opKeyMintBtn">${t('auth.operator.mint')}</button>` +
+      `<div class="auth-form-msg" id="opKeyMsg"></div>` +
+      `<div id="opKeyMinted" hidden></div>` +
+    `</div>`
+  body.appendChild(wrap)
+  wrap.querySelectorAll('input[type=checkbox]').forEach((cb) => cb.addEventListener('change', saveOperatorAccess))
+  document.getElementById('opKeyMintBtn').addEventListener('click', mintOperatorKey)
+  loadOperatorAccess()
+}
+
+function applyOperatorAccess(a) {
+  document.getElementById('opAccEnabled').checked = !!a.enabled
+  for (const c of OPERATOR_CAPS) document.querySelector(`[data-op-cap="${CSS.escape(String(c))}"]`).checked = !!(a.capabilities && a.capabilities[c])
+  for (const c of OPERATOR_CMDS) document.querySelector(`[data-op-cmd="${CSS.escape(String(c))}"]`).checked = (a.commands || []).includes(c)
+  document.getElementById('opAccCaps').style.opacity = a.enabled ? '1' : '0.5'
+}
+
+async function loadOperatorAccess() {
+  try {
+    const r = await fetch('api/operator-access')
+    if (r.ok) applyOperatorAccess(await r.json())
+  } catch { /* the section stays at its unchecked defaults */ }
+}
+
+async function saveOperatorAccess(ev) {
+  const msg = document.getElementById('opAccMsg')
+  msg.className = 'auth-form-msg'
+  // Turning on the pane view shows the operator the conversation itself: ask first.
+  if (ev && ev.target && ev.target.dataset.opCap === 'paneView' && ev.target.checked) {
+    // The box stays unticked while the dialog is open: a save from another switch
+    // behind the dialog reads the boxes, and must not carry paneView=true unconfirmed.
+    const box = ev.target
+    box.checked = false
+    const confirmed = await confirmDialog({
+      title: t('auth.operator.pane_warning_title'),
+      message: t('auth.operator.pane_warning', { cmds: OPERATOR_CMDS.map((c) => '/' + c).join(', ') }),
+      okLabel: t('auth.operator.pane_warning_ok'),
+    })
+    if (!confirmed) return
+    box.checked = true
+  }
+  const next = {
+    enabled: document.getElementById('opAccEnabled').checked,
+    capabilities: Object.fromEntries(OPERATOR_CAPS.map((c) => [c, document.querySelector(`[data-op-cap="${CSS.escape(String(c))}"]`).checked])),
+    commands: OPERATOR_CMDS.filter((c) => document.querySelector(`[data-op-cmd="${CSS.escape(String(c))}"]`).checked),
+  }
+  try {
+    const r = await fetch('api/operator-access', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(next) })
+    if (!r.ok) throw new Error(String(r.status))
+    applyOperatorAccess(await r.json())
+    msg.classList.add('ok'); msg.textContent = t('auth.operator.saved')
+  } catch {
+    msg.classList.add('err'); msg.textContent = t('auth.card.err_generic')
+    loadOperatorAccess()
+  }
+}
+
+async function mintOperatorKey() {
+  const msg = document.getElementById('opKeyMsg')
+  const minted = document.getElementById('opKeyMinted')
+  const name = (document.getElementById('opKeyName').value || '').trim()
+  const expiryRaw = document.getElementById('opKeyExpiry').value
+  msg.className = 'auth-form-msg'
+  minted.hidden = true
+  if (!name) { msg.classList.add('err'); msg.textContent = t('auth.devices.err_name'); return }
+  const payload = { name, scope: 'operator' }
+  if (expiryRaw) payload.expires_in_days = Number(expiryRaw)
+  try {
+    const r = await fetch('api/auth/device-keys', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+    const data = await r.json().catch(() => ({}))
+    if (!r.ok) { msg.classList.add('err'); msg.textContent = data.error || t('auth.card.err_generic'); return }
+    document.getElementById('opKeyName').value = ''
+    document.getElementById('opKeyExpiry').value = ''
+    const url = `${location.origin}/operator`
+    minted.hidden = false
+    minted.innerHTML =
+      `<p class="auth-muted">${t('auth.operator.minted_hint', { date: new Date(data.expires_at * 1000).toLocaleDateString(), url: escapeHtml(url) })}</p>` +
+      `<div class="auth-form auth-device-minted-row">` +
+        `<input id="opKeyMintedVal" type="text" readonly value="${escapeHtml(data.key)}" onclick="this.select()">` +
+        `<button class="btn-secondary btn-compact" id="opKeyCopyBtn">${t('auth.devices.copy')}</button>` +
+      `</div>`
+    document.getElementById('opKeyCopyBtn').addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(data.key)
+        document.getElementById('opKeyCopyBtn').textContent = t('auth.devices.copied')
+      } catch { document.getElementById('opKeyMintedVal').select() }
     })
     refreshDeviceKeyList()
   } catch { msg.classList.add('err'); msg.textContent = t('auth.login.err_network') }
@@ -13501,13 +17870,34 @@ async function renderAuthSessions() {
   } catch { el.innerHTML = '' }
 }
 
-function renderTokenModePanel(body) {
+function renderTokenModePanel(body, status) {
   body.innerHTML =
     `<p class="auth-muted">${t('auth.card.token_mode')}</p>`
+  if (!status || !status.login_available) return
+  // The browser sends a stored access token ahead of the session cookie, so a
+  // browser that came in with ?token= (or the mobile QR) never reaches the login.
+  // Dropping the stored token and reloading lands on the sign-in overlay; from
+  // then on this browser runs on the owner's session (DEVKEYMINT1022).
+  const p = document.createElement('p')
+  p.className = 'auth-muted'
+  p.textContent = t('auth.card.token_mode_signin_desc')
+  const btn = document.createElement('button')
+  btn.type = 'button'
+  btn.className = 'btn-primary'
+  btn.id = 'authTokenSignIn'
+  btn.textContent = t('auth.card.token_mode_signin_btn')
+  btn.addEventListener('click', () => {
+    try { localStorage.removeItem('marveen-dashboard-token') } catch { /* storage blocked */ }
+    window.location.reload()
+  })
+  body.appendChild(p)
+  body.appendChild(btn)
 }
 
-// Dismissible setup banner: shown only when the operator is authed via the token
-// and has not yet created a browser login. Dismissal persists per browser.
+// Dismissible setup banner: shown only when no browser login exists yet and this window can create one: the
+// access token, or (OWNERGATE4-1104) the full device key the first device pairing gave this window (the Bridge). The
+// status carries owner_session only for a full key, never for an operator key, so that is the full-key test here.
+// Dismissal persists per browser.
 const AUTH_BANNER_DISMISS_KEY = 'marveen.auth-banner-dismissed'
 
 async function initAuthBanner() {
@@ -13516,8 +17906,12 @@ async function initAuthBanner() {
   let dismissed = false
   try { dismissed = localStorage.getItem(AUTH_BANNER_DISMISS_KEY) === '1' } catch { /* storage blocked */ }
   const status = await fetchAuthStatus()
-  const show = !!status && status.authenticated && status.method === 'token' && status.setup_required && !dismissed
+  const canCreate = !!status && (status.method === 'token' || (status.method === 'device' && 'owner_session' in status))
+  const show = !!status && status.authenticated && canCreate && status.setup_required && !dismissed
   banner.hidden = !show
+  // DOCKERFIXES1109 follow-up: the setup-resume banner stays out of the way while this one is shown; re-check it now
+  // that this one is decided (whichever of the two inits finishes first).
+  if (show) showSetupResumeBanner()
 }
 
 function wireAuthBanner() {
@@ -13528,13 +17922,20 @@ function wireAuthBanner() {
   if (dismiss) dismiss.addEventListener('click', () => {
     try { localStorage.setItem(AUTH_BANNER_DISMISS_KEY, '1') } catch { /* storage blocked */ }
     banner.hidden = true
+    // DOCKERFIXES1109 follow-up: closing this one must not close the last way back to an unfinished setup.
+    showSetupResumeBanner()
   })
-  if (go) go.addEventListener('click', () => {
-    // Land on the Security tab, where the auth card lives now.
-    try { localStorage.setItem(SETTINGS_ACTIVE_TAB_KEY, 'security') } catch { /* storage blocked */ }
-    if (typeof switchPage === 'function') switchPage('settings')
-    const link = document.querySelector('.sb-link[data-page="settings"]')
-    if (link) { document.querySelectorAll('.sb-link').forEach((l) => l.classList.remove('active')); link.classList.add('active') }
+  // Land on the Security tab, where the auth card lives now (openCreateLoginSettings, shared with the 403 setup_required path).
+  // ONBOARDOWNERPW1107 (Samu 72423): while the onboarding is unfinished, the banner takes the owner back to the wizard,
+  // which opens on its login step (a closed wizard is reopened); otherwise to the Security tab as before.
+  if (go) go.addEventListener('click', async () => {
+    const s = await fetchOnboardingStatus()
+    if (s && s.needsOnboarding) {
+      undismissOnboarding()
+      renderOnboarding(s, await fetchOnboardingAuth())
+      return
+    }
+    openCreateLoginSettings()
   })
 }
 
@@ -13542,12 +17943,87 @@ document.addEventListener('DOMContentLoaded', () => {
   wireAuthBanner()
   initAuthBanner()
   wireBranchDriftBanner()
+  wireUpdateConflictBanner()
+  wireMainChannelUnconfBanner()
+  wireFleetFreeze()
 })
 
+// --- Fleet freeze, the red button (KILLSWITCH1022) ---------------------------
+// Pulling it is open to every signed-in browser; lifting it needs the owner's
+// dashboard login (the server answers 403 owner_session_required otherwise).
+const FLEET_FREEZE_POLL_MS = 15000
+
+function renderFleetFreeze(data) {
+  const banner = document.getElementById('fleetFreezeBanner')
+  const text = document.getElementById('fleetFreezeBannerText')
+  const btn = document.getElementById('fleetFreezeBtn')
+  if (!banner || !text || !btn) return
+  const st = data && data.frozen ? data.state : null
+  if (!st) {
+    banner.hidden = true
+    btn.disabled = false
+    return
+  }
+  const when = st.at ? new Date(st.at).toLocaleString() : ''
+  text.textContent = t(st.mode === 'stop' ? 'fleet_freeze.banner.stop' : 'fleet_freeze.banner.freeze',
+    { by: st.by || '?', at: when, reason: st.reason || '' })
+  banner.hidden = false
+  btn.disabled = st.mode === 'stop'
+}
+
+async function pollFleetFreeze() {
+  try {
+    const res = await fetch('api/fleet/freeze')
+    if (!res.ok) return
+    renderFleetFreeze(await res.json())
+  } catch { /* the next poll retries */ }
+}
+
+function wireFleetFreeze() {
+  const btn = document.getElementById('fleetFreezeBtn')
+  const unfreezeBtn = document.getElementById('fleetUnfreezeBtn')
+  if (!btn || !unfreezeBtn) return
+  btn.addEventListener('click', async () => {
+    const reason = (window.prompt(t('fleet_freeze.prompt.reason')) || '').trim()
+    if (!reason) return
+    const mode = window.confirm(t('fleet_freeze.prompt.stop')) ? 'stop' : 'freeze'
+    try {
+      const res = await fetch('api/fleet/freeze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason, mode }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) { showToast(data.error || ('HTTP ' + res.status)); return }
+      renderFleetFreeze(data)
+      showToast(t('fleet_freeze.toast.frozen'))
+    } catch (err) { showToast(String(err.message || err)) }
+  })
+  unfreezeBtn.addEventListener('click', async () => {
+    if (!window.confirm(t('fleet_freeze.prompt.unfreeze'))) return
+    try {
+      const res = await fetch('api/fleet/unfreeze', { method: 'POST' })
+      const data = await res.json().catch(() => ({}))
+      if (res.status === 403) { showToast(t('fleet_freeze.toast.owner_only'), 8000); return }
+      if (!res.ok) { showToast(data.error || ('HTTP ' + res.status)); return }
+      renderFleetFreeze({ frozen: false })
+      showToast(t('fleet_freeze.toast.unfrozen'))
+    } catch (err) { showToast(String(err.message || err)) }
+  })
+  pollFleetFreeze()
+  setInterval(pollFleetFreeze, FLEET_FREEZE_POLL_MS)
+}
+
+// ONBOARDFOLLOW1107: Settings can be loaded again while a run still waits for /api/settings (opened twice, a language
+// switch). Only the newest run may touch the panels after its await: an older one clearing #settingsTabPanels would tear
+// out the auth card the newer run moved into the Security panel (the card left the page, and the pending renderAuthCard
+// wrote into a detached body). tests/browser/settings-load-race.spec.ts.
+let settingsLoadGen = 0
 async function loadSettings() {
   const tabNav = document.getElementById('settingsTabNav')
   const tabPanels = document.getElementById('settingsTabPanels')
   if (!tabNav || !tabPanels) return
+  const gen = ++settingsLoadGen
 
   // Park the auth card back outside the panels before wiping them: a previous
   // loadSettings run moved it INTO the Security panel, and clearing
@@ -13564,11 +18040,25 @@ async function loadSettings() {
   updateSettingsSaveBar()
 
   renderAuthCard()
+  if (typeof window.loadGromzoCard === 'function') window.loadGromzoCard()
+  if (typeof window.loadGromzoAgents === 'function') window.loadGromzoAgents()
 
   try {
     const res = await fetch('api/settings')
     if (!res.ok) throw new Error('fetch failed')
-    const { settings } = await res.json()
+    const { settings, overridesFile } = await res.json()
+    if (gen !== settingsLoadGen) return // a newer run owns the panels now
+
+    // ENVRELAXGATE1104 step 2: an unreadable config-overrides.json drops every saved value, a tightening one too.
+    const overridesBanner = document.getElementById('settingsOverridesBanner')
+    if (overridesBanner) overridesBanner.remove()
+    if (overridesFile && overridesFile.state === 'unreadable') {
+      const banner = document.createElement('p')
+      banner.id = 'settingsOverridesBanner'
+      banner.style.cssText = 'padding:12px 24px;color:var(--danger, var(--text));font-size:13px'
+      banner.textContent = t('settings.overrides_unreadable').replace('{cause}', String(overridesFile.cause ?? '?'))
+      tabNav.parentNode?.insertBefore(banner, tabNav)
+    }
 
     const byModule = new Map()
     for (const s of settings) {
@@ -13593,7 +18083,13 @@ async function loadSettings() {
     const securityDefs = byModule.get('security') ?? []
     byModule.delete('security')
 
-    const allModules = [...byModule.keys(), 'security', 'autonomy']
+    // module:'claude-plans' is just the CLAUDE_ROTATION_ENABLED toggle (PR2b)
+    // -- it renders below the plan-list widget in the synthetic Claude Plans
+    // tab, same pattern as securityDefs above.
+    const claudePlansDefs = byModule.get('claude-plans') ?? []
+    byModule.delete('claude-plans')
+
+    const allModules = [...byModule.keys(), 'security', 'autonomy', 'claude-plans']
     const savedTab = localStorage.getItem(SETTINGS_ACTIVE_TAB_KEY) || allModules[0]
     const activeTab = allModules.includes(savedTab) ? savedTab : allModules[0]
 
@@ -13616,6 +18112,7 @@ async function loadSettings() {
       for (const def of defs) {
         group.appendChild(buildSettingRow(def))
       }
+      buildSettingsGroupReset(group)
       panel.appendChild(group)
       tabPanels.appendChild(panel)
     }
@@ -13649,6 +18146,7 @@ async function loadSettings() {
         for (const def of securityDefs) {
           group.appendChild(buildSettingRow(def))
         }
+        buildSettingsGroupReset(group)
         panel.appendChild(group)
       }
       tabPanels.appendChild(panel)
@@ -13700,7 +18198,74 @@ async function loadSettings() {
         renderAutonomyContent(grid, footer)
       }
     }
+
+    // Claude Plans tab (PR2b): synthetic like autonomy/security -- a hand-built
+    // plan-list + add-form widget, with the CLAUDE_ROTATION_ENABLED toggle
+    // (claudePlansDefs) appended below it exactly like security appends its
+    // registry keys after the auth card.
+    {
+      const mod = 'claude-plans'
+      const btn = document.createElement('button')
+      btn.className = 'tab-btn' + (mod === activeTab ? ' active' : '')
+      btn.dataset.tab = mod
+      btn.textContent = settingsModuleLabel(mod)
+      btn.addEventListener('click', () => activateSettingsTab(mod))
+      tabNav.appendChild(btn)
+
+      const panel = document.createElement('div')
+      panel.className = 'tab-panel'
+      panel.id = `settings-panel-${mod}`
+      panel.hidden = mod !== activeTab
+
+      const body = document.createElement('div')
+      body.className = 'settings-group'
+      body.id = 'claudePlansBody'
+      panel.appendChild(body)
+
+      if (claudePlansDefs.length) {
+        const group = document.createElement('div')
+        group.className = 'settings-group'
+        for (const def of claudePlansDefs) {
+          group.appendChild(buildSettingRow(def))
+        }
+        buildSettingsGroupReset(group)
+        panel.appendChild(group)
+      }
+
+      tabPanels.appendChild(panel)
+
+      if (mod === activeTab) {
+        renderClaudePlansPanel(body)
+      }
+    }
+
+    // Providers tab (synthetic, owner-only feature for custom Anthropic-compatible endpoints)
+    {
+      const mod = 'providers'
+      const btn = document.createElement('button')
+      btn.className = 'tab-btn' + (mod === activeTab ? ' active' : '')
+      btn.dataset.tab = mod
+      btn.textContent = t('providers.tab')
+      btn.addEventListener('click', () => activateSettingsTab(mod))
+      tabNav.appendChild(btn)
+
+      const panel = document.createElement('div')
+      panel.className = 'tab-panel'
+      panel.id = `settings-panel-${mod}`
+      panel.hidden = mod !== activeTab
+
+      const container = document.createElement('div')
+      container.id = 'settingsProvidersContainer'
+      panel.appendChild(container)
+
+      tabPanels.appendChild(panel)
+
+      if (mod === activeTab) {
+        renderProvidersContent(container)
+      }
+    }
   } catch (err) {
+    if (gen !== settingsLoadGen) return // a stale run's failure must not wipe the newer run's panels either
     tabPanels.innerHTML = `<p style="padding:24px;color:var(--danger)">${t('settings.error')}</p>`
   }
 }
@@ -13719,6 +18284,971 @@ function activateSettingsTab(mod) {
     const footer = document.getElementById('settingsAutonomyUpdatedAt')
     if (grid && !grid.innerHTML.trim()) renderAutonomyContent(grid, footer)
   }
+  if (mod === 'claude-plans') {
+    const body = document.getElementById('claudePlansBody')
+    if (body && !body.innerHTML.trim()) renderClaudePlansPanel(body)
+  }
+  if (mod === 'providers') {
+    const container = document.getElementById('settingsProvidersContainer')
+    if (container && !container.innerHTML.trim()) renderProvidersContent(container)
+  }
+}
+
+// Claude Plans tab (PR2b): plan-list + add-form widget over
+// store/claude-plans.json, plus GET /api/claude-plans/state for the
+// active-plan / last-known-usage badges. The "active" dot reflects the MAIN
+// agent's entry in activePlanByAgent (PR2c, design decision #1: the state is
+// per-agent, but this tab only shows the one that also drives the dashboard
+// header). Each non-active, channels-allowed plan has a "switch to this
+// plan" button (switchToClaudePlan -> POST /api/claude-plans/rotate): the
+// manual path, and the first assignment the rotation heartbeat needs before
+// it can decide anything. Automatic rotation is the heartbeat's job.
+async function renderClaudePlansPanel(body) {
+  body.innerHTML = `
+    <p style="color:var(--text-muted);font-size:13px;margin:0 0 16px">${t('settings.claude_plans.intro')}</p>
+    <div id="claudePlansReadiness" class="claude-plans-readiness-banner" role="alert" hidden></div>
+    <div id="claudePlansList"></div>
+    <div class="claude-plans-add-form">
+      <div class="claude-plans-form-title" id="cpFormTitle">${t('settings.claude_plans.form.title_add')}</div>
+      <div class="form-row">
+        <div class="form-group" style="flex:1">
+          <label>${t('settings.claude_plans.form.id')}</label>
+          <input class="input" id="cpFormId" placeholder="personal-2" autocomplete="off">
+        </div>
+        <div class="form-group" style="flex:1">
+          <label>${t('settings.claude_plans.form.label')}</label>
+          <input class="input" id="cpFormLabel" placeholder="Second Pro" autocomplete="off">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group" style="flex:1">
+          <label>${t('settings.claude_plans.form.mode')}</label>
+          <select class="input" id="cpFormMode">
+            <option value="login">${t('settings.claude_plans.form.mode_login')}</option>
+            <option value="token">${t('settings.claude_plans.form.mode_token')}</option>
+            <option value="configDir">${t('settings.claude_plans.form.mode_config_dir')}</option>
+          </select>
+        </div>
+        <div class="form-group" style="flex:1">
+          <label>${t('settings.claude_plans.form.type')}</label>
+          <select class="input" id="cpFormType">
+            <option value="personal">${t('settings.claude_plans.form.type_personal')}</option>
+            <option value="team">${t('settings.claude_plans.form.type_team')}</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-group" id="cpFormTokenGroup">
+        <label for="cpFormToken">${t('settings.claude_plans.form.token')}</label>
+        <input class="input" id="cpFormToken" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-oat01-…">
+        <div class="claude-plans-form-hint" id="cpFormTokenHint">${t('settings.claude_plans.form.token_hint')}</div>
+      </div>
+      <div class="form-group" id="cpFormLoginGroup" hidden>
+        <div class="claude-plans-form-hint">${t('settings.claude_plans.login.hint')}</div>
+        <div id="cpLoginStep" class="claude-plans-login-step" hidden>
+          <a class="btn-secondary btn-compact" id="cpLoginLink" href="#" target="_blank" rel="noopener noreferrer">${t('settings.claude_plans.login.open_link')}</a>
+          <label for="cpLoginUrl">${t('settings.claude_plans.login.copy_hint')}</label>
+          <div class="form-row">
+            <input class="input" id="cpLoginUrl" style="flex:1" readonly spellcheck="false">
+            <button class="btn-secondary btn-compact" id="cpLoginCopyBtn">${t('settings.claude_plans.login.copy_btn')}</button>
+          </div>
+          <label for="cpLoginCode">${t('settings.claude_plans.login.code')}</label>
+          <div class="form-row">
+            <input class="input" id="cpLoginCode" style="flex:1" autocomplete="off" spellcheck="false">
+            <button class="btn-secondary btn-compact" id="cpLoginCodeBtn">${t('settings.claude_plans.login.submit_code')}</button>
+          </div>
+        </div>
+        <div id="cpLoginStatus" class="claude-plans-form-hint" role="status" hidden></div>
+      </div>
+      <div class="form-group" id="cpFormConfigDirGroup" hidden>
+        <label for="cpFormConfigDir">${t('settings.claude_plans.form.config_dir')}</label>
+        <input class="input" id="cpFormConfigDir" placeholder="~/.claude-second" autocomplete="off">
+      </div>
+      <label class="claude-plans-checkbox-row">
+        <input type="checkbox" id="cpFormChannelsAllowed" checked>
+        <span>${t('settings.claude_plans.form.channels_allowed')}</span>
+      </label>
+      <div id="cpFormError" class="settings-row-error" hidden></div>
+      <div class="claude-plans-form-actions">
+        <button class="btn-secondary btn-compact" id="cpFormAddBtn">${t('settings.claude_plans.form.add_btn')}</button>
+        <button class="btn-secondary btn-compact" id="cpFormCancelBtn" hidden>${t('common.btn.cancel')}</button>
+      </div>
+    </div>
+  `
+
+  document.getElementById('cpFormMode').addEventListener('change', () => syncClaudePlanFormMode())
+  document.getElementById('cpFormAddBtn').addEventListener('click', () => {
+    if (document.getElementById('cpFormMode').value === 'login' && !claudePlanFormEditing) startClaudePlanLogin()
+    else saveClaudePlan()
+  })
+  document.getElementById('cpFormCancelBtn').addEventListener('click', () => {
+    if (claudePlanLoginActive) cancelClaudePlanLogin()
+    else resetClaudePlanForm()
+  })
+  document.getElementById('cpLoginCodeBtn').addEventListener('click', () => submitClaudePlanLoginCode())
+  document.getElementById('cpLoginCopyBtn').addEventListener('click', () => copyClaudePlanLoginUrl())
+  document.getElementById('cpLoginUrl').addEventListener('focus', (e) => e.target.select())
+  document.getElementById('cpLoginCode').addEventListener('keydown', (e) => { if (e.key === 'Enter') submitClaudePlanLoginCode() })
+  for (const id of ['cpFormId', 'cpFormLabel', 'cpFormConfigDir', 'cpFormToken']) {
+    document.getElementById(id).addEventListener('keydown', (e) => { if (e.key === 'Enter') saveClaudePlan() })
+  }
+  claudePlanFormEditing = null
+  claudePlanLoginActive = false
+  syncClaudePlanFormMode()
+
+  await loadClaudePlansList()
+  await resumeClaudePlanLogin()
+}
+
+// The plan being edited in the form (the GET /api/claude-plans object), or
+// null while the form is in "add" mode. Only the plan's public shape is kept
+// here -- the raw token is never returned by the API and never pre-filled.
+let claudePlanFormEditing = null
+
+// Pure: form fields (+ the plan being edited, if any) -> the POST/PUT body,
+// or an i18n error key. Contract of src/web/routes/claude-plans.ts:
+//   - config-dir mode sends `configDir`;
+//   - token mode sends the raw `token` (moved into the vault server-side as
+//     claude-plan-token-<id>, never written to disk or echoed back);
+//   - token mode on EDIT with the token field left empty keeps the stored
+//     token by sending the plan's own `tokenSecretId` instead (the PUT
+//     replaces the whole plan, and a body with neither configDir nor
+//     token/tokenSecretId is rejected);
+//   - never both `token` and `configDir` (the route 400s that as ambiguous).
+function buildClaudePlanRequestBody(fields, editing) {
+  const id = editing ? editing.id : String(fields.id || '').trim()
+  const label = String(fields.label || '').trim()
+  const body = { id, label, planType: fields.planType, channelsAllowed: !!fields.channelsAllowed }
+  if (!id || !label) return { error: 'settings.claude_plans.form.error_required' }
+  if (fields.mode === 'token') {
+    const token = String(fields.token || '').trim()
+    if (token) {
+      body.token = token
+    } else if (editing && editing.tokenSecretId) {
+      body.tokenSecretId = editing.tokenSecretId
+    } else {
+      return { error: 'settings.claude_plans.form.error_token_required' }
+    }
+  } else {
+    const configDir = String(fields.configDir || '').trim()
+    if (!configDir) return { error: 'settings.claude_plans.form.error_config_dir_required' }
+    body.configDir = configDir
+  }
+  return { body, sendsNewToken: typeof body.token === 'string' }
+}
+
+function syncClaudePlanFormMode() {
+  const mode = document.getElementById('cpFormMode')?.value
+  const tokenGroup = document.getElementById('cpFormTokenGroup')
+  const dirGroup = document.getElementById('cpFormConfigDirGroup')
+  const loginGroup = document.getElementById('cpFormLoginGroup')
+  if (!tokenGroup || !dirGroup || !loginGroup) return
+  tokenGroup.hidden = mode !== 'token'
+  dirGroup.hidden = mode !== 'configDir'
+  loginGroup.hidden = mode !== 'login'
+  // Logging in creates a NEW plan; an edit keeps the paste and config-dir ways.
+  const loginOption = document.querySelector('#cpFormMode option[value="login"]')
+  if (loginOption) loginOption.hidden = !!claudePlanFormEditing
+  const addBtn = document.getElementById('cpFormAddBtn')
+  if (addBtn && !claudePlanFormEditing) {
+    addBtn.textContent = t(mode === 'login' ? 'settings.claude_plans.login.start_btn' : 'settings.claude_plans.form.add_btn')
+    addBtn.hidden = mode === 'login' && claudePlanLoginActive
+  }
+  const hasStoredToken = !!claudePlanFormEditing?.tokenSecretId
+  const hint = document.getElementById('cpFormTokenHint')
+  if (hint) {
+    hint.textContent = t(hasStoredToken
+      ? 'settings.claude_plans.form.token_keep_hint'
+      : 'settings.claude_plans.form.token_hint')
+  }
+  // A stored token reads as masked dots, not as an example value to type.
+  const tokenEl = document.getElementById('cpFormToken')
+  if (tokenEl) tokenEl.placeholder = hasStoredToken ? '••••••••••••' : 'sk-ant-oat01-…'
+}
+
+function resetClaudePlanForm() {
+  claudePlanFormEditing = null
+  const idEl = document.getElementById('cpFormId')
+  if (!idEl) return
+  idEl.value = ''
+  idEl.disabled = false
+  document.getElementById('cpFormLabel').value = ''
+  document.getElementById('cpFormConfigDir').value = ''
+  document.getElementById('cpFormToken').value = ''
+  document.getElementById('cpFormMode').value = 'login'
+  document.getElementById('cpFormType').value = 'personal'
+  document.getElementById('cpFormChannelsAllowed').checked = true
+  document.getElementById('cpFormTitle').textContent = t('settings.claude_plans.form.title_add')
+  document.getElementById('cpFormAddBtn').textContent = t('settings.claude_plans.form.add_btn')
+  document.getElementById('cpFormCancelBtn').hidden = true
+  document.getElementById('cpFormError').hidden = true
+  showClaudePlanLoginStep(null)
+  syncClaudePlanFormMode()
+}
+
+function editClaudePlan(plan) {
+  claudePlanFormEditing = plan
+  const idEl = document.getElementById('cpFormId')
+  if (!idEl) return
+  idEl.value = plan.id
+  idEl.disabled = true
+  document.getElementById('cpFormLabel').value = plan.label
+  document.getElementById('cpFormMode').value = plan.tokenSecretId ? 'token' : 'configDir'
+  document.getElementById('cpFormConfigDir').value = plan.configDir || ''
+  // Never pre-filled: the API does not return the token, and an empty field
+  // on save means "keep the stored one" (buildClaudePlanRequestBody).
+  document.getElementById('cpFormToken').value = ''
+  document.getElementById('cpFormType').value = plan.planType === 'team' ? 'team' : 'personal'
+  document.getElementById('cpFormChannelsAllowed').checked = !!plan.channelsAllowed
+  document.getElementById('cpFormTitle').textContent = t('settings.claude_plans.form.title_edit', { id: plan.id })
+  document.getElementById('cpFormAddBtn').textContent = t('common.btn.save')
+  document.getElementById('cpFormCancelBtn').hidden = false
+  document.getElementById('cpFormError').hidden = true
+  syncClaudePlanFormMode()
+  document.getElementById('cpFormLabel').focus()
+  document.querySelector('.claude-plans-add-form')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+}
+
+async function saveClaudePlan() {
+  const errEl = document.getElementById('cpFormError')
+  errEl.hidden = true
+  const editing = claudePlanFormEditing
+  const built = buildClaudePlanRequestBody({
+    id: document.getElementById('cpFormId').value,
+    label: document.getElementById('cpFormLabel').value,
+    mode: document.getElementById('cpFormMode').value,
+    configDir: document.getElementById('cpFormConfigDir').value,
+    token: document.getElementById('cpFormToken').value,
+    planType: document.getElementById('cpFormType').value,
+    channelsAllowed: document.getElementById('cpFormChannelsAllowed').checked,
+  }, editing)
+  if (built.error) {
+    errEl.textContent = t(built.error)
+    errEl.hidden = false
+    return
+  }
+
+  const url = editing ? `api/claude-plans/${encodeURIComponent(editing.id)}` : 'api/claude-plans'
+  try {
+    const res = await fetch(url, {
+      method: editing ? 'PUT' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(built.body),
+    })
+    let data = null
+    try { data = await res.json() } catch { /* non-JSON error body */ }
+    if (!res.ok) {
+      errEl.textContent = (data && data.error) || t('settings.claude_plans.form.error_generic')
+      errEl.hidden = false
+      return
+    }
+    // The raw token leaves the DOM as soon as the server has it.
+    document.getElementById('cpFormToken').value = ''
+    const savedId = (data && data.id) || built.body.id
+    resetClaudePlanForm()
+    await loadClaudePlansList()
+    // A freshly pasted token: measure it right away, so the row shows its
+    // real 5h/7d usage (or "token rejected") instead of "not checked yet".
+    if (built.sendsNewToken && data && data.tokenSecretId) {
+      const btn = document.querySelector(`.claude-plan-row[data-plan-id="${CSS.escape(savedId)}"] .claude-plan-check-btn`)
+      if (btn) await probeClaudePlan(savedId, btn)
+    }
+  } catch {
+    errEl.textContent = t('settings.claude_plans.form.error_generic')
+    errEl.hidden = false
+  }
+}
+
+// "Log in to add a plan" (SETUPTOKENWIZ1022): the server runs claude
+// setup-token, this form shows its login link, takes the code the login page
+// gives, and the server stores the token it catches. The token never reaches
+// the browser. The paste and config-dir modes stay as they were.
+let claudePlanLoginActive = false
+
+// Pure: the start body from the form fields, or an i18n error key.
+function buildClaudePlanLoginStartBody(fields) {
+  const id = String(fields.id || '').trim()
+  const label = String(fields.label || '').trim()
+  if (!id || !label) return { error: 'settings.claude_plans.form.error_required' }
+  return { body: { id, label, planType: fields.planType, channelsAllowed: !!fields.channelsAllowed } }
+}
+
+// Server error code -> i18n key; unknown codes fall back to the server text.
+const CLAUDE_PLAN_LOGIN_ERROR_KEYS = {
+  'busy': 'settings.claude_plans.login.error_busy',
+  'id-taken': 'settings.claude_plans.login.error_id_taken',
+  'invalid-plan': 'settings.claude_plans.login.error_invalid',
+  'invalid-label': 'settings.claude_plans.login.error_invalid_label',
+  'claude-not-found': 'settings.claude_plans.login.error_claude_missing',
+  'url-timeout': 'settings.claude_plans.login.error_no_link',
+  'code-timeout': 'settings.claude_plans.login.error_expired',
+  'token-timeout': 'settings.claude_plans.login.error_no_token',
+  'exited': 'settings.claude_plans.login.error_no_token',
+  'bad-code': 'settings.claude_plans.login.error_bad_code',
+  'wrong-phase': 'settings.claude_plans.login.error_expired',
+  'verify-failed': 'settings.claude_plans.login.error_rejected',
+  // Every route here takes the owner session or a paired Bridge key: a token or other device-key window gets this.
+  'owner_session_required': 'settings.claude_plans.login.error_owner_session',
+}
+
+function claudePlanLoginErrorText(data) {
+  const key = data && CLAUDE_PLAN_LOGIN_ERROR_KEYS[data.code]
+  if (key) return t(key)
+  return (data && data.error) || t('settings.claude_plans.form.error_generic')
+}
+
+// url: show the link + code step; null: back to the start button.
+function showClaudePlanLoginStep(url) {
+  const step = document.getElementById('cpLoginStep')
+  const link = document.getElementById('cpLoginLink')
+  const code = document.getElementById('cpLoginCode')
+  if (!step || !link || !code) return
+  claudePlanLoginActive = !!url
+  step.hidden = !url
+  const safeUrl = url && url.startsWith('https://') ? url : ''
+  link.href = safeUrl || '#'
+  const urlField = document.getElementById('cpLoginUrl')
+  if (urlField) urlField.value = safeUrl
+  code.value = ''
+  for (const id of ['cpFormId', 'cpFormLabel', 'cpFormType', 'cpFormChannelsAllowed', 'cpFormMode']) {
+    const el = document.getElementById(id)
+    if (el) el.disabled = !!url
+  }
+  const cancelBtn = document.getElementById('cpFormCancelBtn')
+  if (cancelBtn) cancelBtn.hidden = !url && !claudePlanFormEditing
+  setClaudePlanLoginStatus(url ? t('settings.claude_plans.login.waiting_code') : null)
+  syncClaudePlanFormMode()
+}
+
+function setClaudePlanLoginStatus(text) {
+  const el = document.getElementById('cpLoginStatus')
+  if (!el) return
+  el.textContent = text || ''
+  el.hidden = !text
+}
+
+function showClaudePlanFormError(text) {
+  const errEl = document.getElementById('cpFormError')
+  errEl.textContent = text
+  errEl.hidden = false
+}
+
+// The link is also shown as text, for opening it on another device or in
+// another browser profile (the Claude account to add may live there).
+async function copyClaudePlanLoginUrl() {
+  const field = document.getElementById('cpLoginUrl')
+  if (!field || !field.value) return
+  try {
+    await navigator.clipboard.writeText(field.value)
+    showToast(t('settings.claude_plans.login.copied'))
+  } catch {
+    field.focus()
+    field.select()
+  }
+}
+
+async function startClaudePlanLogin() {
+  document.getElementById('cpFormError').hidden = true
+  const built = buildClaudePlanLoginStartBody({
+    id: document.getElementById('cpFormId').value,
+    label: document.getElementById('cpFormLabel').value,
+    planType: document.getElementById('cpFormType').value,
+    channelsAllowed: document.getElementById('cpFormChannelsAllowed').checked,
+  })
+  if (built.error) { showClaudePlanFormError(t(built.error)); return }
+  const addBtn = document.getElementById('cpFormAddBtn')
+  addBtn.disabled = true
+  setClaudePlanLoginStatus(t('settings.claude_plans.login.starting'))
+  try {
+    const res = await fetch('api/claude-plans/login/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(built.body),
+    })
+    let data = null
+    try { data = await res.json() } catch { /* non-JSON error body */ }
+    if (!res.ok || !data || typeof data.url !== 'string') {
+      setClaudePlanLoginStatus(null)
+      showClaudePlanFormError(claudePlanLoginErrorText(data))
+      return
+    }
+    showClaudePlanLoginStep(data.url)
+    document.getElementById('cpLoginLink').focus()
+  } catch {
+    setClaudePlanLoginStatus(null)
+    showClaudePlanFormError(t('settings.claude_plans.form.error_generic'))
+  } finally {
+    addBtn.disabled = false
+  }
+}
+
+async function submitClaudePlanLoginCode() {
+  const codeEl = document.getElementById('cpLoginCode')
+  const code = codeEl.value.trim()
+  if (!code) return
+  document.getElementById('cpFormError').hidden = true
+  const btn = document.getElementById('cpLoginCodeBtn')
+  btn.disabled = true
+  setClaudePlanLoginStatus(t('settings.claude_plans.login.checking'))
+  try {
+    const res = await fetch('api/claude-plans/login/code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code }),
+    })
+    let data = null
+    try { data = await res.json() } catch { /* non-JSON error body */ }
+    if (res.status === 201 && data) {
+      showToast(t(data.verified ? 'settings.claude_plans.login.done' : 'settings.claude_plans.login.done_unverified', { label: data.label || data.id }))
+      resetClaudePlanForm()
+      await loadClaudePlansList()
+      return
+    }
+    // A mistyped code leaves the login waiting; anything else has ended it.
+    if (data && data.code === 'bad-code') {
+      setClaudePlanLoginStatus(t('settings.claude_plans.login.waiting_code'))
+    } else {
+      showClaudePlanLoginStep(null)
+    }
+    showClaudePlanFormError(claudePlanLoginErrorText(data))
+  } catch {
+    showClaudePlanLoginStep(null)
+    showClaudePlanFormError(t('settings.claude_plans.form.error_generic'))
+  } finally {
+    btn.disabled = false
+  }
+}
+
+async function cancelClaudePlanLogin() {
+  try { await fetch('api/claude-plans/login/cancel', { method: 'POST' }) } catch { /* the server ends it on its own timeout */ }
+  resetClaudePlanForm()
+}
+
+// Coming back to the tab while a login waits for its code: show its link again.
+async function resumeClaudePlanLogin() {
+  try {
+    const res = await fetch('api/claude-plans/login/status')
+    if (!res.ok) return
+    const data = await res.json()
+    if (data && data.active && typeof data.url === 'string') {
+      document.getElementById('cpFormMode').value = 'login'
+      showClaudePlanLoginStep(data.url)
+    }
+  } catch { /* status is a convenience */ }
+}
+
+// POST /api/claude-plans/rotate for the main agent (agentId defaults to it
+// server-side). Restarts the main agent's session, hence the confirm.
+async function switchToClaudePlan(plan) {
+  const confirmed = await confirmDialog({
+    title: t('settings.claude_plans.confirm_switch_title'),
+    message: t('settings.claude_plans.confirm_switch', { label: plan.label }),
+    okLabel: t('settings.claude_plans.confirm_switch_ok'),
+  })
+  if (!confirmed) return
+  try {
+    const res = await fetch('api/claude-plans/rotate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ targetPlanId: plan.id }),
+    })
+    let data = null
+    try { data = await res.json() } catch { /* non-JSON error body */ }
+    if (!res.ok) {
+      showToast((data && data.error) || t('settings.claude_plans.switch_error'), 'error')
+    } else {
+      showToast(t('settings.claude_plans.switch_done', { label: plan.label }))
+    }
+  } catch {
+    showToast(t('settings.claude_plans.switch_error'), 'error')
+  }
+  await loadClaudePlansList()
+}
+
+// The agents set to a plan: the rotation's record (the main agent included) and every agent whose own claudePlan
+// field points at it (set in the agent editor, which the rotation does not record). After the delete they all
+// stop using the plan from their next start (resolveAgentConfigDir reports planUnresolved). If the agent list
+// cannot be read, the rotation's record is still named.
+async function claudePlanUsers(planId, rotationUsers = []) {
+  const users = new Set(rotationUsers)
+  try {
+    const res = await fetch('api/agents')
+    const list = res.ok ? await res.json() : []
+    for (const a of Array.isArray(list) ? list : []) if (a && a.claudePlan === planId && a.name) users.add(a.name)
+  } catch {}
+  return [...users]
+}
+
+async function deleteClaudePlan(plan, rotationUsers = []) {
+  const id = plan.id
+  const users = await claudePlanUsers(id, rotationUsers)
+  let message = t('settings.claude_plans.confirm_delete', { label: plan.label || id })
+  // Only a token-mode plan has a token in the Vault, and the server removes only that one (deleteOwnTokenSecret);
+  // a configDir plan loses nothing there.
+  if (plan.tokenSecretId) message += ' ' + t('settings.claude_plans.confirm_delete_token')
+  if (users.length) message += '\n\n' + t('settings.claude_plans.confirm_delete_used_by', { agents: users.map(n => `"${n}"`).join(', ') })
+  const confirmed = await confirmDialog({
+    title: t('settings.claude_plans.confirm_delete_title'),
+    message,
+    okLabel: t('settings.claude_plans.confirm_delete_ok'),
+    danger: true,
+  })
+  if (!confirmed) return
+  // OWNERGATE2-1104: the server may refuse (403 owner_session_required); show why instead of a silent no-op.
+  try {
+    const res = await fetch(`api/claude-plans/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    const reply = await readActionReply(res)
+    if (!reply.ok) {
+      showToast(t('common.not_done', { msg: refusalReason(res, reply.body) }))
+    } else if (claudePlanFormEditing?.id === id) {
+      resetClaudePlanForm()
+    }
+  } catch {
+    showToast(t('common.not_done', { msg: t('common.error') }))
+  }
+  await loadClaudePlansList()
+}
+
+// Live usage per plan (piece 1 of multi-key rotation): the 5h / 7d windows
+// last recorded for this plan -- by the rotation heartbeat while the plan is
+// active, or by a live probe (POST /api/claude-plans/:id/probe, "Check now")
+// while it is idle. A window whose reset has already passed is shown muted
+// with "window already reset", same rule as the overview quota strip: an old
+// number must not look like a current one.
+function claudePlanWindowLevel(w, nowSec) {
+  if (!w || typeof w.usedPercent !== 'number') return null
+  if (typeof w.resetsAt === 'number' && w.resetsAt <= nowSec) return 'ok'
+  if (w.usedPercent >= 100 || w.status === 'rejected') return 'exhausted'
+  if (w.usedPercent >= 80) return 'warn'
+  return 'ok'
+}
+
+function claudePlanUsageLevel(observed) {
+  const windows = observed?.windows || {}
+  const nowSec = Math.floor(Date.now() / 1000)
+  const levels = [windows.five_hour, windows.seven_day].map((w) => claudePlanWindowLevel(w, nowSec)).filter(Boolean)
+  if (!levels.length) return null
+  if (levels.includes('exhausted')) return 'exhausted'
+  if (levels.includes('warn')) return 'warn'
+  return 'ok'
+}
+
+function renderClaudePlanUsage(plan, observed) {
+  const wrap = document.createElement('div')
+  wrap.className = 'claude-plan-usage'
+  const nowSec = Math.floor(Date.now() / 1000)
+  const windows = observed?.windows || {}
+
+  const bars = document.createElement('div')
+  bars.className = 'quota-bars'
+  for (const [labelKey, w] of [['overview.quota.five_hour', windows.five_hour], ['overview.quota.seven_day', windows.seven_day]]) {
+    if (!w || typeof w.usedPercent !== 'number') continue
+    const pct = Math.max(0, Math.min(100, Math.round(w.usedPercent)))
+    const expired = typeof w.resetsAt === 'number' && w.resetsAt <= nowSec
+    const lvl = claudePlanWindowLevel(w, nowSec)
+    const fillClass = expired ? '' : (lvl === 'exhausted' ? 'danger' : lvl === 'warn' ? 'warn' : '')
+    let tail = ''
+    if (expired) {
+      tail = ' · ' + t('overview.quota.expired')
+    } else if (typeof w.resetsAt === 'number') {
+      const at = new Date(w.resetsAt * 1000).toLocaleString(_lang === 'en' ? 'en-US' : 'hu-HU', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+      tail = ' · ' + t('settings.claude_plans.resets', { d: formatDurationShort(w.resetsAt - nowSec), at })
+    }
+    const row = document.createElement('div')
+    row.className = 'quota-bar' + (expired ? ' muted' : '')
+    row.innerHTML = `
+      <div class="quota-bar-label">${escapeHtml(t(labelKey))}</div>
+      <div class="quota-bar-track"><div class="quota-bar-fill ${fillClass}" style="width:${pct}%"></div></div>
+      <div class="quota-bar-value">${pct}%<span class="quota-bar-reset">${escapeHtml(tail)}</span></div>
+    `
+    bars.appendChild(row)
+  }
+  if (bars.children.length) wrap.appendChild(bars)
+
+  const foot = document.createElement('div')
+  foot.className = 'claude-plan-usage-foot'
+  const info = document.createElement('span')
+  const checkedAt = Math.max(observed?.observedAt || 0, observed?.lastProbe?.at || 0)
+  const parts = []
+  if (checkedAt > 0) {
+    parts.push(t('settings.claude_plans.checked', { age: formatPendingAge(Date.now() - checkedAt) }))
+  } else {
+    parts.push(t('settings.claude_plans.never_checked'))
+  }
+  const lp = observed?.lastProbe
+  if (lp && !lp.ok && lp.error !== 'rate_limited') {
+    parts.push(t('settings.claude_plans.probe_error.' + (lp.error || 'http_error'), { status: lp.httpStatus ?? '' }))
+    info.className = 'claude-plan-usage-error'
+  }
+  info.textContent = parts.join(' · ')
+  foot.appendChild(info)
+
+  const btn = document.createElement('button')
+  btn.className = 'btn-secondary btn-compact claude-plan-check-btn'
+  btn.textContent = t('settings.claude_plans.check_now')
+  if (!plan.tokenSecretId) {
+    btn.disabled = true
+    btn.title = t('settings.claude_plans.check_needs_token')
+  } else {
+    btn.addEventListener('click', () => probeClaudePlan(plan.id, btn))
+  }
+  foot.appendChild(btn)
+  wrap.appendChild(foot)
+  return wrap
+}
+
+async function probeClaudePlan(id, btn) {
+  const original = btn.textContent
+  btn.disabled = true
+  btn.textContent = t('settings.claude_plans.checking')
+  try {
+    const res = await fetch(`api/claude-plans/${encodeURIComponent(id)}/probe`, { method: 'POST' })
+    if (!res.ok) {
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON error body */ }
+      // A 502 is an upstream verdict (e.g. token rejected) already recorded in
+      // the state side-car; the reloaded row shows it. Anything else (404/409/
+      // 422) is not recorded, so surface it here.
+      // A 429 is the per-plan probe throttle: the reloaded row already shows
+      // the last measurement, so just say why nothing new happened.
+      if (res.status === 429) showToast(t('settings.claude_plans.probe_throttled'))
+      else if (res.status !== 502) showToast((data && data.error) || t('settings.claude_plans.probe_failed'))
+    }
+  } catch {
+    showToast(t('settings.claude_plans.probe_failed'))
+  }
+  btn.textContent = original
+  await loadClaudePlansList()
+}
+
+// Pure: GET /api/claude-plans/readiness -> the banner's lines, or null when
+// no banner belongs on screen. Shown only while rotation is ON but something
+// keeps it inert (with rotation off there is nothing to warn about: the
+// toggle itself says so). Known codes get the localized text; an unknown one
+// falls back to the server's own Hungarian message rather than vanishing.
+function claudePlansReadinessLines(readiness) {
+  if (!readiness || readiness.ready) return null
+  const codes = Array.isArray(readiness.blockers) ? readiness.blockers : []
+  if (!codes.length || codes.includes('rotation_disabled')) return null
+  const details = Array.isArray(readiness.details) ? readiness.details : []
+  return codes.map((code) => {
+    const key = 'settings.claude_plans.readiness.' + code
+    const text = t(key)
+    if (text !== key) return text
+    const d = details.find((x) => x && x.code === code)
+    return (d && d.message) || code
+  })
+}
+
+async function loadClaudePlansReadiness() {
+  const el = document.getElementById('claudePlansReadiness')
+  if (!el) return
+  let lines = null
+  try {
+    const res = await fetch('api/claude-plans/readiness')
+    if (res.ok) lines = claudePlansReadinessLines(await res.json())
+  } catch { /* banner is advisory: no answer, no banner */ }
+  if (!lines) {
+    el.hidden = true
+    el.innerHTML = ''
+    return
+  }
+  el.innerHTML = `<div class="claude-plans-readiness-title">${escapeHtml(t('settings.claude_plans.readiness.title'))}</div>`
+    + `<ul>${lines.map((l) => `<li>${escapeHtml(l)}</li>`).join('')}</ul>`
+  el.hidden = false
+}
+
+async function loadClaudePlansList() {
+  const list = document.getElementById('claudePlansList')
+  if (!list) return
+  // Plan count and channelsAllowed feed the readiness report, so it is
+  // refreshed together with the list (add/edit/delete all end up here).
+  loadClaudePlansReadiness()
+  list.innerHTML = `<p style="color:var(--text-muted);font-size:13px">${t('common.loading')}</p>`
+  try {
+    const [plansRes, stateRes] = await Promise.all([
+      fetch('api/claude-plans'),
+      fetch('api/claude-plans/state'),
+    ])
+    const plans = plansRes.ok ? await plansRes.json() : []
+    const state = stateRes.ok ? await stateRes.json() : { activePlanByAgent: {}, plans: {} }
+
+    if (!plans.length) {
+      list.innerHTML = `<p style="color:var(--text-muted);font-size:13px">${t('settings.claude_plans.empty')}</p>`
+      return
+    }
+
+    list.innerHTML = ''
+    for (const plan of plans) {
+      const observed = state.plans?.[plan.id]
+      const level = claudePlanUsageLevel(observed)
+      const isActive = state.activePlanByAgent?.[mainAgentId()] === plan.id
+
+      const row = document.createElement('div')
+      row.className = 'claude-plan-row'
+      row.dataset.planId = plan.id
+
+      const main = document.createElement('div')
+      main.style.flex = '1'
+      const mainLine = document.createElement('div')
+      mainLine.className = 'claude-plan-row-main'
+      mainLine.innerHTML = `
+        ${isActive ? `<span class="claude-plan-active-dot" title="${t('settings.claude_plans.active')}"></span>` : ''}
+        <strong>${escapeHtml(plan.label)}</strong>
+        <span class="claude-plan-badge">${plan.planType === 'team' ? t('settings.claude_plans.form.type_team') : t('settings.claude_plans.form.type_personal')}</span>
+        ${!plan.channelsAllowed ? `<span class="claude-plan-badge claude-plan-badge-muted">${t('settings.claude_plans.no_channels')}</span>` : ''}
+        ${level ? `<span class="claude-plan-badge claude-plan-status-${level}">${t('settings.claude_plans.status.' + level)}</span>` : ''}
+      `
+      main.appendChild(mainLine)
+
+      const meta = document.createElement('div')
+      meta.className = 'claude-plan-row-meta'
+      meta.textContent = `${plan.id} · ${plan.tokenSecretId ? t('settings.claude_plans.token_mode') : plan.configDir}`
+      main.appendChild(meta)
+
+      main.appendChild(renderClaudePlanUsage(plan, observed))
+
+      row.appendChild(main)
+
+      const actions = document.createElement('div')
+      actions.className = 'claude-plan-actions'
+      const editBtn = document.createElement('button')
+      editBtn.className = 'claude-plan-edit'
+      editBtn.title = t('common.btn.edit')
+      editBtn.setAttribute('aria-label', t('common.btn.edit'))
+      editBtn.textContent = '✎'
+      editBtn.addEventListener('click', () => editClaudePlan(plan))
+      actions.appendChild(editBtn)
+
+      // Manual switch (also the first assignment the rotation heartbeat
+      // needs before it can decide anything, see readiness no_active_plan).
+      // Only for a plan that may run the channel and is not already active.
+      if (plan.channelsAllowed && !isActive) {
+        const switchBtn = document.createElement('button')
+        switchBtn.className = 'btn-secondary btn-compact claude-plan-switch-btn'
+        switchBtn.textContent = t('settings.claude_plans.switch_btn')
+        switchBtn.title = t('settings.claude_plans.switch_btn')
+        switchBtn.addEventListener('click', () => switchToClaudePlan(plan))
+        actions.appendChild(switchBtn)
+      }
+
+      const delBtn = document.createElement('button')
+      delBtn.className = 'claude-plan-delete'
+      delBtn.title = t('common.btn.delete')
+      delBtn.textContent = '×'
+      // The agents the rotation has on this plan; deleteClaudePlan adds the ones set to it in the agent editor.
+      const planUsers = Object.entries(state.activePlanByAgent || {}).filter(([, id]) => id === plan.id).map(([agent]) => agent)
+      delBtn.addEventListener('click', () => deleteClaudePlan(plan, planUsers))
+      actions.appendChild(delBtn)
+      row.appendChild(actions)
+
+      list.appendChild(row)
+    }
+  } catch {
+    list.innerHTML = `<p style="color:var(--danger);font-size:13px">${t('settings.error')}</p>`
+  }
+}
+
+
+async function renderProvidersContent(container) {
+  container.innerHTML = '<p style="padding:16px;color:var(--text-muted);font-size:13px">' + escapeHtml(t('common.loading')) + '</p>'
+  try {
+    const res = await fetch('api/custom-providers')
+    if (!res.ok) throw new Error('fetch failed')
+    const { providers } = await res.json()
+    buildProvidersUI(container, providers)
+  } catch {
+    container.innerHTML = '<p style="padding:16px;color:var(--danger);font-size:13px">' + escapeHtml(t('providers.load_error')) + '</p>'
+  }
+}
+
+function buildProvidersUI(container, providers) {
+  container.innerHTML = ''
+
+  const notice = document.createElement('p')
+  notice.style.cssText = 'font-size:12.5px;color:var(--text-muted);padding:12px 0 8px;line-height:1.5'
+  notice.textContent = t('providers.notice')
+  container.appendChild(notice)
+
+  if (providers.length > 0) {
+    const tableWrap = document.createElement('div')
+    tableWrap.style.cssText = 'overflow-x:auto;margin-bottom:16px'
+    const table = document.createElement('table')
+    table.style.cssText = 'width:100%;min-width:520px;border-collapse:collapse;font-size:13px'
+    table.innerHTML = `<thead><tr style="border-bottom:1px solid var(--border)">
+      <th style="text-align:left;padding:6px 8px">${escapeHtml(t('providers.col.name'))}</th>
+      <th style="text-align:left;padding:6px 8px">${escapeHtml(t('providers.col.base_url'))}</th>
+      <th style="text-align:left;padding:6px 8px">${escapeHtml(t('providers.col.auth'))}</th>
+      <th style="text-align:left;padding:6px 8px">${escapeHtml(t('providers.col.vault_key'))}</th>
+      <th style="text-align:left;padding:6px 8px">${escapeHtml(t('providers.col.used_by'))}</th>
+      <th style="padding:6px 8px"></th>
+    </tr></thead><tbody id="customProvidersTableBody"></tbody>`
+    tableWrap.appendChild(table)
+    container.appendChild(tableWrap)
+    const tbody = table.querySelector('#customProvidersTableBody')
+    for (const p of providers) {
+      const tr = document.createElement('tr')
+      tr.style.borderBottom = '1px solid var(--border)'
+      tr.innerHTML = `
+        <td style="padding:6px 8px;font-weight:500">${escapeHtml(p.label)}</td>
+        <td style="padding:6px 8px;font-family:monospace;font-size:12px;word-break:break-all">${escapeHtml(p.baseUrl)}</td>
+        <td style="padding:6px 8px">${escapeHtml(p.authHeader)}</td>
+        <td style="padding:6px 8px;font-family:monospace;font-size:12px">${p.vaultKey ? escapeHtml(p.vaultKey) : `<em style="color:var(--text-muted)">${escapeHtml(t('providers.none'))}</em>`}</td>
+        <td style="padding:6px 8px">${(p.usedBy || []).length ? escapeHtml(p.usedBy.join(', ')) : `<em style="color:var(--text-muted)">${escapeHtml(t('providers.none'))}</em>`}</td>
+        <td style="padding:6px 8px;text-align:right;white-space:nowrap">
+          <button class="btn-secondary btn-compact" data-provider-edit="${escapeHtml(p.id)}" style="margin-right:4px">${escapeHtml(t('common.btn.edit'))}</button>
+          <button class="btn-secondary btn-compact" style="color:var(--danger)" data-provider-delete="${escapeHtml(p.id)}">${escapeHtml(t('common.btn.delete'))}</button>
+        </td>`
+      tbody.appendChild(tr)
+    }
+    tbody.querySelectorAll('[data-provider-edit]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const id = btn.dataset.providerEdit
+        const p = providers.find(x => x.id === id)
+        if (p) openAddProviderModal(container, p)
+      })
+    })
+    tbody.querySelectorAll('[data-provider-delete]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const id = btn.dataset.providerDelete
+        const p = providers.find(x => x.id === id)
+        // An agent whose provider is gone no longer starts, so name the agents that use it.
+        const users = (p && p.usedBy) || []
+        let message = t('providers.confirm.delete', { name: (p && p.label) || id })
+        if (users.length) message += '\n\n' + t('providers.confirm.delete_used_by', { agents: users.map(n => `"${n}"`).join(', ') })
+        const confirmed = await confirmDialog({
+          title: t('providers.confirm.delete_title'),
+          message,
+          okLabel: t('providers.confirm.delete_ok'),
+          danger: true,
+        })
+        if (!confirmed) return
+        try {
+          const r = await fetch(`api/custom-providers/${encodeURIComponent(id)}`, { method: 'DELETE' })
+          if (!r.ok) {
+            const err = await r.json().catch(() => ({}))
+            showToast(err.error || t('providers.toast.delete_error'))
+            return
+          }
+          renderProvidersContent(container)
+          loadAvailableModels()
+        } catch { showToast(t('providers.toast.delete_error')) }
+      })
+    })
+  } else {
+    const empty = document.createElement('p')
+    empty.style.cssText = 'color:var(--text-muted);font-size:13px;padding:8px 0 16px'
+    empty.textContent = t('providers.empty')
+    container.appendChild(empty)
+  }
+
+  const addBtn = document.createElement('button')
+  addBtn.className = 'btn-primary btn-compact'
+  addBtn.textContent = '+ ' + t('providers.new_btn')
+  addBtn.addEventListener('click', () => openAddProviderModal(container))
+  container.appendChild(addBtn)
+}
+
+function openAddProviderModal(container, editProvider = null) {
+  const existing = document.getElementById('addProviderModal')
+  if (existing) existing.remove()
+
+  const isEdit = editProvider !== null
+  const v = (field) => isEdit ? escapeHtml(editProvider[field] || '') : ''
+
+  const overlay = document.createElement('div')
+  overlay.id = 'addProviderModal'
+  overlay.className = 'modal-overlay active'
+  overlay.innerHTML = `
+    <div class="modal" style="max-width:480px">
+      <div class="modal-header">
+        <h2>${escapeHtml(t(isEdit ? 'providers.modal.edit_title' : 'providers.modal.add_title'))}</h2>
+        <button class="modal-close" id="addProviderModalClose">&times;</button>
+      </div>
+      <div class="modal-body" style="display:flex;flex-direction:column;gap:12px">
+        <div class="form-group">
+          <label class="form-label">${escapeHtml(t('providers.field.label'))} *</label>
+          <input type="text" id="cpLabel" class="input" placeholder="${escapeHtml(t('providers.field.label_ph'))}" value="${v('label')}">
+        </div>
+        <div class="form-group">
+          <label class="form-label">${escapeHtml(t('providers.field.id'))} * <small style="color:var(--text-muted)">${escapeHtml(t('providers.field.id_chars'))}</small></label>
+          <input type="text" id="cpId" class="input" placeholder="${escapeHtml(t('providers.field.id_ph'))}" value="${v('id')}"${isEdit ? ' readonly style="opacity:0.6;cursor:not-allowed"' : ''}>
+          <small style="display:block;margin-top:4px;color:var(--text-muted);font-size:12px">${escapeHtml(t('providers.field.id_help'))}</small>
+        </div>
+        <div class="form-group">
+          <label class="form-label">${escapeHtml(t('providers.field.base_url'))} * <small style="color:var(--text-muted)">${escapeHtml(t('providers.field.base_url_hint'))}</small></label>
+          <input type="text" id="cpBaseUrl" class="input" placeholder="https://api.deepseek.com/anthropic" value="${v('baseUrl')}">
+        </div>
+        <div class="form-group">
+          <label class="form-label">${escapeHtml(t('providers.field.auth'))} *</label>
+          <select id="cpAuthHeader" class="input">
+            <option value="x-api-key"${isEdit && editProvider.authHeader === 'x-api-key' ? ' selected' : ''}>x-api-key (ANTHROPIC_API_KEY)</option>
+            <option value="Bearer"${isEdit && editProvider.authHeader === 'Bearer' ? ' selected' : ''}>Bearer (ANTHROPIC_AUTH_TOKEN)</option>
+            <option value="none"${isEdit && editProvider.authHeader === 'none' ? ' selected' : ''}>${escapeHtml(t('providers.field.auth_none'))}</option>
+          </select>
+        </div>
+        <div class="form-group" id="cpVaultKeyGroup"${isEdit && editProvider.authHeader === 'none' ? ' style="display:none"' : ''}>
+          <label class="form-label">${escapeHtml(t('providers.field.vault_key'))} *</label>
+          <input type="text" id="cpVaultKey" class="input" placeholder="${escapeHtml(t('providers.field.vault_key_ph'))}" value="${v('vaultKey')}">
+          <small style="display:block;margin-top:4px;color:var(--text-muted);font-size:12px">${escapeHtml(t('providers.field.vault_key_help'))}</small>
+        </div>
+        <p style="font-size:12px;color:var(--text-muted);background:var(--surface-hover);padding:10px;border-radius:6px;line-height:1.5">
+          ${escapeHtml(t('providers.modal.note'))}
+        </p>
+        <div style="display:flex;gap:8px;justify-content:flex-end">
+          <button class="btn-secondary" id="addProviderCancelBtn">${escapeHtml(t('common.btn.cancel'))}</button>
+          <button class="btn-primary" id="addProviderSaveBtn">${escapeHtml(t('common.btn.save'))}</button>
+        </div>
+      </div>
+    </div>`
+  document.body.appendChild(overlay)
+
+  const closeModal = () => overlay.remove()
+  overlay.querySelector('#addProviderModalClose').addEventListener('click', closeModal)
+  overlay.querySelector('#addProviderCancelBtn').addEventListener('click', closeModal)
+
+  overlay.querySelector('#cpAuthHeader').addEventListener('change', (e) => {
+    const vkGroup = overlay.querySelector('#cpVaultKeyGroup')
+    vkGroup.style.display = e.target.value === 'none' ? 'none' : ''
+  })
+
+  overlay.querySelector('#addProviderSaveBtn').addEventListener('click', async () => {
+    const id = overlay.querySelector('#cpId').value.trim()
+    const label = overlay.querySelector('#cpLabel').value.trim()
+    const baseUrl = overlay.querySelector('#cpBaseUrl').value.trim()
+    const authHeader = overlay.querySelector('#cpAuthHeader').value
+    const vaultKey = authHeader !== 'none' ? overlay.querySelector('#cpVaultKey').value.trim() : null
+    // Point at the first empty required field, in the form's order, as the add-server form does.
+    const missing = !label ? ['#cpLabel', 'providers.form.label_required']
+      : !id ? ['#cpId', 'providers.form.id_required']
+      : !baseUrl ? ['#cpBaseUrl', 'providers.form.base_url_required']
+      : (authHeader !== 'none' && !vaultKey) ? ['#cpVaultKey', 'providers.form.vault_key_required']
+      : null
+    if (missing) { overlay.querySelector(missing[0]).focus(); showToast(t(missing[1])); return }
+    try {
+      const r = await fetch('api/custom-providers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, label, baseUrl, authHeader, vaultKey }),
+      })
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}))
+        showToast(err.error || t('providers.toast.save_error'))
+        return
+      }
+      overlay.remove()
+      renderProvidersContent(container)
+      loadAvailableModels()
+    } catch { showToast(t('providers.toast.save_error')) }
+  })
+}
+
+// t() answers a missing key with the key itself, which is truthy, so a plain
+// `t(...) || def.description` never fell back and the row showed the raw
+// settings.desc.<KEY> (#2228). Compare with the key instead.
+function settingDescription(def) {
+  const key = 'settings.desc.' + def.key
+  const text = t(key)
+  return text === key ? (def.description || '') : text
 }
 
 function buildSettingRow(def) {
@@ -13741,7 +19271,7 @@ function buildSettingRow(def) {
 
   const desc = document.createElement('div')
   desc.className = 'settings-row-desc'
-  desc.textContent = t('settings.desc.' + def.key) || def.description
+  desc.textContent = settingDescription(def)
   info.appendChild(desc)
 
   const meta = document.createElement('div')
@@ -13753,8 +19283,18 @@ function buildSettingRow(def) {
   }
   if (def.type === 'color') metaParts.push(t('settings.meta.format') + ': #rrggbb')
   metaParts.push(t('settings.meta.default') + ': ' + def.default)
+  if (def.source === 'override') metaParts.push(t('settings.meta.overridden'))
   meta.textContent = metaParts.join(' · ')
   info.appendChild(meta)
+  // ENVRELAXGATE1104 step 2: a .env line for this security key is ignored (it would loosen it). The server sends a
+  // marker only, never the .env value.
+  if (def.envIgnored) {
+    const ignored = document.createElement('div')
+    ignored.className = 'settings-row-meta settings-env-ignored'
+    ignored.style.color = 'var(--warning, var(--text-muted))'
+    ignored.textContent = t('settings.meta.env_ignored')
+    info.appendChild(ignored)
+  }
 
   row.appendChild(info)
 
@@ -13808,8 +19348,256 @@ function buildSettingRow(def) {
   valueInput.addEventListener('input', () => markSettingDirty(def.key, valueInput, originalValue, def.type, errorEl))
   valueInput.addEventListener('change', () => markSettingDirty(def.key, valueInput, originalValue, def.type, errorEl))
 
+  // A value saved from this page is an override (config-overrides.json), and
+  // until now it could only be replaced, never removed. The button drops the
+  // override; the row is rebuilt from the answer so the input, the dirty
+  // tracking and the button itself all reflect the layer that answers now.
+  if (def.source === 'override') {
+    const resetBtn = document.createElement('button')
+    resetBtn.type = 'button'
+    resetBtn.className = 'btn-secondary btn-compact settings-reset-default-btn'
+    resetBtn.textContent = t('settings.btn.reset_default')
+    const preview = settingResetPreview(def)
+    resetBtn.title = t('settings.btn.reset_default_title') + ' ' + formatSettingValue(preview.from) + ' \u2192 ' + formatSettingValue(preview.to) + ' (' + preview.source + ')'
+    resetBtn.addEventListener('click', () => resetSettingToDefault(def, row, resetBtn, errorEl))
+    editor.insertBefore(resetBtn, errorEl)
+  }
+
+  row._settingDef = def
   row.appendChild(editor)
   return row
+}
+
+// Removes one saved override and rebuilds its row from the answer. Shared by
+// the row button and the per-tab button; reports instead of toasting so the
+// caller decides what to tell the operator.
+async function removeSettingOverride(row) {
+  const def = row._settingDef
+  const errorEl = row.querySelector('.settings-row-error')
+  if (errorEl) errorEl.textContent = ''
+  try {
+    const res = await fetch('api/settings/' + encodeURIComponent(def.key), { method: 'DELETE' })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) {
+      if (errorEl) errorEl.textContent = data.error || 'Hiba'
+      return { ok: false }
+    }
+    settingsDirty.delete(def.key)
+    row.replaceWith(buildSettingRow({ ...def, value: data.value, source: data.source, resetValue: data.value, resetSource: data.source }))
+    return { ok: true, source: data.source, requiresRestart: !!data.requiresRestart }
+  } catch {
+    if (errorEl) errorEl.textContent = 'Kapcsolati hiba'
+    return { ok: false }
+  }
+}
+
+async function resetSettingToDefault(def, row, btn, errorEl) {
+  // One row is confirmed the same way as a tab: the button used to reset at
+  // once, and the first sign of a wrong click could be a notification on the
+  // wrong channel.
+  if (!(await confirmSettingsReset([settingResetPreview(def)]))) return
+  btn.disabled = true
+  const group = row.closest('.settings-group')
+  const result = await removeSettingOverride(row)
+  if (!result.ok) {
+    btn.disabled = false
+    return
+  }
+  refreshSettingsGroupReset(group)
+  updateSettingsSaveBar()
+  loadClaudePlansReadiness()
+  const base = result.source === 'env' ? t('settings.toast.reset_env') : t('settings.toast.reset_default')
+  showToast(result.requiresRestart ? base + ' ' + t('settings.toast.reset_restart_suffix') : base)
+}
+
+// One button per tab: every overridden row of this group back to its default.
+// It changes several values at once, so it is confirmed, and the question
+// lists the keys -- the operator approves a named set, not "everything here".
+function overriddenSettingRows(group) {
+  return [...group.querySelectorAll('.settings-row')].filter((r) => r._settingDef && r._settingDef.source === 'override')
+}
+
+function buildSettingsGroupReset(group) {
+  const bar = document.createElement('div')
+  bar.className = 'settings-group-actions'
+  const btn = document.createElement('button')
+  btn.type = 'button'
+  btn.className = 'btn-secondary btn-compact settings-reset-tab-btn'
+  btn.addEventListener('click', () => resetSettingsGroupToDefault(group))
+  bar.appendChild(btn)
+  group.prepend(bar)
+  refreshSettingsGroupReset(group)
+}
+
+function refreshSettingsGroupReset(group) {
+  const btn = group ? group.querySelector('.settings-reset-tab-btn') : null
+  if (!btn) return
+  const count = overriddenSettingRows(group).length
+  btn.disabled = count === 0
+  btn.textContent = count === 0 ? t('settings.btn.reset_tab') : t('settings.btn.reset_tab') + ' (' + count + ')'
+  btn.title = count === 0 ? t('settings.btn.reset_tab_none') : t('settings.btn.reset_tab_title')
+}
+
+// What a row turns into when its override is removed, as the page knows it
+// from GET /api/settings: the value that answers without the override, and the
+// layer it comes from (.env or the registry default).
+function settingResetPreview(def) {
+  return {
+    key: def.key,
+    from: String(def.value),
+    to: String(def.resetValue !== undefined ? def.resetValue : def.default),
+    source: def.resetSource === 'env' ? t('settings.source.env') : t('settings.source.default'),
+    requiresRestart: !!def.requiresRestart,
+  }
+}
+
+function formatSettingValue(value) {
+  return value === '' ? t('settings.value.empty') : value
+}
+
+// The app's own confirmation dialog, in place of the native confirm(): that one
+// carries the host name as its title, cannot show a list as a list, and looks
+// the same for "stop" as for "delete". Resolves true only on the explicit
+// confirm button; Escape, the close button, the backdrop and Cancel all resolve
+// false, and Cancel has the focus, so Enter on a freshly opened dialog changes
+// nothing. `danger` styles the confirm button for an action that cannot be
+// undone or cuts running work. Every text goes in through textContent; extra
+// markup (`content`) is built by the caller from elements, never from HTML.
+function confirmDialog({ title, message, okLabel, danger = false, content = null, wide = false, bodyClass = '', cancelLabel = '' }) {
+  return new Promise((resolve) => {
+    // Where the focus was (the button that asked, usually), so it goes back there afterwards.
+    const previous = document.activeElement
+    const overlay = document.createElement('div')
+    overlay.className = 'modal-overlay active'
+    overlay.setAttribute('role', 'dialog')
+    overlay.setAttribute('aria-modal', 'true')
+
+    const modal = document.createElement('div')
+    modal.className = wide ? 'modal modal-wide' : 'modal'
+
+    const header = document.createElement('div')
+    header.className = 'modal-header'
+    const titleEl = document.createElement('h2')
+    titleEl.textContent = title
+    const closeBtn = document.createElement('button')
+    closeBtn.type = 'button'
+    closeBtn.className = 'modal-close'
+    closeBtn.textContent = '\u00d7'
+    header.append(titleEl, closeBtn)
+
+    const body = document.createElement('div')
+    body.className = 'modal-body confirm-dialog' + (bodyClass ? ' ' + bodyClass : '')
+    const messageEl = document.createElement('p')
+    messageEl.textContent = message
+    body.appendChild(messageEl)
+    if (content) body.appendChild(content)
+    const actions = document.createElement('div')
+    actions.className = 'confirm-dialog-actions'
+    const cancelBtn = document.createElement('button')
+    cancelBtn.type = 'button'
+    cancelBtn.className = 'btn-secondary'
+    cancelBtn.textContent = cancelLabel || t('common.cancel')
+    const okBtn = document.createElement('button')
+    okBtn.type = 'button'
+    okBtn.className = danger ? 'btn-danger' : 'btn-primary'
+    okBtn.textContent = okLabel
+    actions.append(cancelBtn, okBtn)
+    body.appendChild(actions)
+
+    modal.append(header, body)
+    overlay.appendChild(modal)
+
+    const finish = (answer) => {
+      document.removeEventListener('keydown', onKey)
+      overlay.remove()
+      if (previous && previous.isConnected && typeof previous.focus === 'function') previous.focus()
+      resolve(answer)
+    }
+    // Tab stays inside the dialog: from its last focusable element on to the first, and Shift+Tab
+    // back, so the focus cannot wander to the page behind the backdrop.
+    const focusables = () => [...modal.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')]
+      .filter((el) => !el.disabled && el.offsetParent !== null)
+    const onKey = (e) => {
+      if (e.key === 'Escape') { finish(false); return }
+      if (e.key !== 'Tab') return
+      const items = focusables()
+      if (!items.length) return
+      const first = items[0]
+      const last = items[items.length - 1]
+      const active = document.activeElement
+      const outside = !modal.contains(active)
+      if (e.shiftKey && (active === first || outside)) { e.preventDefault(); last.focus() }
+      else if (!e.shiftKey && (active === last || outside)) { e.preventDefault(); first.focus() }
+    }
+    document.addEventListener('keydown', onKey)
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) finish(false) })
+    closeBtn.addEventListener('click', () => finish(false))
+    cancelBtn.addEventListener('click', () => finish(false))
+    okBtn.addEventListener('click', () => finish(true))
+
+    document.body.appendChild(overlay)
+    cancelBtn.focus()
+  })
+}
+
+// The confirmation for a reset, per row and per tab. An override is often a
+// deliberate choice, and removing one can switch a safety setting back
+// (notifications on again, isolation off), so the dialog shows for every key
+// what the value is now, what it becomes and where that comes from -- the owner
+// approves a change, not a list of names.
+function confirmSettingsReset(items) {
+  const list = document.createElement('ul')
+  list.className = 'settings-reset-confirm-keys'
+  for (const item of items) {
+    const li = document.createElement('li')
+    const key = document.createElement('span')
+    key.className = 'settings-reset-confirm-key'
+    key.textContent = item.key
+    const change = document.createElement('span')
+    change.className = 'settings-reset-confirm-change'
+    change.textContent = formatSettingValue(item.from) + ' \u2192 ' + formatSettingValue(item.to) + ' (' + item.source + ')'
+    li.append(key, change)
+    if (item.requiresRestart) {
+      const restart = document.createElement('span')
+      restart.className = 'settings-restart-badge'
+      restart.textContent = t('settings.restart_badge')
+      li.appendChild(restart)
+    }
+    list.appendChild(li)
+  }
+  return confirmDialog({
+    title: t('settings.confirm.reset_tab_title'),
+    message: t('settings.confirm.reset_tab'),
+    okLabel: t('settings.confirm.reset_tab_ok'),
+    content: list,
+    wide: true,
+    bodyClass: 'settings-reset-confirm',
+  })
+}
+
+async function resetSettingsGroupToDefault(group) {
+  const rows = overriddenSettingRows(group)
+  if (rows.length === 0) return
+  if (!(await confirmSettingsReset(rows.map((r) => settingResetPreview(r._settingDef))))) return
+
+  const btn = group.querySelector('.settings-reset-tab-btn')
+  if (btn) btn.disabled = true
+  let failed = 0
+  let needsRestart = false
+  for (const row of rows) {
+    const result = await removeSettingOverride(row)
+    if (!result.ok) failed++
+    else if (result.requiresRestart) needsRestart = true
+  }
+  refreshSettingsGroupReset(group)
+  updateSettingsSaveBar()
+  loadClaudePlansReadiness()
+  if (failed) {
+    showToast(t('settings.toast.reset_tab_partial'), 6000)
+  } else {
+    const base = t('settings.toast.reset_tab')
+    showToast(needsRestart ? base + ' ' + t('settings.toast.reset_restart_suffix') : base)
+  }
 }
 
 async function saveAllSettings() {
@@ -13836,6 +19624,14 @@ async function saveAllSettings() {
       } else {
         input.dataset.originalValue = String(raw)
         if (data.requiresRestart) needsRestart = true
+        // The saved value is an override now: rebuild the row so it offers
+        // "reset to default" without a page reload.
+        const savedRow = input.closest('.settings-row')
+        if (savedRow && savedRow._settingDef) {
+          const rebuilt = buildSettingRow({ ...savedRow._settingDef, value: data.value ?? raw, source: 'override' })
+          savedRow.replaceWith(rebuilt)
+          refreshSettingsGroupReset(rebuilt.closest('.settings-group'))
+        }
       }
     } catch {
       errorEl.textContent = 'Kapcsolati hiba'
@@ -13850,6 +19646,9 @@ async function saveAllSettings() {
   updateSettingsSaveBar()
 
   if (btn) { btn.disabled = false; btn.textContent = t('settings.btn.save') }
+  // The rotation toggle lives on the Claude plans tab and changes its
+  // readiness banner (and turning it on seeds the heartbeat task server-side).
+  loadClaudePlansReadiness()
   if (errors.length) {
     showToast(t('settings.toast.partial_error'), 'error')
   } else {
@@ -13860,7 +19659,7 @@ async function saveAllSettings() {
 function resetAllSettings() {
   for (const [key, { input, originalValue }] of settingsDirty) {
     input.value = originalValue
-    const errorEl = document.querySelector(`[data-setting-key="${key}"]`)?.closest('.settings-row')?.querySelector('.settings-row-error')
+    const errorEl = document.querySelector(`[data-setting-key="${CSS.escape(String(key))}"]`)?.closest('.settings-row')?.querySelector('.settings-row-error')
     if (errorEl) errorEl.textContent = ''
   }
   settingsDirty.clear()
@@ -14011,11 +19810,20 @@ const TU_MODEL_PRICING = {
   'claude-opus-4-6':     { in: 5.0,   out: 25.0,  cw: 6.25,  cr: 0.50 },
   // Opus 4.0 / 4.1 -- the last generation still on the old Opus pricing.
   'claude-opus-4':       { in: 15.0,  out: 75.0,  cw: 18.75, cr: 1.50 },
+  // Sonnet 5.5: 2 / 10, from the official models overview (2026-09-28).
+  'claude-sonnet-5-5':   { in: 2.0,   out: 10.0,  cw: 2.50,  cr: 0.20 },
   'claude-sonnet-5':     TU_SONNET5_PRICE,
   'claude-sonnet-4-6':   { in: 3.0,   out: 15.0,  cw: 3.75,  cr: 0.30 },
   'claude-sonnet-4-5':   { in: 3.0,   out: 15.0,  cw: 3.75,  cr: 0.30 },
   'claude-fable-5':      { in: 10.0,  out: 50.0,  cw: 12.50, cr: 1.00 },
+  // Fable 5.2: official pricing page, read 2026-11-09 (FABLE52SELECTOR1109): $8 in, $40 out, $10 5m cache write, $0.20 cache hit.
+  'claude-fable-5-2':    { in: 8.0,   out: 40.0,  cw: 10.00, cr: 0.20 },
   'claude-mythos-5':     { in: 10.0,  out: 50.0,  cw: 12.50, cr: 1.00 },
+  // Haiku 5.5, from the official pricing page (2026-10-08): prompts up to 100k
+  // tokens 0.10 / 0.50 (5m cache write 0.125, hit 0.01); prompts over 100k
+  // tokens 0.50 / 2.50. This table holds one price per model, so the <=100k
+  // tier is used and spend on >100k prompts is understated.
+  'claude-haiku-5-5':    { in: 0.10,  out: 0.50,  cw: 0.125, cr: 0.01 },
   'claude-haiku-4-5':    { in: 1.0,   out: 5.0,   cw: 1.25,  cr: 0.10 },
   default:               { in: 3.0,   out: 15.0,  cw: 3.75,  cr: 0.30 },
 }
@@ -14056,8 +19864,63 @@ const TU_MODEL_COLORS = ['#6366f1','#06b6d4','#f59e0b','#22c55e','#ef4444','#8b5
 
 function tuGetModelColor(idx) { return TU_MODEL_COLORS[idx % TU_MODEL_COLORS.length] }
 
+// Agents missing from TU_COLORS used to share the '#64748b' fallback, so on a
+// fleet whose agent names are not in the map every agent except the main one
+// rendered in the same grey and the stacked timeline could not show who used
+// what. Unlisted agents now get a distinct colour from this palette.
+//
+// The palette is disjoint from EVERY TU_COLORS value and from the chart's own
+// line colours, not only from the listed agents present in the current load:
+// the summary depends on the selected period, so a listed agent can appear
+// after a period switch, and a palette colour it shares would then belong to
+// two agents at once (review on #1646: 'geri' got #f59e0b on 1h, 'codi' showed
+// up with the same colour on 7d).
+const TU_RESERVED_COLORS = [
+  '#06b6d4', // 5h window line
+  '#8b5cf6', // weekly window line
+  '#3b82f6', // 5h reset marker
+  '#f59e0b', // day marker
+  '#ef4444', // week marker
+  '#64748b', // legacy grey fallback
+]
+const TU_EXTRA_PALETTE = [
+  '#f97316', '#84cc16', '#0ea5e9', '#d946ef', '#14b8a6', '#eab308',
+  '#78716c', '#be123c', '#a16207', '#15803d', '#1d4ed8', '#c2410c',
+  '#4d7c0f', '#7f1d1d', '#fb7185', '#92400e',
+]
+const tuAssignedColors = {}
+let tuGeneratedCount = 0
+
+// Past the palette, a generated hue instead of the grey: golden-angle steps
+// keep consecutive agents far apart on the wheel. Returned as an hsl() string,
+// which canvas and CSS both accept and which never equals a hex palette entry.
+function tuGeneratedColor(n) {
+  return `hsl(${Math.round((n * 137.508 + 20) % 360)}, 62%, 46%)`
+}
+
+// Called with the agent list of each summary load. Assignment is alphabetical
+// over the agents not yet coloured, so the same fleet gets the same colours on
+// every page load, and an agent keeps its colour for the life of the page even
+// if a later filter hides the others.
+function tuAssignColors(agents) {
+  const used = new Set([
+    ...Object.values(TU_COLORS),
+    ...TU_RESERVED_COLORS,
+    ...Object.values(tuAssignedColors),
+  ])
+  const pending = [...new Set(agents)]
+    .filter((a) => !TU_COLORS[a] && !tuAssignedColors[a])
+    .sort()
+  for (const a of pending) {
+    const free = TU_EXTRA_PALETTE.find((c) => !used.has(c))
+    const colour = free || tuGeneratedColor(tuGeneratedCount++)
+    tuAssignedColors[a] = colour
+    used.add(colour)
+  }
+}
+
 function tuGetColor(agent) {
-  return TU_COLORS[agent] || '#64748b'
+  return TU_COLORS[agent] || tuAssignedColors[agent] || '#64748b'
 }
 
 function tuMcpServerFromTool(toolName) {
@@ -14109,6 +19972,7 @@ async function loadTokenUsage() {
     const bTotal = (b.totalInput || 0) + (b.totalCacheRead || 0) + (b.totalCacheCreation || 0)
     return bTotal - aTotal
   })
+  tuAssignColors(summary.map((s) => s.agent))
   renderTuSummary(summary)
 
   const agentSelect = document.getElementById('tuAgent')
@@ -14549,7 +20413,7 @@ function renderTuTimeline(data, filterAgent) {
       let html = `<div style="font-weight:600;margin-bottom:4px">${tuFormatLocalShort(hit.bucket)}${isPeak ? ` <span style="color:#ef4444;font-size:10px">${t('tokenUsage.chart.peak')}</span>` : ''}</div>`
       let total = 0
       for (const seg of hit.segments) {
-        html += `<div><span style="color:${tuGetColor(seg.agent)}">&#9632;</span> ${seg.agent}: ${tuFormatTokens(seg.val)}</div>`
+        html += `<div><span style="color:${tuGetColor(seg.agent)}">&#9632;</span> ${escapeHtml(seg.agent)}: ${tuFormatTokens(seg.val)}</div>`
         total += seg.val
       }
       if (hit.segments.length > 1) html += `<div style="border-top:1px solid rgba(255,255,255,0.2);margin-top:4px;padding-top:4px;font-weight:600">${t('tokenUsage.total')} ${tuFormatTokens(total)}</div>`
@@ -14665,7 +20529,12 @@ function renderTuDetailsTable() {
     const totalIn = (d.input_tokens || 0) + (d.cache_read_tokens || 0) + (d.cache_creation_tokens || 0)
     const timeStr = tuFormatLocalDate(d.timestamp)
     const preview = d.content_preview ? d.content_preview.slice(0, 80) + (d.content_preview.length > 80 ? '...' : '') : ''
-    const taskInfo = d.task_title ? `<span style="color:var(--text-secondary);font-size:11px"> [${escapeHtml(d.task_title)}]</span>` : ''
+    // DBSIZE1111: the card comes from the agent's in_progress windows at read time (taskCards). Two or more
+    // overlapping cards are all shown, none is picked: the call itself does not say which one it was for.
+    const cards = Array.isArray(d.taskCards) ? d.taskCards : []
+    const taskInfo = cards.length
+      ? `<span style="color:var(--text-secondary);font-size:11px"${cards.length > 1 ? ` title="${escapeHtml(t('tokenUsage.cards_overlap', { n: cards.length }))}"` : ''}> [${cards.map(c => escapeHtml(c.title)).join(' / ')}]</span>`
+      : ''
     return `<tr>
       <td style="white-space:nowrap">${timeStr}</td>
       <td><span style="color:${tuGetColor(d.agent)};font-weight:600">${escapeHtml(d.agent)}</span>${taskInfo}</td>
@@ -14943,8 +20812,178 @@ let ideasAll = []
 let ideasPromoteId = null
 let ideaEditId = null
 let ideaDetailId = null
+const IDEA_SCOPE_STORAGE_KEY = 'ideas-scope-filter'
+let ideaScope = (() => {
+  try {
+    const saved = localStorage.getItem(IDEA_SCOPE_STORAGE_KEY)
+    return ['munka', 'szemelyes', 'all'].includes(saved) ? saved : 'munka'
+  } catch { return 'munka' }
+})()
 const STATUS_COLORS = { new: 'var(--accent)', reviewed: '#f59e0b', kanban: '#22c55e', rejected: '#ef4444' }
 const STATUS_LABELS = { new: () => t('ideas.status.new'), reviewed: () => t('ideas.status.reviewed'), kanban: () => t('ideas.status.kanban'), rejected: () => t('ideas.status.rejected') }
+
+// ============================================================
+// === Team notes ("Jegyzetek") ===
+// ============================================================
+// The team's small follow-ups, kept off the kanban board. Rows come from
+// /api/notes (active, sorted by due date) and ?include_deleted=1 for the
+// last-7-days deleted section. Deletion is soft on the server.
+
+let notesAssigneesLoaded = false
+
+function notesLocalToday() {
+  // The viewer's local date (the browser's timezone), not UTC.
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+function notesFmtTs(unix) {
+  if (!unix) return ''
+  const locale = (window._lang || 'hu') === 'en' ? 'en-GB' : 'hu-HU'
+  return new Date(unix * 1000).toLocaleString(locale, { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+function notesAssigneeLabel(name) {
+  if (name === 'mindenki') return t('notes.assignee.mindenki')
+  if (name === 'gazda') return t('notes.assignee.gazda')
+  return name
+}
+
+async function loadNotesAssignees() {
+  const sel = document.getElementById('notesAssignee')
+  if (!sel) return
+  let names = []
+  let loaded = false
+  try {
+    const r = await fetch('api/agents')
+    if (r.ok) {
+      const list = await r.json()
+      if (Array.isArray(list)) { names = list.map((a) => a && a.name).filter(Boolean); loaded = true }
+    }
+  } catch { /* the fixed entries below are enough to keep the form usable */ }
+  // Stored assignees are lower-case (the server lower-cases them too).
+  const main = mainAgentId().toLowerCase()
+  const fixed = ['mindenki', 'gazda', main]
+  const all = [...fixed, ...[...new Set(names.map((n) => String(n).toLowerCase()))].filter((n) => !fixed.includes(n)).sort()]
+  const prev = sel.value
+  sel.innerHTML = all.map((n) => `<option value="${escapeHtml(n)}">${escapeHtml(notesAssigneeLabel(n))}</option>`).join('')
+  if (prev && all.includes(prev)) sel.value = prev
+  // Only a real agent list counts as loaded: after a failed request the next
+  // visit tries again instead of keeping the fallback list for the session.
+  notesAssigneesLoaded = loaded
+}
+
+async function loadNotesPage() {
+  // The author (kanbanMoveActor) and the assignee list (mainAgentId) both read
+  // window._marveen, which only some pages fill: resolve it first, or a
+  // token-authenticated first add/delete goes out without a name and gets a 400.
+  await ensureMarveenLoaded()
+  wireNotesPage()
+  if (!notesAssigneesLoaded) loadNotesAssignees()
+  // A language switch since the options were drawn: relabel them in place.
+  document.querySelectorAll('#notesAssignee option').forEach((o) => { o.textContent = notesAssigneeLabel(o.value) })
+  const tbody = document.getElementById('notesTbody')
+  const delTbody = document.getElementById('notesDeletedTbody')
+  let rows = []
+  try {
+    const r = await fetch('api/notes?include_deleted=1')
+    if (!r.ok) throw new Error(`HTTP ${r.status}`)
+    rows = await r.json()
+  } catch (err) {
+    if (tbody) tbody.innerHTML = `<tr><td colspan="5" class="notes-empty">${escapeHtml(t('notes.load_error', { msg: String(err.message || err) }))}</td></tr>`
+    return
+  }
+  const active = rows.filter((n) => n.deleted_at == null)
+  const deleted = rows.filter((n) => n.deleted_at != null).sort((a, b) => b.deleted_at - a.deleted_at)
+  const today = notesLocalToday()
+
+  if (tbody) {
+    tbody.innerHTML = active.length ? active.map((n) => {
+      const overdue = n.due_date && n.due_date < today
+      const dueToday = n.due_date === today
+      const cls = overdue ? 'notes-row-overdue' : dueToday ? 'notes-row-today' : ''
+      const dueLabel = n.due_date
+        ? escapeHtml(n.due_date) + (overdue ? ` <span class="notes-due-tag">${escapeHtml(t('notes.overdue'))}</span>` : dueToday ? ` <span class="notes-due-tag">${escapeHtml(t('notes.today'))}</span>` : '')
+        : '<span class="notes-muted">-</span>'
+      return `<tr class="${cls}">
+        <td data-label="${escapeHtml(t('notes.col.assignee'))}" class="notes-assignee">${escapeHtml(notesAssigneeLabel(n.assignee))}</td>
+        <td data-label="${escapeHtml(t('notes.col.content'))}" class="notes-content">${escapeHtml(n.content)}</td>
+        <td data-label="${escapeHtml(t('notes.col.created'))}" class="notes-muted">${escapeHtml(notesFmtTs(n.created_at))} · ${escapeHtml(n.created_by)}</td>
+        <td data-label="${escapeHtml(t('notes.col.due'))}">${dueLabel}</td>
+        <td class="notes-actions"><button class="btn-secondary btn-compact" data-note-done="${escapeHtml(n.id)}">${escapeHtml(t('notes.btn.done'))}</button></td>
+      </tr>`
+    }).join('') : `<tr><td colspan="5" class="notes-empty">${escapeHtml(t('notes.empty'))}</td></tr>`
+  }
+
+  if (delTbody) {
+    delTbody.innerHTML = deleted.length ? deleted.map((n) => `<tr>
+        <td data-label="${escapeHtml(t('notes.col.assignee'))}">${escapeHtml(notesAssigneeLabel(n.assignee))}</td>
+        <td data-label="${escapeHtml(t('notes.col.content'))}" class="notes-content">${escapeHtml(n.content)}</td>
+        <td data-label="${escapeHtml(t('notes.deleted.col_when'))}" class="notes-muted">${escapeHtml(notesFmtTs(n.deleted_at))}</td>
+        <td data-label="${escapeHtml(t('notes.deleted.col_by'))}">${escapeHtml(n.deleted_by || '')}</td>
+        <td data-label="${escapeHtml(t('notes.deleted.col_reason'))}" class="notes-muted">${escapeHtml(n.delete_reason || '-')}</td>
+      </tr>`).join('') : `<tr><td colspan="5" class="notes-empty">${escapeHtml(t('notes.deleted.empty'))}</td></tr>`
+  }
+  const summary = document.querySelector('#notesDeleted > summary')
+  if (summary) summary.textContent = t('notes.deleted.title_n', { n: deleted.length })
+}
+
+let notesPageWired = false
+function wireNotesPage() {
+  if (notesPageWired) return
+  notesPageWired = true
+  document.getElementById('notesForm')?.addEventListener('submit', async (e) => {
+    e.preventDefault()
+    const assignee = document.getElementById('notesAssignee')?.value || ''
+    const contentEl = document.getElementById('notesContent')
+    const dueEl = document.getElementById('notesDue')
+    const content = (contentEl?.value || '').trim()
+    if (!content) { contentEl?.focus(); return }
+    await ensureMarveenLoaded()
+    // The author is the owner from the page config, as for the board's moves
+    // (kanbanMoveActor). A login session or device key overrides it on the
+    // server with the name of whoever is actually signed in.
+    const body = { assignee, content, created_by: kanbanMoveActor() }
+    if (dueEl?.value) body.due_date = dueEl.value
+    const btn = document.getElementById('notesAddBtn')
+    if (btn) btn.disabled = true
+    try {
+      const r = await fetch('api/notes', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`)
+      if (contentEl) contentEl.value = ''
+      if (dueEl) dueEl.value = ''
+      showToast(t('notes.toast.added'))
+      loadNotesPage()
+    } catch (err) {
+      showToast(t('notes.toast.error', { msg: String(err.message || err) }))
+    } finally {
+      if (btn) btn.disabled = false
+    }
+  })
+  document.getElementById('notesTbody')?.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-note-done]')
+    if (!btn) return
+    const reason = window.prompt(t('notes.prompt.reason'), '')
+    if (reason === null) return // cancelled
+    btn.disabled = true
+    await ensureMarveenLoaded()
+    try {
+      const r = await fetch(`api/notes/${encodeURIComponent(btn.dataset.noteDone)}`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ by: kanbanMoveActor(), reason: reason.trim() || null }),
+      })
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`)
+      showToast(t('notes.toast.deleted'))
+      loadNotesPage()
+    } catch (err) {
+      btn.disabled = false
+      showToast(t('notes.toast.error', { msg: String(err.message || err) }))
+    }
+  })
+}
 
 async function loadIdeasPage() {
   const statusFilter = document.getElementById('ideaStatusFilter')?.value ?? 'active'
@@ -14955,6 +20994,7 @@ async function loadIdeasPage() {
   // first promote the "Kanbanban" box showed 0 with the item hidden, which read
   // as data loss on the first live promote (2026-08-20).
   if (categoryFilter) params.set('category', categoryFilter)
+  if (ideaScope !== 'all') params.set('scope', ideaScope)
   const [ideasRes, catsRes] = await Promise.all([fetch('api/ideas?' + params), fetch('api/ideas/categories')])
   ideasAll = await ideasRes.json()
   if (statusFilter === 'active') ideas = ideasAll.filter(i => i.status === 'new' || i.status === 'reviewed')
@@ -14968,7 +21008,48 @@ async function loadIdeasPage() {
   }
   renderIdeasStats()
   renderIdeasList()
+  document.querySelectorAll('#ideaScopeFilter [data-scope]').forEach(button => button.classList.toggle('active', button.dataset.scope === ideaScope))
 }
+
+document.getElementById('ideaUploadInput')?.addEventListener('change', async (event) => {
+  const input = event.target
+  const files = Array.from(input.files || [])
+  const button = document.getElementById('ideaUploadBtn')
+  let uploaded = 0
+  const failures = []
+  input.disabled = true
+  button.disabled = true
+  try {
+    for (const file of files) {
+      button.textContent = t('ideas.upload.uploading', { name: file.name })
+      const form = new FormData()
+      form.append('file', file)
+      form.append('scope', ideaScope === 'all' ? 'munka' : ideaScope)
+      try {
+        const res = await fetch('api/ideas/upload', { method: 'POST', body: form })
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}))
+          throw new Error(data.error || t('ideas.upload.error'))
+        }
+        uploaded++
+      } catch (err) {
+        failures.push(`${file.name}: ${err.message || t('ideas.upload.error')}`)
+      }
+    }
+    if (files.length) {
+      const summary = t('ideas.upload.summary', { uploaded, failed: failures.length })
+      showToast(failures.length ? `${summary} (${failures.join('; ')})` : summary, failures.length ? 'error' : undefined)
+      await loadIdeasPage()
+    }
+  } finally {
+    input.value = ''
+    input.disabled = false
+    button.disabled = false
+    button.textContent = t('ideas.upload.button')
+  }
+})
+
+document.getElementById('ideaUploadBtn')?.addEventListener('click', () => document.getElementById('ideaUploadInput')?.click())
 
 function renderIdeasStats() {
   const counts = { new: 0, reviewed: 0, kanban: 0, rejected: 0 }
@@ -15003,7 +21084,7 @@ function ideaScoreBadge(idea) {
   if (!idea.impact || !idea.effort) return ''
   const score = idea.impact - idea.effort
   const color = score > 0 ? '#22c55e' : score < 0 ? '#ef4444' : 'var(--text-muted)'
-  return `<span style="font-size:11px;color:${color};border:1px solid ${color};border-radius:4px;padding:2px 5px" title="Impact ${idea.impact} - Effort ${idea.effort}">I${idea.impact}·E${idea.effort}</span>`
+  return `<span style="font-size:11px;color:${color};border:1px solid ${color};border-radius:4px;padding:2px 5px" title="Impact ${escapeHtml(idea.impact)} - Effort ${escapeHtml(idea.effort)}">I${escapeHtml(idea.impact)}·E${escapeHtml(idea.effort)}</span>`
 }
 
 function renderIdeaCard(idea) {
@@ -15015,20 +21096,20 @@ function renderIdeaCard(idea) {
     <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px">
       <div style="flex:1;min-width:0">
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-          <span class="idea-title-link" style="font-weight:600;font-size:14px;cursor:pointer" onclick="openIdeaDetail('${idea.id}')">${escapeHtml(idea.title)}</span>
-          <span style="font-size:11px;color:${statusColor};padding:2px 6px;border:1px solid ${statusColor};border-radius:4px">${statusLabel}</span>
+          <span class="idea-title-link" style="font-weight:600;font-size:14px;cursor:pointer" onclick="openIdeaDetail(${jsArg(idea.id)})">${escapeHtml(idea.title)}</span>
+          <span style="font-size:11px;color:${statusColor};padding:2px 6px;border:1px solid ${statusColor};border-radius:4px">${escapeHtml(statusLabel)}</span>
           ${ideaScoreBadge(idea)}
           ${staleBadge}
         </div>
         ${desc}
       </div>
       <div style="display:flex;gap:4px;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end">
-        ${idea.status !== 'reviewed' && idea.status !== 'kanban' ? `<button class="btn-secondary btn-compact" onclick="setIdeaStatus('${idea.id}','reviewed')" style="font-size:11px">${t('ideas.btn.reviewed')}</button>` : ''}
-        ${idea.status !== 'rejected' ? `<button class="btn-secondary btn-compact" onclick="setIdeaStatus('${idea.id}','rejected')" style="font-size:11px;color:#ef4444">${t('ideas.btn.rejected')}</button>` : ''}
-        ${idea.status === 'reviewed' || idea.status === 'rejected' ? `<button class="btn-secondary btn-compact" onclick="setIdeaStatus('${idea.id}','new')" style="font-size:11px">${t('ideas.btn.reopen')}</button>` : ''}
-        <button class="btn-secondary btn-compact" onclick="openIdeaEdit('${idea.id}')" style="font-size:11px">${t('ideas.btn.edit')}</button>
-        ${idea.status !== 'kanban' && idea.status !== 'rejected' ? `<button class="btn-primary btn-compact" onclick="openIdeaBreakdown('${idea.id}')" style="font-size:11px">${t('ideas.btn.kanban_ai')}</button>` : ''}
-        <button class="btn-secondary btn-compact" onclick="deleteIdeaItem('${idea.id}')" style="font-size:11px;color:#ef4444">${t('ideas.btn.delete')}</button>
+        ${idea.status !== 'reviewed' && idea.status !== 'kanban' ? `<button class="btn-secondary btn-compact" onclick="setIdeaStatus(${jsArg(idea.id)},'reviewed')" style="font-size:11px">${t('ideas.btn.reviewed')}</button>` : ''}
+        ${idea.status !== 'rejected' ? `<button class="btn-secondary btn-compact" onclick="setIdeaStatus(${jsArg(idea.id)},'rejected')" style="font-size:11px;color:#ef4444">${t('ideas.btn.rejected')}</button>` : ''}
+        ${idea.status === 'reviewed' || idea.status === 'rejected' ? `<button class="btn-secondary btn-compact" onclick="setIdeaStatus(${jsArg(idea.id)},'new')" style="font-size:11px">${t('ideas.btn.reopen')}</button>` : ''}
+        <button class="btn-secondary btn-compact" onclick="openIdeaEdit(${jsArg(idea.id)})" style="font-size:11px">${t('ideas.btn.edit')}</button>
+        ${idea.status !== 'kanban' && idea.status !== 'rejected' ? `<button class="btn-primary btn-compact" onclick="openIdeaBreakdown(${jsArg(idea.id)})" style="font-size:11px">${t('ideas.btn.kanban_ai')}</button>` : ''}
+        <button class="btn-secondary btn-compact" onclick="deleteIdeaItem(${jsArg(idea.id)})" style="font-size:11px;color:#ef4444">${t('ideas.btn.delete')}</button>
       </div>
     </div>
   </div>`
@@ -15036,7 +21117,7 @@ function renderIdeaCard(idea) {
 
 function applyIdeaModalI18n() {
   const labels = document.querySelectorAll('#ideaModalOverlay .form-label')
-  const keys = ['ideas.modal.title_label', 'ideas.modal.desc_label', 'ideas.modal.category_label', 'ideas.modal.impact_label', 'ideas.modal.effort_label']
+  const keys = ['ideas.modal.title_label', 'ideas.modal.desc_label', 'ideas.scope.label', 'ideas.modal.category_label', 'ideas.modal.impact_label', 'ideas.modal.effort_label']
   labels.forEach((el, i) => { if (keys[i]) el.textContent = t(keys[i]) })
   const saveBtn = document.getElementById('ideaModalSave')
   const cancelBtn = document.getElementById('ideaModalCancel')
@@ -15049,6 +21130,7 @@ function openIdeaNew() {
   document.getElementById('ideaModalTitle').textContent = t('ideas.modal.title_new')
   document.getElementById('ideaTitleInput').value = ''
   document.getElementById('ideaDescInput').value = ''
+  document.getElementById('ideaScopeInput').value = ideaScope === 'all' ? 'munka' : ideaScope
   applyIdeaModalI18n()
   openModal(document.getElementById('ideaModalOverlay'))
 }
@@ -15061,6 +21143,7 @@ function openIdeaEdit(id) {
   document.getElementById('ideaTitleInput').value = idea.title
   document.getElementById('ideaDescInput').value = idea.description || ''
   document.getElementById('ideaCategoryInput').value = idea.category
+  document.getElementById('ideaScopeInput').value = idea.scope
   document.getElementById('ideaImpactInput').value = idea.impact ?? ''
   document.getElementById('ideaEffortInput').value = idea.effort ?? ''
   openModal(document.getElementById('ideaModalOverlay'))
@@ -15068,29 +21151,51 @@ function openIdeaEdit(id) {
 
 async function saveIdea() {
   const title = document.getElementById('ideaTitleInput').value.trim()
-  if (!title) { showToast(t('common.title') + ' ' + t('common.error'), 'error'); return }
+  if (!title) { document.getElementById('ideaTitleInput').focus(); showToast(t('ideas.form.title_required'), 'error'); return }
   const impactRaw = document.getElementById('ideaImpactInput').value
   const effortRaw = document.getElementById('ideaEffortInput').value
   const body = {
     title,
     description: document.getElementById('ideaDescInput').value.trim() || undefined,
     category: document.getElementById('ideaCategoryInput').value,
+    scope: document.getElementById('ideaScopeInput').value,
     source: 'manual',
     impact: impactRaw ? parseInt(impactRaw) : null,
     effort: effortRaw ? parseInt(effortRaw) : null,
   }
-  if (ideaEditId) {
-    await fetch(`api/ideas/${ideaEditId}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-  } else {
-    await fetch('api/ideas', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body, status: 'new' }) })
-  }
+  // A failed save keeps the modal open with what was typed, and says so.
+  try {
+    const res = ideaEditId
+      ? await fetch(`api/ideas/${encodeURIComponent(ideaEditId)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      : await fetch('api/ideas', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body, status: 'new' }) })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      showToast(err.error || t('ideas.toast.save_error'), 'error')
+      return
+    }
+  } catch { showToast(t('ideas.toast.save_error'), 'error'); return }
   closeModal(document.getElementById('ideaModalOverlay'))
   loadIdeasPage()
 }
 
 async function deleteIdeaItem(id) {
-  if (!confirm(t('kanban.confirm.delete'))) return
-  await fetch(`api/ideas/${id}`, { method: 'DELETE' })
+  const idea = ideasAll.find(i => i.id === id) || ideas.find(i => i.id === id)
+  // The server deletes the idea's attachments (and their files) and its comments with it, so say so.
+  const confirmed = await confirmDialog({
+    title: t('ideas.confirm.delete_title'),
+    message: t('ideas.confirm.delete', { title: (idea && idea.title) || id }) + '\n\n' + t('ideas.confirm.delete_children'),
+    okLabel: t('ideas.confirm.delete_ok'),
+    danger: true,
+  })
+  if (!confirmed) return
+  try {
+    const res = await fetch(`api/ideas/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      showToast(err.error || t('ideas.toast.delete_error'), 'error')
+      return
+    }
+  } catch { showToast(t('ideas.toast.delete_error'), 'error'); return }
   loadIdeasPage()
 }
 
@@ -15100,17 +21205,102 @@ async function openIdeaDetail(id) {
   const idea = ideas.find(i => i.id === id)
   if (!idea) return
   ideaDetailId = id
-  const statusLabel = STATUS_LABELS[idea.status] || idea.status
+  // STATUS_LABELS holds functions (the language can change): call it, as the list does.
+  const statusLabelFn = STATUS_LABELS[idea.status]
+  const statusLabel = typeof statusLabelFn === 'function' ? statusLabelFn() : (statusLabelFn || idea.status)
   document.getElementById('ideaDetailTitle').textContent = idea.title
   document.getElementById('ideaDetailMeta').textContent = `${idea.category} · ${statusLabel}`
   document.getElementById('ideaDetailDesc').textContent = idea.description || t('ideas.no_description')
+  const otherScope = idea.scope === 'munka' ? 'szemelyes' : 'munka'
+  document.getElementById('ideaDetailScope').textContent = t('ideas.scope.current', { scope: t(`ideas.scope.${idea.scope}`) })
+  document.getElementById('ideaDetailScopeMove').textContent = t('ideas.scope.move', { scope: t(`ideas.scope.${otherScope}`) })
+  document.getElementById('ideaDetailScopeMove').dataset.scope = otherScope
   document.getElementById('ideaDetailImpact').value = idea.impact ?? ''
   document.getElementById('ideaDetailEffort').value = idea.effort ?? ''
   updateDetailScoreChip()
   document.getElementById('ideaCommentsList').innerHTML = ''
+  document.getElementById('ideaAttachmentsList').innerHTML = ''
+  document.getElementById('ideaAttachmentStatus').style.display = 'none'
   document.getElementById('ideaCommentContent').value = ''
   openModal(document.getElementById('ideaDetailOverlay'))
-  await loadIdeaComments(id)
+  await Promise.all([loadIdeaComments(id), loadIdeaAttachments(id)])
+}
+
+function formatIdeaAttachmentSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+async function loadIdeaAttachments(id) {
+  const list = document.getElementById('ideaAttachmentsList')
+  try {
+    const res = await fetch(`api/ideas/${encodeURIComponent(id)}/attachments`)
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    const data = await res.json()
+    if (!data.attachments || !data.attachments.length) {
+      list.innerHTML = `<div style="color:var(--text-muted);font-size:12px;padding:3px 0">${t('ideas.detail.attach.empty')}</div>`
+      return
+    }
+    list.innerHTML = data.attachments.map(a => `
+      <div style="display:flex;align-items:center;gap:8px;padding:5px 0;border-top:1px solid var(--border)">
+        <div style="flex:1;min-width:0">
+          <div style="font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(a.filename)}">${escapeHtml(a.filename)}</div>
+          <div style="font-size:11px;color:var(--text-muted)">${formatIdeaAttachmentSize(a.size)}${a.has_text ? ` · <span title="${t('ideas.detail.attach.has_text')}" style="color:var(--success)">✓ ${t('ideas.detail.attach.text_marker')}</span>` : ''}</div>
+        </div>
+        <a class="btn-secondary btn-compact" style="font-size:11px;text-decoration:none" href="api/ideas/attachments/${encodeURIComponent(a.id)}/download">${t('ideas.detail.attach.download')}</a>
+        <button class="btn-secondary btn-compact" style="font-size:11px;color:var(--danger)" onclick="deleteIdeaAttachmentItem(${jsArg(encodeURIComponent(a.id))}, ${jsArg(a.filename)})">${t('ideas.detail.attach.delete')}</button>
+      </div>`).join('')
+  } catch {
+    list.innerHTML = `<div style="color:var(--danger);font-size:12px">${t('ideas.detail.attach.load_error')}</div>`
+  }
+}
+
+document.getElementById('ideaAttachmentInput')?.addEventListener('change', async (event) => {
+  if (!ideaDetailId) return
+  const input = event.target
+  const files = Array.from(input.files || [])
+  const label = document.getElementById('ideaAttachmentUploadLabel')
+  const status = document.getElementById('ideaAttachmentStatus')
+  input.disabled = true
+  label.style.opacity = '0.6'
+  status.style.display = ''
+  try {
+    for (const file of files) {
+      status.textContent = t('ideas.detail.attach.uploading', { name: file.name })
+      const form = new FormData()
+      form.append('file', file)
+      const res = await fetch(`api/ideas/${encodeURIComponent(ideaDetailId)}/attachments`, { method: 'POST', body: form })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.error || t('ideas.detail.attach.upload_error'))
+      }
+    }
+    if (files.length) showToast(t('ideas.detail.attach.uploaded'))
+    await loadIdeaAttachments(ideaDetailId)
+  } catch (err) {
+    showToast(err.message || t('ideas.detail.attach.upload_error'), 'error')
+  } finally {
+    input.value = ''
+    input.disabled = false
+    label.style.opacity = ''
+    status.style.display = 'none'
+  }
+})
+
+async function deleteIdeaAttachmentItem(encodedId, filename) {
+  const confirmed = await confirmDialog({
+    title: t('ideas.detail.attach.confirm_delete_title'),
+    message: t('ideas.detail.attach.confirm_delete', { name: filename || '' }),
+    okLabel: t('ideas.detail.attach.confirm_delete_ok'),
+    danger: true,
+  })
+  if (!confirmed) return
+  try {
+    const res = await fetch(`api/ideas/attachments/${encodedId}`, { method: 'DELETE' })
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    if (ideaDetailId) await loadIdeaAttachments(ideaDetailId)
+  } catch { showToast(t('ideas.detail.attach.delete_error'), 'error') }
 }
 
 function updateDetailScoreChip() {
@@ -15199,6 +21389,18 @@ document.getElementById('ideaDetailEditBtn')?.addEventListener('click', () => {
   closeModal(document.getElementById('ideaDetailOverlay'))
   openIdeaEdit(ideaDetailId)
 })
+document.getElementById('ideaDetailScopeMove')?.addEventListener('click', async (event) => {
+  if (!ideaDetailId) return
+  const scope = event.currentTarget.dataset.scope
+  try {
+    const res = await fetch(`api/ideas/${encodeURIComponent(ideaDetailId)}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ scope }),
+    })
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    closeModal(document.getElementById('ideaDetailOverlay'))
+    await loadIdeasPage()
+  } catch { showToast(t('ideas.scope.move_error'), 'error') }
+})
 
 function openIdeaPromote(id) {
   ideasPromoteId = id
@@ -15232,14 +21434,14 @@ async function openIdeaBreakdown(id) {
   // populated by loadKanban(). If the user lands here without visiting the board,
   // fetch it so the AI-suggested assignees are selectable.
   if (!kanbanAssignees.length) {
-    try { kanbanAssignees = await (await fetch('api/kanban/assignees')).json() } catch { /* dropdown falls back to "nincs" */ }
+    try { kanbanAssignees = await (await fetch('api/kanban/assignees')).json() } catch { /* dropdown falls back to "unassigned" */ }
   }
   showToast(t('ideas.toast.ai_elaborating'))
   try {
     const res = await fetch(`api/ideas/${id}/breakdown`, { method: 'POST', headers: { 'Content-Type': 'application/json' } })
     const data = await res.json()
-    if (!res.ok) { showToast(data.error || 'Breakdown hiba'); return }
-    if (!data.subtasks || !data.subtasks.length) { showToast('Az AI nem adott vissza alfeladatot'); return }
+    if (!res.ok) { showToast(data.error || t('kanban.breakdown.failed')); return }
+    if (!data.subtasks || !data.subtasks.length) { showToast(t('ideas.toast.no_subtasks')); return }
     breakdownMode = 'idea'
     breakdownIdeaId = id
     breakdownSubtasks = data.subtasks
@@ -15248,7 +21450,7 @@ async function openIdeaBreakdown(id) {
     const dodSection = document.getElementById('breakdownDoDSection')
     if (dodSection) { dodSection.style.display = ''; document.getElementById('breakdownSuccessCriteria').value = '' }
   } catch {
-    showToast('Breakdown hiba')
+    showToast(t('kanban.breakdown.failed'))
   }
 }
 
@@ -15262,6 +21464,13 @@ document.getElementById('ideaPromoteDetail')?.addEventListener('click', () => pr
 document.getElementById('ideaPromotePlan')?.addEventListener('click', () => promoteIdea('plan'))
 document.getElementById('ideaStatusFilter')?.addEventListener('change', loadIdeasPage)
 document.getElementById('ideaCategoryFilter')?.addEventListener('change', loadIdeasPage)
+document.getElementById('ideaScopeFilter')?.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-scope]')
+  if (!button) return
+  ideaScope = button.dataset.scope
+  try { localStorage.setItem(IDEA_SCOPE_STORAGE_KEY, ideaScope) } catch { /* storage blocked */ }
+  loadIdeasPage()
+})
 
 
 // === Agent reauth login flow ===
@@ -15276,7 +21485,8 @@ async function handleAgentLogin(agentName, btn) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ phase }),
     })
-    if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.error || 'HTTP ' + res.status) }
+    // OWNERGATE3-1104: an owner-session refusal is shown in the page language (refusalReason).
+    if (!res.ok) { const reply = await readActionReply(res); throw new Error(refusalReason(res, reply.body)) }
     if (phase === 'start') {
       btn.dataset.phase = 'confirm'
       btn.textContent = t('agents.auth.btn_confirm')
@@ -15288,7 +21498,7 @@ async function handleAgentLogin(agentName, btn) {
       setTimeout(() => loadAgents(), 1500)
     }
   } catch (e) {
-    showToast('Hiba: ' + (e.message || e))
+    showToast(`${t('common.error')}: ${e.message || e}`)
     btn.textContent = origText
     btn.dataset.phase = 'start'
     btn.disabled = false
@@ -15304,6 +21514,8 @@ let terminalFit = null
 // server enforces the same gate independently (fail-closed). Owner flips it via
 // the checkbox in the modal header (POST /api/terminal-input).
 let terminalInputEnabled = false
+// When the last refused-keystroke toast was shown (OWNERGATE3-1104), to show at most one every 5 s.
+let terminalKeysRefusalToastAt = 0
 
 function syncTerminalInputToggleUI() {
   const cb = document.getElementById('terminalInputToggle')
@@ -15412,14 +21624,23 @@ function openTerminalModal(agentName) {
     if (!terminalInputEnabled) {
       // Read-only mode: input gate is OFF. Drop the keystroke locally (server
       // would 403 it anyway) and nudge the user to the toggle.
-      showToast('Terminal input is off. Enable it with the header toggle first.')
+      showToast(t('terminal.input_off'))
       return
     }
     const special = ESC_TO_SPECIAL[data]
     const body = special ? { special } : { keys: data }
+    // OWNERGATE3-1104: a refused keystroke (403 owner_session_required, or the toggle OFF on the server) was dropped
+    // silently; say why, at most once every 5 s, so typing does not stack a toast per key.
     fetch(`api/agents/${encodeURIComponent(agentName)}/keys`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+    }).then(async (r) => {
+      if (r.ok) return
+      const reply = await readActionReply(r)
+      const now = Date.now()
+      if (now - terminalKeysRefusalToastAt < 5000) return
+      terminalKeysRefusalToastAt = now
+      showToast(t('common.not_done', { msg: refusalReason(r, reply.body) }))
     }).catch(() => {})
   })
 
@@ -15445,20 +21666,29 @@ document.getElementById('terminalClose')?.addEventListener('click', () => {
 // state, POST it, then reconcile with the server's authoritative response.
 document.getElementById('terminalInputToggle')?.addEventListener('change', (e) => {
   const desired = e.target.checked === true
+  // OWNERGATE3-1104: the server may refuse (403 owner_session_required). Show why, and re-read the real state from
+  // GET: a refused OFF leaves the switch ON on the server, so the UI must not show it as off.
   fetch('api/terminal-input', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ enabled: desired }),
   })
-    .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
-    .then(d => {
-      terminalInputEnabled = d.enabled === true
+    .then(async r => {
+      const reply = await readActionReply(r)
+      if (!reply.ok) {
+        showToast(t('common.not_done', { msg: refusalReason(r, reply.body) }))
+        const cur = await fetch('api/terminal-input').then(g => (g.ok ? g.json() : null)).catch(() => null)
+        terminalInputEnabled = cur ? cur.enabled === true : false
+        syncTerminalInputToggleUI()
+        return
+      }
+      terminalInputEnabled = reply.body.enabled === true
       syncTerminalInputToggleUI()
-      showToast(terminalInputEnabled ? 'Terminal input enabled (audit-logged)' : 'Terminal input disabled')
+      showToast(t(terminalInputEnabled ? 'terminal.input_enabled' : 'terminal.input_disabled'))
     })
     .catch(() => {
       terminalInputEnabled = false
       syncTerminalInputToggleUI()
-      showToast('Could not change terminal input state')
+      showToast(t('terminal.input_toggle_failed'))
     })
 })
 
@@ -15668,11 +21898,18 @@ function renderFederationPage() {
     </div>`
   document.getElementById('fedEnabledToggle').addEventListener('change', async (e) => {
     const enabled = e.target.checked
-    if (!enabled && !confirm(t('federation.confirm.disable'))) { e.target.checked = true; return }
+    if (!enabled) {
+      const confirmed = await confirmDialog({
+        title: t('federation.confirm.disable_title'),
+        message: t('federation.confirm.disable'),
+        okLabel: t('federation.confirm.disable_ok'),
+      })
+      if (!confirmed) { e.target.checked = true; return }
+    }
     try {
       const res = await fetch('api/federation/enabled', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) })
       const data = await res.json().catch(() => ({}))
-      if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); e.target.checked = !enabled; return }
+      if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) })); e.target.checked = !enabled; return }
       showToast(enabled ? t('federation.toast.enabled') : t('federation.toast.disabled'))
       fedRefreshAndReload()
     } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })); e.target.checked = !enabled }
@@ -15683,7 +21920,7 @@ function renderFederationPage() {
       try {
         const res = await fetch('api/federation/routing-mode', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode }) })
         const data = await res.json().catch(() => ({}))
-        if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+        if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) })); return }
         showToast(t('federation.routing.toast_set', { mode: t('federation.routing.mode.' + mode + '.label') }))
       } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
     })
@@ -15739,7 +21976,7 @@ async function fedRevealToken(peerId, card) {
   try {
     const res = await fetch(`api/federation/peers/${encodeURIComponent(peerId)}/inbound-token`)
     const data = await res.json().catch(() => ({}))
-    if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+    if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) })); return }
     box.textContent = data.inboundToken
     box.hidden = false
     navigator.clipboard?.writeText(data.inboundToken).then(
@@ -15749,14 +21986,45 @@ async function fedRevealToken(peerId, card) {
   } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
 }
 
+// A peer's inbound token in the app's own dialog (the pairing showed it in a native prompt()): selectable,
+// and "Copy" puts it on the clipboard. The Inbound token button shows it again later.
+async function fedShowInboundTokenDialog(peerId, token, messageKey) {
+  const box = document.createElement('input')
+  box.type = 'text'
+  box.readOnly = true
+  box.className = 'confirm-dialog-token'
+  box.value = token
+  box.addEventListener('focus', () => box.select())
+  const copy = await confirmDialog({
+    title: t('federation.token_dialog.title', { peer: peerId }),
+    message: t(messageKey),
+    okLabel: t('federation.token_dialog.copy'),
+    cancelLabel: t('federation.token_dialog.close'),
+    content: box,
+  })
+  if (!copy) return
+  try {
+    await navigator.clipboard.writeText(token)
+    showToast(t('federation.toast.token_copied'))
+  } catch { showToast(t('federation.token_dialog.copy_failed')) }
+}
+
 async function fedRotateToken(peerId) {
-  if (!confirm(t('federation.confirm.rotate', { peer: peerId }))) return
+  const confirmed = await confirmDialog({
+    title: t('federation.confirm.rotate_title'),
+    message: t('federation.confirm.rotate', { peer: peerId }),
+    okLabel: t('federation.confirm.rotate_ok'),
+    danger: true,
+  })
+  if (!confirmed) return
   try {
     const res = await fetch(`api/federation/peers/${encodeURIComponent(peerId)}/rotate-inbound-token`, { method: 'POST' })
     const data = await res.json().catch(() => ({}))
-    if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+    if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) })); return }
     showToast(t('federation.toast.rotated'))
     loadFederationPage()
+    // The answer carries the new token: shown right away, like at pairing.
+    if (data.inboundToken) await fedShowInboundTokenDialog(peerId, data.inboundToken, 'federation.token_dialog.rotated_hint')
   } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
 }
 
@@ -15767,17 +22035,23 @@ async function fedToggleShareCap(peerId, share) {
       body: JSON.stringify({ shareCapabilitySummaries: share }),
     })
     const data = await res.json().catch(() => ({}))
-    if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); loadFederationPage(); return }
+    if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) })); loadFederationPage(); return }
     showToast(share ? t('federation.toast.share_cap_on') : t('federation.toast.share_cap_off'))
   } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })); loadFederationPage() }
 }
 
 async function fedDeletePeer(peerId) {
-  if (!confirm(t('federation.confirm.delete_peer', { peer: peerId }))) return
+  const confirmed = await confirmDialog({
+    title: t('federation.confirm.delete_peer_title'),
+    message: t('federation.confirm.delete_peer', { peer: peerId }),
+    okLabel: t('federation.confirm.delete_peer_ok'),
+    danger: true,
+  })
+  if (!confirmed) return
   try {
     const res = await fetch(`api/federation/peers/${encodeURIComponent(peerId)}`, { method: 'DELETE' })
     const data = await res.json().catch(() => ({}))
-    if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+    if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) })); return }
     // Sweep browser leftovers scoped to the removed peer.
     for (let i = localStorage.length - 1; i >= 0; i--) {
       const key = localStorage.key(i)
@@ -15794,17 +22068,38 @@ async function fedDeletePeer(peerId) {
 // directive). Reuses the existing main-agent restart endpoint -- no new
 // backend, no terminal command for the operator.
 async function fedApplyToMainAgent() {
-  if (!confirm(t('federation.confirm.apply'))) return
+  const confirmed = await confirmDialog({
+    title: t('federation.confirm.apply_title'),
+    message: t('federation.confirm.apply'),
+    okLabel: t('federation.confirm.apply_ok'),
+  })
+  if (!confirmed) return
   try {
     // Server-side apply: restarts the main channels agent by MAIN_AGENT_ID,
     // so the client does not depend on window._marveen being loaded (the
     // Federation page does not populate it -> the old /api/agents/:name path
     // 404'd when it fell back to the 'marveen' default).
-    const res = await fetch('api/federation/apply', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    // FEDAPPLYGATE1018: the apply restarts the main agent, so the server's busy gate applies; a refusal
+    // asks a second time, like the main restart button, and only then sends an explicit force.
+    const apply = (force) => fetch('api/federation/apply', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: force ? JSON.stringify({ force: true }) : '{}',
     })
-    const data = await res.json().catch(() => ({}))
-    if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+    let res = await apply(false)
+    let data = await res.json().catch(() => ({}))
+    if (res.status === 409 && data.error === 'restart-blocked') {
+      const key = data.reason === 'busy' ? 'agents.confirm.force_restart_busy' : 'agents.confirm.force_restart_unreadable'
+      // The same question as the main restart button (restartMainAgentGated).
+      const forced = await confirmDialog({
+        title: t('agents.confirm.hard_restart_title'),
+        message: t(key),
+        okLabel: t('agents.confirm.force_restart_ok'),
+        danger: true,
+      })
+      if (!forced) { showToast(t('agents.toast.restart_not_forced')); return }
+      res = await apply(true)
+      data = await res.json().catch(() => ({}))
+    }
+    if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) })); return }
     showToast(t('federation.toast.applied'))
   } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
 }
@@ -15848,17 +22143,17 @@ async function fedSavePeerModal() {
       else body.abandonWindowMinutes = null
       res = await fetch(`api/federation/peers/${encodeURIComponent(fedPeerModalEditId)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
       data = await res.json().catch(() => ({}))
-      if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+      if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) })); return }
       showToast(t('federation.toast.peer_saved'))
     } else {
       const body = { id, baseUrl }
       if (outbound) body.outboundToken = outbound
       res = await fetch('api/federation/peers', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
       data = await res.json().catch(() => ({}))
-      if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+      if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) })); return }
       // The minted inbound token is shown ONCE right away: the owner hands it
       // to the peer's operator during pairing.
-      prompt(t('federation.modal.minted_token_hint'), data.inboundToken)
+      await fedShowInboundTokenDialog(id, data.inboundToken, 'federation.modal.minted_token_hint')
       showToast(t('federation.toast.peer_added'))
     }
     closeModal(document.getElementById('fedPeerModalOverlay'))
@@ -15867,11 +22162,17 @@ async function fedSavePeerModal() {
 }
 
 async function fedRemoveAll() {
-  if (!confirm(t('federation.confirm.remove'))) return
+  const confirmed = await confirmDialog({
+    title: t('federation.confirm.remove_title'),
+    message: t('federation.confirm.remove'),
+    okLabel: t('federation.confirm.remove_ok'),
+    danger: true,
+  })
+  if (!confirmed) return
   try {
     const res = await fetch('api/federation/remove', { method: 'POST' })
     const data = await res.json().catch(() => ({}))
-    if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+    if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) })); return }
     federatedPeerStatus = []
     // Sweep browser leftovers for ALL federated (qualified) threads -- the
     // per-peer DELETE path does this per peer, full removal must do it wholesale.
@@ -15929,8 +22230,17 @@ function mdInline(text) {
   s = s.replace(/`([^`]+)`/g, (m, c) => '<code>' + c + '</code>')
   s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
   s = s.replace(/\*([^*]+)\*/g, '<em>$1</em>')
-  s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, txt, url) =>
-    '<a href="' + escapeAttr(url) + '" target="_blank" rel="noopener noreferrer">' + txt + '</a>')
+  // Only a link safeHref() accepts (http(s), mailto, or scheme-less relative)
+  // becomes an anchor; anything else stays its text.
+  // url is a piece of the escaped text (and may hold the <em>/<strong>/<code>
+  // tags inserted above): turn it back into the raw URL, judge that, and
+  // encode it once for the attribute.
+  s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, txt, url) => {
+    const raw = url.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&')
+    return safeHref(raw, { relative: true })
+      ? '<a href="' + escapeHtml(safeHref(raw, { relative: true })) + '" target="_blank" rel="noopener noreferrer">' + txt + '</a>'
+      : txt
+  })
   return s
 }
 
@@ -16198,6 +22508,462 @@ async function openResearchDoc(agent, name) {
   overlay.addEventListener('click', (e) => { if (e.target === overlay) closeModal(overlay) })
 })()
 
+// GROMZOLINKCONFIRM1106: the Gromzo card's status line, pure so the tests can run it. A link that waits for the
+// owner's confirmation says where to confirm and until when (on 2026-11-06 the owner saw only "not linked yet"
+// and the request ran out); a refused or expired one says what to do next. A new pending request wins over an
+// older refusal.
+const GROMZO_LINK_REFUSAL_KINDS = ['expired', 'refused', 'owner_mismatch', 'not_found']
+function gromzoStatusLine(s, nowMs) {
+  if (!s || !s.available) {
+    if (s && (s.code === 'not_running' || s.code === 'no_access')) return { key: 'gromzo.status.not_running' }
+    return { key: 'gromzo.status.unknown', params: { code: String((s && s.code) || '?') } }
+  }
+  if (s.linked) return { key: 'gromzo.status.linked' }
+  if (Number.isInteger(s.linkPendingExpiresIn)) {
+    if (s.linkPendingExpiresIn <= 0) return { key: 'gromzo.status.link_expired' }
+    return { key: 'gromzo.status.link_pending', until: nowMs + s.linkPendingExpiresIn * 1000 }
+  }
+  if (typeof s.linkRefusal === 'string') {
+    if (GROMZO_LINK_REFUSAL_KINDS.includes(s.linkRefusal)) return { key: 'gromzo.status.link_' + s.linkRefusal }
+    return { key: 'gromzo.status.link_failed', params: { kind: s.linkRefusal } }
+  }
+  return { key: 'gromzo.status.not_linked' }
+}
+
+// GROMZOLINKCONFIRM1106 follow-up (Dani, #2555 review): the deadline in the UI's own language (24-hour clock in both),
+// and the re-read of a pending link, both pure so the tests run the shipped code: 15 s after a pending line, once,
+// and only while the card is still on the page.
+const GROMZO_STATUS_REFRESH_MS = 15000
+function gromzoUntilText(untilMs, lang) {
+  return new Date(untilMs).toLocaleTimeString(lang === 'en' ? 'en-GB' : 'hu-HU', { hour: '2-digit', minute: '2-digit' })
+}
+function gromzoScheduleStatusRefresh(isConnected, reload, setT) {
+  return setT(() => { if (isConnected()) reload() }, GROMZO_STATUS_REFRESH_MS)
+}
+
+// === Gromzo card: the link status (GROMZOOWNERQR1030; GROMZOBRIDGEWIZARD1107 D5a) ===
+// The phone hookup and a new phone's code are the Marveen Bridge's ("Gromzo bekötése" wizard). The card's own owner
+// QR is gone: dash.sock never hands out the owner's codes (marveen-mxd #89), so it always ended on consent_required.
+// The card keeps the link status line; the agents are setupGromzoAgents below.
+;(function setupGromzoCard() {
+  const card = document.getElementById('gromzoCard')
+  if (!card) return
+  const statusEl = document.getElementById('gromzoStatus')
+
+  // While a link waits for the owner's confirmation the line is read again, so the card turns to "linked" on its
+  // own once the owner confirms (or to "expired" when the 15 minutes run out). Only while the card is on the page.
+  let statusRefresh = null
+  async function loadStatus() {
+    if (statusRefresh) { clearTimeout(statusRefresh); statusRefresh = null }
+    statusEl.textContent = t('gromzo.status.loading')
+    try {
+      const r = await fetch('api/gromzo/status', { cache: 'no-store' })
+      const s = r.ok ? await r.json() : { available: false, code: 'http_' + r.status }
+      const line = gromzoStatusLine(s, Date.now())
+      if (line.until) {
+        statusEl.textContent = t(line.key, { until: gromzoUntilText(line.until, window._lang) })
+        statusRefresh = gromzoScheduleStatusRefresh(() => statusEl.isConnected, () => { statusRefresh = null; loadStatus() }, setTimeout)
+      } else {
+        statusEl.textContent = t(line.key, line.params)
+      }
+    } catch (e) {
+      statusEl.textContent = t('gromzo.status.unknown', { code: 'network' })
+    }
+  }
+  window.loadGromzoCard = loadStatus
+})()
+
+// === Gromzo card: which agents are on Gromzo (GROMZOAGENTPICK1101) ===
+// GET /api/gromzo/agents lists the fleet; switching on asks the owner to approve in the
+// app (POST .../enable), then this panel asks POST .../consent every few seconds until the
+// owner decided (the server paces the real mxd check to one per ~11 s). Switching off
+// is POST .../disable. Only the owner's dashboard session may do any of it; the
+// consent id never reaches the browser.
+;(function setupGromzoAgents() {
+  const listEl = document.getElementById('gromzoAgentList')
+  const errEl = document.getElementById('gromzoAgentsError')
+  // MXDAGENTSOCKID1106: mxd could not read its protection state, so it counts every agent as protected (Samu 71344 (1)).
+  const ratchetEl = document.getElementById('gromzoAgentsRatchet')
+  if (!listEl || !errEl) return
+  const POLL_MS = 6000
+  // slug -> { kind: 'pending'|'busy'|'error'|'restarting', text?, until? } (this page's view only)
+  const local = new Map()
+  let rows = []
+  let pollTimer = null
+  // GROMZONAMETAKEN1106: the name the agent gets on Gromzo. A row shows a name field once the controller refused its
+  // name (at the switch-on or at the approval). The codes that mean "pick another name", never "try again later".
+  const NAME_CODES = ['name_taken', 'reserved_name', 'bad_name', 'bad_display_name', 'mixed_script']
+  const nameDraft = new Map() // slug -> what the owner typed (survives the list's re-renders)
+  const nameAsk = new Set() // slugs whose last switch-on came back with a name code
+
+  function agentErr(code) {
+    // The controller says name_taken for a taken AND a reserved name: one sentence that asks for another name.
+    if (code === 'name_taken') code = 'reserved_name'
+    for (const key of ['gromzo.agents.err.' + code, 'gromzo.err.' + code]) {
+      const s = t(key)
+      if (s !== key) return s
+    }
+    return t('gromzo.agents.err.generic', { code })
+  }
+
+  async function codeOf(r) {
+    let code = 'http_' + r.status
+    try { const b = await r.json(); code = String(b.code || b.error || code) } catch { /* keep the HTTP code */ }
+    return code
+  }
+
+  function showError(msg) {
+    errEl.textContent = msg
+    errEl.hidden = !msg
+  }
+
+  // GROMZOMAINAGENT1106: the main agent's own launch side (the server's mainLaunch), after the shared
+  // local/pending states. "running" is observed (the running session was started with the plugin), not
+  // assumed from the switch.
+  function mainStateOf(row) {
+    switch (row.mainLaunch) {
+      case 'running': return { cls: 'is-on', text: t('gromzo.agents.main.running') }
+      case 'restart_waiting': return { cls: 'is-pending', text: t(row.gromzo ? 'gromzo.agents.main.restart_waiting_on' : 'gromzo.agents.main.restart_waiting_off') }
+      case 'waiting_mxd': return { cls: 'is-pending', text: t('gromzo.agents.main.waiting_mxd') }
+      case 'held': return { cls: 'is-error', text: t('gromzo.agents.state.held') }
+      case 'marketplace_failed': return { cls: 'is-error', text: t('gromzo.agents.main.marketplace_failed') }
+      case 'env_failed': return { cls: 'is-error', text: t('gromzo.agents.main.env_failed') }
+      case 'restart_failed': return { cls: 'is-error', text: t('gromzo.agents.main.restart_failed') }
+      case 'on_unknown': return { cls: 'is-on', text: t('gromzo.agents.state.on') }
+      default: return row.gromzo ? { cls: 'is-on', text: t('gromzo.agents.state.on') } : { cls: '', text: t('gromzo.agents.main.off') }
+    }
+  }
+
+  function stateOf(row) {
+    const l = local.get(row.slug)
+    if (l && l.kind === 'busy') return { cls: '', text: t('gromzo.agents.state.busy') }
+    if (l && l.kind === 'restarting') return { cls: 'is-on', text: t('gromzo.agents.state.restarting') }
+    if (l && l.kind === 'error') return { cls: 'is-error', text: l.text }
+    const until = (l && l.kind === 'pending' && l.until) || row.pendingUntil
+    if (until && until > Date.now()) {
+      const min = Math.max(1, Math.ceil((until - Date.now()) / 60000))
+      return { cls: 'is-pending', text: t('gromzo.agents.state.pending', { min }) }
+    }
+    if (row.held) return { cls: 'is-error', text: t('gromzo.agents.state.held') }
+    if (row.main) return mainStateOf(row)
+    return row.gromzo ? { cls: 'is-on', text: t('gromzo.agents.state.on') } : { cls: '', text: t('gromzo.agents.state.off') }
+  }
+
+  // Not on a held row: mxd asks for a held agent again only under the name it lists (marveen-mxd main.rs is_held), so a
+  // new name there could not take effect (Dani 71877).
+  function nameFieldShown(row, pending) {
+    return !pending && !row.gromzo && !row.held && nameAsk.has(row.slug)
+  }
+
+  function nameFor(row) {
+    return nameDraft.has(row.slug) ? nameDraft.get(row.slug) : (row.gromzoName || row.name || row.slug)
+  }
+
+  function render() {
+    // A re-render (the poll, a reload) must not take the name field from under the owner's typing.
+    const focused = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.gromzoName : undefined
+    const sel = focused !== undefined ? [document.activeElement.selectionStart, document.activeElement.selectionEnd] : null
+    listEl.replaceChildren()
+    for (const row of rows) {
+      const li = document.createElement('li')
+      li.className = 'gromzo-agent-row'
+      const main = document.createElement('div')
+      main.className = 'gromzo-agent-main'
+      const name = document.createElement('span')
+      name.className = 'gromzo-agent-name'
+      name.textContent = row.name || row.slug
+      const st = stateOf(row)
+      const state = document.createElement('span')
+      state.className = 'gromzo-agent-state' + (st.cls ? ' ' + st.cls : '')
+      state.textContent = st.text
+      state.setAttribute('aria-live', 'polite')
+      main.append(name, state)
+      // The agent's picture on Gromzo (Samu 64526): say up front what would stop it (too large, not PNG/JPEG, ...).
+      if (!row.main && row.avatarProblem) {
+        const pic = document.createElement('span')
+        pic.className = 'gromzo-agent-state is-warn'
+        pic.textContent = t('gromzo.agents.avatar.' + row.avatarProblem)
+        main.append(pic)
+      }
+      // MXDAGENTSOCKID1106: the agent's agent.sock protection. Refused: its plugin sends no token for a protected
+      // agent; unprotected: running for 10 minutes without a token yet. Protected shows nothing.
+      if (row.protection === 'refused' || row.protection === 'unprotected') {
+        const prot = document.createElement('span')
+        prot.className = 'gromzo-agent-state ' + (row.protection === 'refused' ? 'is-error' : 'is-warn')
+        prot.textContent = t('gromzo.agents.prot.' + row.protection)
+        main.append(prot)
+      }
+      // The main agent: switching it on or off restarts the main conversation, so the row says so up front.
+      if (row.main) {
+        const note = document.createElement('span')
+        note.className = 'gromzo-agent-state gromzo-agent-note'
+        note.textContent = t('gromzo.agents.main.note')
+        main.append(note)
+      }
+      li.append(main)
+      {
+        const l = local.get(row.slug)
+        const pending = (l && l.kind === 'pending') || (row.pendingUntil && row.pendingUntil > Date.now())
+        const disabled = !!pending || !!(l && (l.kind === 'busy' || l.kind === 'restarting'))
+        if (nameFieldShown(row, pending)) {
+          const field = document.createElement('label')
+          field.className = 'gromzo-agent-namefield'
+          const cap = document.createElement('span')
+          cap.textContent = t('gromzo.agents.name.label')
+          const input = document.createElement('input')
+          input.type = 'text'
+          input.className = 'input'
+          input.maxLength = 64
+          input.autocomplete = 'off'
+          input.spellcheck = false
+          input.value = nameFor(row)
+          input.disabled = disabled
+          input.dataset.gromzoName = row.slug
+          input.addEventListener('input', () => nameDraft.set(row.slug, input.value))
+          input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !input.disabled) { e.preventDefault(); switchOn(row) } })
+          field.append(cap, input)
+          main.append(field)
+        }
+        const label = row.name || row.slug
+        const mk = (on, primary, textKey) => {
+          const b = document.createElement('button')
+          b.className = primary ? 'btn-primary btn-compact' : 'btn-secondary btn-compact'
+          b.textContent = t(textKey)
+          b.setAttribute('aria-label', t(on ? 'gromzo.agents.aria.on' : 'gromzo.agents.aria.off', { name: label }))
+          b.disabled = disabled
+          b.addEventListener('click', () => (on ? switchOn(row) : switchOff(row)))
+          return b
+        }
+        const actions = document.createElement('div')
+        actions.className = 'gromzo-agent-actions'
+        // A held agent: mxd lists it but its last start held it back; ask for a new approval, or take it off.
+        if (row.main && row.mainLaunch === 'restart_waiting' && !pending) {
+          const b = document.createElement('button')
+          b.className = 'btn-primary btn-compact'
+          b.textContent = t('gromzo.agents.main.btn_restart')
+          b.disabled = disabled
+          b.addEventListener('click', () => restartMain(row))
+          actions.append(b)
+        }
+        if (row.held) actions.append(mk(true, true, 'gromzo.agents.btn.reapprove'))
+        // A held sub-agent always gets the switch-off, flag on or not (Dani 71938): mxd lists it, the switch-off is its
+        // agent_remove, and it is the way to another name the held sentence names.
+        if (row.gromzo || (row.held && !row.main)) actions.append(mk(false, false, 'gromzo.agents.btn.off'))
+        else if (!row.held) actions.append(mk(true, true, 'gromzo.agents.btn.on'))
+        li.append(actions)
+      }
+      listEl.append(li)
+    }
+    if (focused !== undefined) {
+      const again = [...listEl.querySelectorAll('input[data-gromzo-name]')].find((x) => x.dataset.gromzoName === focused)
+      if (again && !again.disabled) { again.focus(); if (sel) try { again.setSelectionRange(sel[0], sel[1]) } catch { /* not a text field */ } }
+    }
+  }
+
+  // GROMZOAGENTPICK1101 (Bridge): the Bridge's device key authenticates every call, but an owner
+  // action needs the owner's password login as well (a session cookie next to the key). The login
+  // button opens the dashboard's own login overlay; the logout button ends that session (the
+  // Bridge has no other way to: its Settings show the device, not the session).
+  // Shown AHEAD of any click (the card's first list load answers owner_session_required), as a notice,
+  // not an error: the owner learns up front that the password login is the missing step (Samu 64431 (3)).
+  const ownerInfo = document.getElementById('gromzoOwnerInfo')
+  const loginBtn = document.getElementById('gromzoLoginBtn')
+  const logoutBtn = document.getElementById('gromzoLogoutBtn')
+  window.gromzoOwnerLogin = (needed) => { if (ownerInfo) ownerInfo.hidden = !needed }
+  if (loginBtn) loginBtn.addEventListener('click', () => { if (typeof window.mvShowLogin === 'function') window.mvShowLogin({ cancellable: true }) })
+  if (logoutBtn) logoutBtn.addEventListener('click', async () => {
+    try { await fetch('api/auth/logout', { method: 'POST' }) } catch { /* ignore */ }
+    window.location.reload()
+  })
+  async function showLogoutIfDevice() {
+    if (!logoutBtn) return
+    try {
+      const s = await (await fetch('api/auth/status', { cache: 'no-store' })).json()
+      logoutBtn.hidden = s.method !== 'device'
+    } catch { logoutBtn.hidden = true }
+  }
+
+  // The protection banner: the fail-closed ratchet, or (Samu 71546) the state not available after a failed load.
+  function showProtBanner(key) {
+    if (!ratchetEl) return
+    ratchetEl.textContent = key ? t(key) : ''
+    ratchetEl.hidden = !key
+  }
+
+  async function loadAgents() {
+    showError('')
+    // Dani 71532 (1): a failed reload must not leave the last answer's "every agent protected" banner standing.
+    showProtBanner(null)
+    try {
+      const r = await fetch('api/gromzo/agents', { cache: 'no-store' })
+      if (!r.ok) {
+        const code = await codeOf(r)
+        rows = []; render()
+        window.gromzoOwnerLogin(code === 'owner_session_required')
+        if (code !== 'owner_session_required') {
+          showError(agentErr(code))
+          showProtBanner('gromzo.agents.prot.unavailable')
+        }
+        if (logoutBtn) logoutBtn.hidden = true
+        return
+      }
+      window.gromzoOwnerLogin(false)
+      void showLogoutIfDevice()
+      const body = await r.json()
+      rows = body.agents || []
+      showProtBanner(body.ratchetUnreadable === true ? 'gromzo.agents.prot.ratchet_unreadable' : null)
+      for (const row of rows) if (row.pendingUntil && row.pendingUntil > Date.now() && !local.has(row.slug)) local.set(row.slug, { kind: 'pending', until: row.pendingUntil })
+      render()
+      ensurePolling()
+    } catch {
+      rows = []; render(); showError(agentErr('network'))
+      showProtBanner('gromzo.agents.prot.unavailable')
+    }
+  }
+
+  async function post(slug, action, body) {
+    return fetch('api/gromzo/agents/' + encodeURIComponent(slug) + '/' + action, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : '{}', cache: 'no-store',
+    })
+  }
+
+  // A name code: the row keeps (or gets) its name field, prefilled with the name just refused, and says why.
+  function nameRefused(row, code, tried) {
+    nameAsk.add(row.slug)
+    if (!nameDraft.has(row.slug) && tried) nameDraft.set(row.slug, tried)
+    // A held sub-agent has no name field (mxd asks for it again only under its listed name): its way to another name is
+    // switching it off (agent_remove), then on again. The main agent's switch-off does not remove it from mxd, so it
+    // keeps the general sentence (Dani 71903).
+    const text = row.held && !row.main && code === 'name_taken' ? t('gromzo.agents.err.name_taken_held') : agentErr(code)
+    local.set(row.slug, { kind: 'error', text })
+  }
+
+  async function switchOn(row) {
+    // The main agent's switch restarts the main conversation fresh (hardRestartMarveenChannels) after the approval,
+    // through the manual-restart pane gate: a busy pane is not cut off, the row offers "Restart now" instead.
+    if (row.main) {
+      const confirmed = await confirmDialog({
+        title: t('gromzo.agents.main.confirm_on_title'),
+        message: t('gromzo.agents.main.confirm_on'),
+        okLabel: t('gromzo.agents.main.confirm_on_ok'),
+      })
+      if (!confirmed) return
+    }
+    const withName = nameFieldShown(row, false)
+    const name = withName ? nameFor(row).trim() : ''
+    local.set(row.slug, { kind: 'busy' }); render()
+    try {
+      const r = await post(row.slug, 'enable', withName ? { name } : null)
+      if (!r.ok) {
+        const code = await codeOf(r)
+        if (NAME_CODES.includes(code)) nameRefused(row, code, name || row.gromzoName || row.name)
+        else local.set(row.slug, { kind: 'error', text: agentErr(code) })
+        render(); return
+      }
+      nameAsk.delete(row.slug)
+      const b = await r.json()
+      if (b.state === 'pending') local.set(row.slug, { kind: 'pending', until: Date.now() + (Number(b.expires_in) || 600) * 1000 })
+      else local.delete(row.slug)
+      await loadAgents()
+    } catch {
+      local.set(row.slug, { kind: 'error', text: agentErr('network') }); render()
+    }
+  }
+
+  async function switchOff(row) {
+    // A sub-agent's switch-off removes it from mxd (agent_remove), so switching it on again asks for a new approval;
+    // the main agent stays listed in mxd, only its launch side goes, with the same fresh restart as the switch-on.
+    const confirmed = await confirmDialog(row.main
+      ? {
+        title: t('gromzo.agents.main.confirm_off_title'),
+        message: t('gromzo.agents.main.confirm_off'),
+        okLabel: t('gromzo.agents.main.confirm_off_ok'),
+      }
+      : {
+        title: t('gromzo.agents.confirm_off_title'),
+        message: t('gromzo.agents.confirm_off', { name: row.name || row.slug }),
+        okLabel: t('gromzo.agents.confirm_off_ok'),
+        danger: true,
+      })
+    if (!confirmed) return
+    local.set(row.slug, { kind: 'busy' }); render()
+    try {
+      const r = await post(row.slug, 'disable')
+      if (!r.ok) { local.set(row.slug, { kind: 'error', text: agentErr(await codeOf(r)) }); render(); return }
+      local.set(row.slug, { kind: 'restarting' })
+      await loadAgents()
+      setTimeout(() => { if (local.get(row.slug)?.kind === 'restarting') { local.delete(row.slug); loadAgents() } }, 15000)
+    } catch {
+      local.set(row.slug, { kind: 'error', text: agentErr('network') }); render()
+    }
+  }
+
+  // GROMZOMAINAGENT1106: the main conversation's restart, when the pane was busy at the switch. The server
+  // asks the pane gate again; a busy pane keeps the row on "waiting", never forced.
+  async function restartMain(row) {
+    const confirmed = await confirmDialog({
+      title: t('gromzo.agents.main.confirm_restart_title'),
+      message: t('gromzo.agents.main.confirm_restart'),
+      okLabel: t('gromzo.agents.main.confirm_restart_ok'),
+    })
+    if (!confirmed) return
+    local.set(row.slug, { kind: 'busy' }); render()
+    try {
+      const r = await post(row.slug, 'restart')
+      if (!r.ok) { local.set(row.slug, { kind: 'error', text: agentErr(await codeOf(r)) }); render(); return }
+      const b = await r.json()
+      local.delete(row.slug)
+      if (b.state === 'restart_waiting') local.set(row.slug, { kind: 'error', text: t('gromzo.agents.main.still_busy') })
+      await loadAgents()
+    } catch {
+      local.set(row.slug, { kind: 'error', text: agentErr('network') }); render()
+    }
+  }
+
+  async function pollOnce() {
+    const slugs = [...local].filter(([, l]) => l.kind === 'pending').map(([s]) => s)
+    if (!slugs.length || document.hidden) { stopPolling(); return }
+    for (const slug of slugs) {
+      try {
+        const r = await post(slug, 'consent')
+        if (!r.ok) {
+          let code = 'http_' + r.status
+          let added = ''
+          try { const e = await r.json(); code = String(e.code || e.error || code); added = typeof e.added_slug === 'string' ? e.added_slug : '' } catch { /* keep the HTTP code */ }
+          // mxd reloading or a transient refusal: keep waiting; a gone consent ends the wait.
+          if (code === 'no_pending') local.delete(slug)
+          // The approval belonged to another agent and mxd added THAT one (its switch here stays off).
+          else if (code === 'consent_mismatch' && added) local.set(slug, { kind: 'error', text: t('gromzo.agents.err.consent_mismatch_added', { slug: added }) })
+          // The controller checks the name again when the approval is used (a member may have taken it meanwhile).
+          else if (NAME_CODES.includes(code)) { const row = rows.find((x) => x.slug === slug); if (row) nameRefused(row, code, nameFor(row)); else local.set(slug, { kind: 'error', text: agentErr(code) }) }
+          else if (!['not_running', 'timeout', 'rate_limited', 'too_soon', 'unavailable', 'io'].includes(code)) local.set(slug, { kind: 'error', text: agentErr(code) })
+          continue
+        }
+        const b = await r.json()
+        if (b.state === 'pending') continue
+        if (b.state === 'added' || b.state === 'on') {
+          local.set(slug, { kind: 'restarting' })
+          setTimeout(() => { if (local.get(slug)?.kind === 'restarting') { local.delete(slug); loadAgents() } }, 15000)
+        } else {
+          local.set(slug, { kind: 'error', text: t('gromzo.agents.result.' + b.state) })
+        }
+      } catch { /* network blip: the next round asks again */ }
+    }
+    await loadAgents()
+  }
+
+  function ensurePolling() {
+    const any = [...local.values()].some((l) => l.kind === 'pending')
+    if (any && !pollTimer) pollTimer = setInterval(pollOnce, POLL_MS)
+    if (!any) stopPolling()
+  }
+  function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null } }
+
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) ensurePolling() })
+  window.addEventListener('pagehide', stopPolling)
+  window.loadGromzoAgents = loadAgents
+})()
+
 // === Archivalt kartyak ===
 ;(() => {
   let archivedInit = false
@@ -16238,11 +23004,11 @@ async function openResearchDoc(agent, name) {
     let labelsHtml = ''
     if (Array.isArray(card.labels) && card.labels.length > 0) {
       const pills = card.labels
-        .map(l => `<span class="kanban-card-label-pill" style="--label-color:${esc(l.color)}">#${esc(l.name)}</span>`)
+        .map(l => `<span class="kanban-card-label-pill" style="--label-color:${escapeHtml(safeCssColor(l.color, '#64748b'))}">#${esc(l.name)}</span>`)
         .join('')
       labelsHtml = `<div class="kanban-card-labels">${pills}</div>`
     }
-    const prioPill = `<span class="archived-prio-pill" style="--prio-color:${prioColor}">${prioLabel}</span>`
+    const prioPill = `<span class="archived-prio-pill" style="--prio-color:${prioColor}">${escapeHtml(prioLabel)}</span>`
     return `<div class="kanban-card archived-card" data-id="${esc(card.id)}" data-priority="${esc(card.priority)}">
       ${projectHtml}
       <div class="kanban-card-title">${seqHtml}${esc(card.title)}</div>
@@ -16264,9 +23030,9 @@ async function openResearchDoc(agent, name) {
     const idLabel = (card.seq != null ? `#${card.seq} · ` : '') + card.id
     meta.innerHTML = `
       <div class="meta-item"><span class="meta-label">${t('kanban.meta.id')}</span><span class="meta-value" style="font-family:monospace">${esc(idLabel)}</span></div>
-      <div class="meta-item"><span class="meta-label">${t('kanban.meta.status')}</span><span class="meta-value">${STATUS_LABELS[card.status]?.() ?? card.status}</span></div>
+      <div class="meta-item"><span class="meta-label">${t('kanban.meta.status')}</span><span class="meta-value">${escapeHtml(STATUS_LABELS[card.status]?.() ?? card.status)}</span></div>
       <div class="meta-item"><span class="meta-label">${t('kanban.meta.assignee')}</span><span class="meta-value">${card.assignee ? esc(card.assignee) : t('kanban.meta.none')}</span></div>
-      <div class="meta-item"><span class="meta-label">${t('kanban.meta.priority')}</span><span class="meta-value">${PRIORITY_LABELS[card.priority]?.() ?? card.priority}</span></div>
+      <div class="meta-item"><span class="meta-label">${t('kanban.meta.priority')}</span><span class="meta-value">${escapeHtml(PRIORITY_LABELS[card.priority]?.() ?? card.priority)}</span></div>
       <div class="meta-item"><span class="meta-label">${t('kanban.meta.project')}</span><span class="meta-value">${card.project ? esc(card.project) : t('kanban.meta.none')}</span></div>
       <div class="meta-item"><span class="meta-label">${t('archived.meta.archived_at')}</span><span class="meta-value">${fmtDate(card.archived_at)}</span></div>
     `
@@ -16274,7 +23040,7 @@ async function openResearchDoc(agent, name) {
     const labelsBox = document.getElementById('archivedDetailLabels')
     if (Array.isArray(card.labels) && card.labels.length > 0) {
       labelsBox.innerHTML = card.labels
-        .map(l => `<span class="kanban-card-label-pill" style="--label-color:${esc(l.color)}">#${esc(l.name)}</span>`)
+        .map(l => `<span class="kanban-card-label-pill" style="--label-color:${escapeHtml(safeCssColor(l.color, '#64748b'))}">#${esc(l.name)}</span>`)
         .join('')
       labelsWrap.style.display = ''
     } else {
@@ -16402,7 +23168,7 @@ async function openResearchDoc(agent, name) {
         })
       })
     } catch (err) {
-      list.innerHTML = '<p class="naplo-empty error">' + t('common.error_network', {msg: err.message}) + '</p>'
+      list.innerHTML = '<p class="naplo-empty error">' + t('common.error_network', {msg: escapeHtml(String(err.message))}) + '</p>'
     }
   }
 
@@ -16417,7 +23183,7 @@ async function openResearchDoc(agent, name) {
       const backBtn = document.getElementById('archivedBackToKanban')
       if (backBtn) backBtn.addEventListener('click', () => switchPage('kanban'))
       const adOverlay = document.getElementById('archivedDetailOverlay')
-      document.getElementById('archivedDetailClose').addEventListener('click', () => closeModal(adOverlay))
+      document.getElementById('archivedDetailClose').addEventListener('click', () => requestOverlayClose(adOverlay))
       attachOverlayCloseGuard(adOverlay)
     }
     populateArchivedProjects()
@@ -16444,7 +23210,7 @@ async function openResearchDoc(agent, name) {
   function renderEntry(e) {
     const sourceColor = SOURCE_COLORS[e.source] || '#6b7280'
     const sourceLabelRaw = SOURCE_LABELS[e.source]; const sourceLabel = sourceLabelRaw ? (typeof sourceLabelRaw === 'function' ? sourceLabelRaw() : sourceLabelRaw) : e.source
-    const badge = `<span class="naplo-badge" style="background:${sourceColor}">${sourceLabel}</span>`
+    const badge = `<span class="naplo-badge" style="background:${sourceColor}">${escapeHtml(sourceLabel)}</span>`
     const ts = `<span class="naplo-ts">${fmtTs(e.created_at)}</span>`
     let detail = ''
     if (e.source === 'config') {
@@ -16464,10 +23230,9 @@ async function openResearchDoc(agent, name) {
     } else if (e.source === 'diary') {
       const entryColor = DIARY_ENTRY_COLORS[e.entry_type] || '#6b7280'
       const entryLabelRaw = DIARY_ENTRY_LABELS[e.entry_type]; const entryLabel = entryLabelRaw ? (typeof entryLabelRaw === 'function' ? entryLabelRaw() : entryLabelRaw) : e.entry_type
-      const entryBadge = `<span class="naplo-badge" style="background:${entryColor};font-size:10px">${entryLabel}</span>`
+      const entryBadge = `<span class="naplo-badge" style="background:${entryColor};font-size:10px">${escapeHtml(entryLabel)}</span>`
       const agentStr = e.agent_id ? ` <span class="naplo-actor">${esc(e.agent_id)}</span>` : ''
-      let contentSnippet = esc(e.content || '').replace(/\n/g, ' ').slice(0, 200)
-      if ((e.content || '').length > 200) contentSnippet += '…'
+      const contentSnippet = escSnippet((e.content || '').replace(/\n/g, ' '), 200)
       const keywordsStr = e.keywords ? `<div class="naplo-note" style="margin-top:2px">Kulcsszavak: ${esc(e.keywords)}</div>` : ''
       const catStr = e.category ? ` <span class="naplo-event-type">${esc(e.category)}</span>` : ''
       detail = `${entryBadge}${catStr}${agentStr}<div class="naplo-diary-content">${contentSnippet}</div>${keywordsStr}`
@@ -16503,7 +23268,7 @@ async function openResearchDoc(agent, name) {
       if (entries.length === 0) { timeline.innerHTML = `<p class="naplo-empty">${t('naplo.empty')}</p>`; return }
       timeline.innerHTML = entries.map(renderEntry).join('')
     } catch (err) {
-      timeline.innerHTML = `<p class="naplo-empty error">${t('naplo.error', { msg: err.message })}</p>`
+      timeline.innerHTML = `<p class="naplo-empty error">${t('naplo.error', { msg: escapeHtml(String(err.message)) })}</p>`
     }
   }
 
@@ -16627,7 +23392,7 @@ async function openResearchDoc(agent, name) {
 
     // Exclude cards whose entire bar lies outside the window
     cards = cards.filter(c => {
-      const barStart = c.created_at ? c.created_at * 1000 : rangeStart.getTime()
+      const barStart = c.start_date ? c.start_date * 1000 : c.created_at ? c.created_at * 1000 : rangeStart.getTime()
       const barEnd   = c.due_date * 1000
       return barEnd >= rangeStart && barStart <= rangeEnd
     })
@@ -16690,7 +23455,7 @@ async function openResearchDoc(agent, name) {
 
       // Card rows
       for (const card of projCards) {
-        const barStartMs = card.created_at ? card.created_at * 1000 : rangeStart.getTime()
+        const barStartMs = card.start_date ? card.start_date * 1000 : card.created_at ? card.created_at * 1000 : rangeStart.getTime()
         const barEndMs   = card.due_date * 1000
         const isOverdue  = card.status !== 'done' && barEndMs < nowMs
 
@@ -16873,4 +23638,19 @@ async function openResearchDoc(agent, name) {
 
   window._initGanttViewSwitcher = initGanttViewSwitcher
   window.renderGantt = renderGantt
+  // A direct #kanban load routes (switchPage) earlier in this file, before the
+  // initializer above exists, so that first call skipped it and the Board /
+  // Timeline / Archived buttons stayed dead. Catch up if the board is showing.
+  if (document.getElementById('kanbanPage')?.hidden === false) initGanttViewSwitcher()
 })()
+
+// VIDEOREVIEW1002: reveal the sidebar link to the review page only when the
+// install has a video root configured. Failure-proof like the other optional
+// badges: an older backend (404) or an error just leaves the link hidden.
+fetch('api/video-review/config')
+  .then((r) => (r.ok ? r.json() : null))
+  .then((cfg) => {
+    const link = document.getElementById('sbVideoReview')
+    if (link && cfg && cfg.enabled) link.hidden = false
+  })
+  .catch(() => {})

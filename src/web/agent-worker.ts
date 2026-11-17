@@ -1,11 +1,15 @@
+import { tmuxStderr } from './tmux-stderr.js'
 import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, rmSync, readFileSync, writeFileSync, readdirSync, lstatSync, symlinkSync, realpathSync } from 'node:fs'
 import { join } from 'node:path'
-import { homedir, userInfo } from 'node:os'
+import { homedir, tmpdir, userInfo } from 'node:os'
 import { createHash } from 'node:crypto'
 import { resolveFromPath, tryResolveFromPath } from '../platform.js'
 import { logger } from '../logger.js'
-import { MAIN_AGENT_ID, PROJECT_ROOT, DEFAULT_AGENT_MODEL } from '../config.js'
+import { launchableInstallDefaultSync, launchableDistributionDefaultSync } from './default-model-guard.js'
+import { measureClaudeCliVersionSync } from './claude-cli-version.js'
+import { CLAUDE_MODEL_MIN_CLI, baseModelId, isModelUnsupportedByCli } from '../claude-cli-support.js'
+import { MAIN_AGENT_ID, PROJECT_ROOT, DEFAULT_AGENT_MODEL, DEFAULT_AGENT_MODEL_IS_DISTRIBUTION, WORKER_AUTOUPDATE, WORKER_MODEL_FAST } from '../config.js'
 import {
   capturePane,
   isSessionReadyForPrompt,
@@ -13,11 +17,17 @@ import {
   sessionExistsOnHost,
   hasFleetOauthToken,
   FLEET_OAUTH_TOKEN_PATH,
+  buildCustomProviderLaunchEnv,
+  stampCustomApiKeyApproval,
 } from './agent-process.js'
 import { withSessionSendLock } from './session-send-lock.js'
 import { readClaudeCodeOauthJson } from './claude-credentials.js'
 import { detectPaneState } from '../pane-state.js'
 import { notifyChannel } from '../notify.js'
+import { ROOT_SANDBOX_ENV } from './root-sandbox-env.js'
+import { shouldRunBackgroundServices, ALLOW_SECOND_INSTANCE_SERVICES_KEY } from './hook-registration-guard.js'
+import { exactTmuxTarget } from '../tmux-target.js'
+import { injectDbWriteGate, injectEmailSendGate, pythonHookCommand, isUnsafeHookCommand, EMAIL_GATE_MATCHER } from './agent-scaffold.js'
 
 // =============================================================================
 // Interactive-tmux agent worker (jun.15 subscription migration).
@@ -43,22 +53,125 @@ import { notifyChannel } from '../notify.js'
 
 const TMUX = resolveFromPath('tmux')
 
-// MARVEEN_WORKER_MODEL stays a process-level escape hatch (systemd
-// `Environment=`), but the .env-backed DEFAULT_AGENT_MODEL is what an operator
-// can actually set: readEnvFile() returns a plain object and never populates
-// process.env, so a MARVEEN_WORKER_MODEL line in .env was silently ignored.
-const WORKER_MODEL = process.env.MARVEEN_WORKER_MODEL || DEFAULT_AGENT_MODEL
+// MARVEEN_WORKER_MODEL is an escape hatch (systemd `Environment=`); when set it
+// wins over everything else. Without it the worker inherits the main agent's
+// custom provider (model + endpoint env) if one is configured, so a
+// Claude-subscription-less fleet (e.g. custom LiteLLM endpoint) gets working
+// background workers without any extra config. Falls back to DEFAULT_AGENT_MODEL
+// when neither override nor custom provider is in play.
+const WORKER_MODEL_OVERRIDE = process.env.MARVEEN_WORKER_MODEL ?? null
+
+
+// WORKERMODEL1773 (#1773): the worker's --model, resolved in one pure place
+// (it also carries the launch log's source label, APRO920 (c)(2): replaces
+// workerModelSource, which called a custom-provider or an explicit
+// DEFAULT_AGENT_MODEL launch "default").
+// The #1609 guard (DEFAULTCLIGUARD927) only ever looked at the SHIPPED default:
+// an explicit value -- MARVEEN_WORKER_MODEL, or a configured DEFAULT_AGENT_MODEL
+// -- reached --model unchecked, so on a CLI below the model's minimum the worker
+// came up and every prompt got 400 unrecognized_model. Measured 2026-10-07 with
+// the real guard and CLI 2.1.110: an explicit claude-opus-5-5[1m] passed through
+// unchanged, while the shipped default fell back to claude-opus-5[1m].
+//
+// The decision now carries `unlaunchable` for an explicit value the measured
+// CLI cannot run (fail-open: an unmeasured CLI flags nothing; a custom-provider
+// model is not a Claude model and is not checked).
+export type WorkerModelSourceLabel = 'env:MARVEEN_WORKER_MODEL' | 'env:MARVEEN_WORKER_MODEL_FAST' | 'custom-provider' | 'env:DEFAULT_AGENT_MODEL' | 'default'
+export interface WorkerModelDecision {
+  model: string
+  source: WorkerModelSourceLabel
+  /**
+   * Set when the explicitly configured model cannot be launched by the
+   * measured CLI. `requested` is the configured value; `fallback` is the model
+   * this run uses instead (the owner's decision (A), WORKERMODEL1773 part 2),
+   * or null when the fallback is not launchable either and the requested model
+   * is kept (nothing better to run).
+   */
+  unlaunchable: { requested: string; minCli: string; installedCli: string; fallback: string | null } | null
+}
+export interface WorkerModelInputs {
+  /** MARVEEN_WORKER_MODEL, or null. */
+  override: string | null
+  /** Source label for `override` (the fast session's own model reports its own key). */
+  overrideSource?: WorkerModelSourceLabel
+  /** The main agent's custom-provider model, or null when none is configured. */
+  customProviderModel: string | null
+  /** DEFAULT_AGENT_MODEL as resolved by config. */
+  configuredDefault: string
+  /** True when no operator configured DEFAULT_AGENT_MODEL (the shipped default). */
+  defaultIsDistribution: boolean
+  /** The #1609 guard for the shipped default (called only on that path). */
+  launchableDefault: () => string
+  /**
+   * The distribution default as the #1609 guard launches it on this CLI (the
+   * shipped default, or its previous tier). Called only when an explicit value
+   * is unlaunchable: it is the model that run falls back to.
+   */
+  launchableFallback: () => string
+  /** The measured installed CLI version, or null when unmeasured. */
+  installedCli: () => string | null
+}
+export function resolveWorkerModel(i: WorkerModelInputs): WorkerModelDecision {
+  // The owner's decision (A), WORKERMODEL1773 part 2: an explicit model the
+  // measured CLI cannot run is replaced FOR THIS RUN by the model a model-less
+  // launch would use (the #1609 guard's choice). The setting itself is only
+  // read here, never written: the next launch decides again, so a CLI upgrade
+  // brings the configured model back without anyone touching it.
+  const explicit = (model: string, source: WorkerModelSourceLabel): WorkerModelDecision => {
+    const installed = i.installedCli()
+    const req = CLAUDE_MODEL_MIN_CLI[baseModelId(model)]
+    if (!(installed && req && isModelUnsupportedByCli(model, installed))) return { model, source, unlaunchable: null }
+    const candidate = i.launchableFallback()
+    const fallback = isModelUnsupportedByCli(candidate, installed) ? null : candidate
+    return { model: fallback ?? model, source, unlaunchable: { requested: model, minCli: req.minCli, installedCli: installed, fallback } }
+  }
+  if (i.override) return explicit(i.override, i.overrideSource ?? 'env:MARVEEN_WORKER_MODEL')
+  if (i.customProviderModel) return { model: i.customProviderModel, source: 'custom-provider', unlaunchable: null }
+  if (!i.defaultIsDistribution) return explicit(i.configuredDefault, 'env:DEFAULT_AGENT_MODEL')
+  return { model: i.launchableDefault(), source: 'default', unlaunchable: null }
+}
+
+// WORKERMODELFAST1109: the fast session's own model. Order: the process env (a
+// systemd `Environment=`), then the config value (.env / dashboard settings). With
+// neither, null: the fast session walks the same chain as the slow one
+// (resolveWorkerModel), so an install that does not set it behaves exactly as before.
+// The config step is deliberate: as noted above, a MARVEEN_WORKER_MODEL line in .env
+// is silently ignored, and that trap is not worth building a second time. The value
+// becomes resolveWorkerModel's override, so the CLI launchability guard
+// (WORKERMODEL1773) runs on the fast model too.
+const WORKER_MODEL_FAST_OVERRIDE: string | null =
+  process.env.MARVEEN_WORKER_MODEL_FAST || WORKER_MODEL_FAST || null
 
 // How long to wait for a freshly launched worker to reach an idle prompt.
 const WORKER_BOOT_TIMEOUT_MS = 90_000
 // Poll cadence while waiting for the <reqid>.done sentinel.
 const CAPTURE_POLL_MS = 1_500
+// How often to re-check the pane while waiting for /clear to return an idle prompt.
+const CLEAR_READY_POLL_MS = 400
+// Total budget for that pane-state wait before failing open (delivery must go out).
+const CLEAR_READY_BUDGET_MS = 8_000
+// Settle before the FIRST readiness poll after Enter. Until the TUI actually reads
+// the queued Enter, the pane still shows the pre-/clear idle prompt (the R1 review
+// corner: both confirm captures can land in that stale window), so the first poll
+// must not end before the old fixed 0.5s sleep would have -- delivery is never
+// earlier than the pre-change code in any path, and strictly later in the corner.
+const CLEAR_READY_SETTLE_MS = 500
 // Channel plugins to force-disable in the worker's isolated settings.json.
 const WORKER_DISABLED_PLUGINS = ['telegram', 'slack-channel']
 // ~/.claude entries NOT symlinked into the isolated config dir:
 //  - settings.json: we own it (enabledPlugins:{} override).
 //  - CLAUDE.md: skipped so global user memory never tints one-shot gens (refinement #1).
-const WORKER_CONFIG_SKIP = new Set(['settings.json', 'CLAUDE.md', '.DS_Store', '.lock'])
+// .claude.json is in this set for the same reason settings.json is: the worker
+// OWNS it (ensureWorkerCwd writes it below, stamping projects[ctx.home] trusted).
+// Symlinked, that write lands in the SHARED ~/.claude/.claude.json instead, and
+// then every claude process on the host -- both workers, the channels session,
+// each agent -- rewrites that one file wholesale from its own stale in-memory
+// copy. Measured 2026-08-29: the slow worker's home read trusted, the FAST
+// worker's home read hasTrustDialogAccepted:false, so every restart parked the
+// fast session on the "Do you trust the files in this folder?" modal until a
+// human answered it in the terminal. Nothing was wrong with the stamping code:
+// its write was simply being overwritten through the alias.
+const WORKER_CONFIG_SKIP = new Set(['settings.json', 'CLAUDE.md', '.claude.json', '.DS_Store', '.lock'])
 
 // --- Per-session context ------------------------------------------------------
 //
@@ -71,16 +184,20 @@ const WORKER_CONFIG_SKIP = new Set(['settings.json', 'CLAUDE.md', '.DS_Store', '
 export interface WorkerCtx {
   readonly session: string
   readonly home: string
+  /** An explicit model for this session (fast vs slow), or null: then the shared
+   *  chain decides (MARVEEN_WORKER_MODEL > custom provider > default). */
+  readonly modelOverride: string | null
   readonly configDir: string
   readonly scratchDir: string
   chain: Promise<unknown>
   lastStuckAlert: number
 }
 
-export function makeWorkerCtx(session: string, homeDir: string): WorkerCtx {
+export function makeWorkerCtx(session: string, homeDir: string, modelOverride: string | null = null): WorkerCtx {
   return {
     session,
     home: homeDir,
+    modelOverride,
     configDir: join(homeDir, '.claude-config'),
     scratchDir: join(homeDir, 'scratch'),
     chain: Promise.resolve() as Promise<unknown>,
@@ -108,11 +225,62 @@ export function workerHomeFor(agentId: string, variant: 'slow' | 'fast'): string
  * fleet. The boot-time pre-start in web.ts is already gated, but the worker
  * also LAZY-starts from runViaWorker (scaffold generation, heartbeat, digest),
  * which is how a WEB_ONLY sandbox still created live tmux sessions and wrote
- * into worker config dirs (WORKERHOME1). Read at call time, pure, so the gate
+ * into worker config dirs (WORKERHOME1). Read at call time, so the gate
  * is unit-testable and follows env changes in tests.
+ *
+ * A second instance (a worktree checkout or a temp-dir clone) is refused too, by the same decision as the
+ * background services in web.ts (#2419, Samu 64972): a dashboard action in its UI must not start a live worker
+ * session or write the live worker's config dir either. MARVEEN_ALLOW_SECOND_INSTANCE_SERVICES=1 in the process
+ * environment opts in, as it does for the services; WEB_ONLY=true always refuses.
  */
-export function workerStartAllowed(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env['WEB_ONLY'] !== 'true'
+export function workerStartAllowed(
+  env: NodeJS.ProcessEnv = process.env,
+  where: { projectRoot?: string; isGitFile?: (root: string) => boolean; tmpDir?: string } = {},
+): boolean {
+  return shouldRunBackgroundServices({
+    projectRoot: where.projectRoot ?? PROJECT_ROOT,
+    webOnly: env['WEB_ONLY'] === 'true',
+    allowSecondInstance: env[ALLOW_SECOND_INSTANCE_SERVICES_KEY] === '1',
+    isGitFile: where.isGitFile,
+    tmpDir: where.tmpDir ?? tmpdir(),
+  }).run
+}
+
+/**
+ * WORKERAUTOUPDATE1011: the worker launch line's auto-updater clause.
+ *
+ * Both workers used to launch WITHOUT DISABLE_AUTOUPDATER. channels.sh exports
+ * it and also sets it in the tmux global env, but -g only reaches sessions
+ * created AFTER it: after a reboot the dashboard's worker session is usually
+ * what creates the tmux server, so both workers came up with a live updater
+ * (measured 2026-10-11: two updater-enabled workers 14s before a native
+ * 2.1.296 landed and the launcher symlink moved, while channels and every
+ * sub-agent had the variable). So the clause is explicit, never inherited.
+ *
+ * Default: every worker is pinned. With WORKER_AUTOUPDATE on a native install,
+ * the SLOW worker alone is the designated updater -- `unset`, not merely "no
+ * export", because the tmux global env may still carry the variable.
+ */
+export function workerAutoUpdaterEnv(i: { role: 'slow' | 'fast'; optIn: boolean; nativeInstall: boolean }): string {
+  return i.role === 'slow' && i.optIn && i.nativeInstall
+    ? 'unset DISABLE_AUTOUPDATER; '
+    : 'export DISABLE_AUTOUPDATER=1; '
+}
+
+/**
+ * True when `bin` resolves into the native installer's versions dir
+ * (~/.local/share/claude/versions/<v>). Mirrors claude_is_native in
+ * channels.sh: on an npm-global install the in-process updater would race the
+ * boot-time claude_ensure, so the opt-in is honoured on native installs only.
+ */
+export function isNativeClaudeBin(bin: string | null, home: string = homedir()): boolean {
+  if (!bin) return false
+  try {
+    const root = realpathSync(join(home, '.local', 'share', 'claude', 'versions'))
+    return realpathSync(bin).startsWith(root + '/')
+  } catch {
+    return false
+  }
 }
 
 // Slow session: long-running tasks (analysis, reports, search). The original
@@ -130,6 +298,7 @@ const ctxSlow = makeWorkerCtx(
 const ctxFast = makeWorkerCtx(
   process.env.MARVEEN_WORKER_SESSION_FAST || `${MAIN_AGENT_ID}-worker-fast`,
   process.env.MARVEEN_WORKER_DIR_FAST || workerHomeFor(MAIN_AGENT_ID, 'fast'),
+  WORKER_MODEL_FAST_OVERRIDE,
 )
 
 // --- Message priority routing -------------------------------------------------
@@ -320,6 +489,77 @@ function lstatSyncSafe(p: string): ReturnType<typeof lstatSync> | null {
 
 interface WorkerSettings { enabledPlugins?: Record<string, boolean>; [k: string]: unknown }
 
+/** The fleet-freeze PreToolUse gate in the worker's own settings (KILLSWITCH1022). */
+export const WORKER_FREEZE_GATE_CMD = `bash "${join(PROJECT_ROOT, 'scripts', 'hooks', 'fleet-freeze-gate.sh')}"`
+
+/**
+ * KILLSWITCH1022: the worker runs tools too (--dangerously-skip-permissions),
+ * and its cwd is outside the project, so the project .claude/settings.json never
+ * reaches it. The fleet-freeze gate goes into its OWN settings, first in
+ * PreToolUse: every other entry (and every other hook event) Claude Code may have
+ * written is kept, and the gate entry is replaced, never duplicated.
+ */
+export function withFleetFreezeGate(settings: WorkerSettings): WorkerSettings {
+  const hooks = (settings.hooks && typeof settings.hooks === 'object' && !Array.isArray(settings.hooks) ? settings.hooks : {}) as Record<string, unknown>
+  const pre = (Array.isArray(hooks.PreToolUse) ? hooks.PreToolUse : []) as unknown[]
+  const preToolUse = [
+    { matcher: '*', hooks: [{ type: 'command', command: WORKER_FREEZE_GATE_CMD, timeout: 5 }] },
+    ...pre.filter((e) => !JSON.stringify(e).includes('fleet-freeze-gate.sh')),
+  ]
+  return { ...settings, hooks: { ...hooks, PreToolUse: preToolUse } }
+}
+
+// ENVRELAXGATE1104 (Samu 67818, Marveen 67806). Lives here, not in agent-scaffold.ts: these entries reach the two
+// workers ONLY, never a sub-agent (sub-agents keep the email-send-gate's hard deny). The two workers (marveen-worker, marveen-worker-fast) run the main
+// agent's runAgent prompts (heartbeat, daily digest, second review, schedule prompts) on untrusted text, with Bash and
+// Write, in their own CLAUDE_CONFIG_DIR. The main agent's tracked project settings never reach them (their cwd is
+// outside the install), so only the fleet-freeze gate ran there. This puts the outgoing-copy gate on them the way the
+// main agent carries it, on Bash and the email tools. EMAIL_GATE_MATCHER already starts with `Bash|`, so ONE entry
+// covers both (two entries would run the gate twice on every Bash call). The Telegram/Discord copy entries are left
+// out: the worker has every channel plugin disabled. The command is absolute (the tracked file's $CLAUDE_PROJECT_DIR
+// form would point into the worker's own home there). The send side is the sub-agents' hard email-send-gate (see
+// withWorkerGates), not the main agent's approval gate.
+export const WORKER_MAIL_GATE_MATCHER = EMAIL_GATE_MATCHER
+
+function injectWorkerMailGate(existing: Record<string, unknown>, script: string): void {
+  const hooks = (existing.hooks && typeof existing.hooks === 'object'
+    ? existing.hooks
+    : (existing.hooks = {})) as Record<string, unknown>
+  const command = pythonHookCommand(join(PROJECT_ROOT, 'scripts', 'hooks', script))
+  // Registration guard: a /tmp or missing path must never enter shared settings.
+  if (isUnsafeHookCommand(command)) return
+  const prev = Array.isArray(hooks.PreToolUse) ? (hooks.PreToolUse as unknown[]) : []
+  hooks.PreToolUse = [
+    // same dedupe discipline as injectTelegramCopyGate: only this script under this matcher is replaced
+    ...prev.filter((e) => !(JSON.stringify(e).includes(script) && (e as { matcher?: unknown })?.matcher === WORKER_MAIL_GATE_MATCHER)),
+    { matcher: WORKER_MAIL_GATE_MATCHER, hooks: [{ type: 'command', command, timeout: 10 }] },
+  ]
+}
+
+export function injectWorkerCopyGate(existing: Record<string, unknown>): void {
+  injectWorkerMailGate(existing, 'outgoing-copy-gate.py')
+}
+
+/**
+ * ENVRELAXGATE1104 (Samu 67818, 67900): the worker's gates, written into its own settings on every boot. The
+ * fleet-freeze gate stays FIRST; then the db-write-gate and the email-send-gate (both the sub-agents' own generators)
+ * and the outgoing-copy gate on Bash and the email tools. The email-send-gate is the sub-agents' HARD one, not the
+ * main agent's approval gate (Dani 67895, least privilege): a worker has no legitimate send, a send is always refused,
+ * a draft is held to the recipient ledger, and no approval request would appear under the main agent's name. Every
+ * other entry is kept, and none is duplicated.
+ *
+ * The worker's hook has CLAUDE_PROJECT_DIR = its own home (ctx.home, outside the install), so the db-write-gate takes
+ * it for a sub-agent: its sub-agent list applies (the install .env, the gate-rule files, the shared ~/.claude
+ * settings, its own config dir's settings). That is right: it works on untrusted text.
+ */
+export function withWorkerGates(settings: WorkerSettings): WorkerSettings {
+  const out = withFleetFreezeGate(settings)
+  injectDbWriteGate(out)
+  injectEmailSendGate(out)
+  injectWorkerCopyGate(out)
+  return out
+}
+
 /**
  * Build (idempotently) the worker's isolated cwd + CLAUDE_CONFIG_DIR:
  *  - empty project .mcp.json (defense in depth);
@@ -327,8 +567,9 @@ interface WorkerSettings { enabledPlugins?: Record<string, boolean>; [k: string]
  *    (so auth/transcripts/marketplaces stay shared, persona memory does not);
  *  - settings.json with every channel plugin disabled (no 409);
  *  - .credentials.json seeded from the host login (subscription auth);
- *  - .claude.json with projects[ctx.home] mirroring projects[PROJECT_ROOT]
- *    so the worker inherits Marveen's project-scoped MCP servers.
+ *  - .claude.json with projects[ctx.home] mirroring projects[PROJECT_ROOT],
+ *    but with NO user-scope MCP server and only the allowlisted mail server
+ *    of the project scope (buildWorkerClaudeJson, WORKERMCPSEND1104).
  * No CLAUDE.md is written here: the cwd is outside PROJECT_ROOT, so the worker
  * boots with a neutral context.
  */
@@ -391,7 +632,12 @@ export function ensureWorkerCwd(ctx: WorkerCtx = ctxSlow): void {
   // skipDangerousModePermissionPrompt: suppress the "Bypass Permissions mode"
   // first-run warning so the headless worker (launched with
   // --dangerously-skip-permissions) reaches its prompt without a blocking modal.
-  writeFileSync(settingsPath, JSON.stringify({ ...current, enabledPlugins, skipDangerousModePermissionPrompt: true }, null, 2) + '\n')
+  // WORKERMCPSEND1104 part 2: the kept mail server's non-reading tools denied by name; disableAllHooks and env dropped.
+  // The same kept server is the ONLY entry of the strict MCP config the worker is launched with.
+  const keptMcp = existsSync(join(homedir(), '.claude.json')) ? workerMcpServers() : {}
+  const mailServers = Object.keys(keptMcp)
+  writeFileSync(workerMcpConfigPath(ctx), JSON.stringify({ mcpServers: keptMcp }, null, 2) + '\n', { mode: 0o600 })
+  writeFileSync(settingsPath, JSON.stringify(withWorkerGates(withWorkerMailDeny({ ...current, enabledPlugins, skipDangerousModePermissionPrompt: true }, mailServers)), null, 2) + '\n')
 
   // Subscription auth: materialise the host login JSON as .credentials.json AND
   // clear the stale path-hashed Keychain entry that would shadow it (see the
@@ -405,19 +651,20 @@ export function ensureWorkerCwd(ctx: WorkerCtx = ctxSlow): void {
   // flags on BOTH ctx.home and its realpath (macOS /var, symlinked $HOME
   // edge-cases) since Claude Code keys trust by the resolved workspace path.
   try {
+    // Heal an install that already has the alias: the skip-set above only stops
+    // NEW symlinks, so without this an existing worker dir keeps writing into
+    // the shared file forever. Same guard settings.json has had all along.
+    const workerClaudeJson = join(ctx.configDir, '.claude.json')
+    if (lstatSyncSafe(workerClaudeJson)?.isSymbolicLink()) rmSync(workerClaudeJson, { force: true })
     const homeClaudeJson = join(homedir(), '.claude.json')
     const parsed: { projects?: Record<string, unknown>; hasCompletedOnboarding?: boolean; [k: string]: unknown } =
       existsSync(homeClaudeJson) ? JSON.parse(readFileSync(homeClaudeJson, 'utf-8')) : {}
-    stampWorkerFirstRun(parsed)
-    const projects: Record<string, unknown> = (parsed.projects && typeof parsed.projects === 'object') ? parsed.projects : {}
-    const base = (projects[PROJECT_ROOT] && typeof projects[PROJECT_ROOT] === 'object')
-      ? projects[PROJECT_ROOT] as Record<string, unknown>
-      : {}
-    const trusted = { ...base, hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true, projectOnboardingSeenCount: 1 }
     const keys = new Set<string>([ctx.home])
     try { keys.add(realpathSync(ctx.home)) } catch { /* dir may not resolve yet */ }
-    for (const k of keys) projects[k] = { ...trusted }
-    parsed.projects = projects
+    const { droppedUser, droppedProject } = buildWorkerClaudeJson(parsed, PROJECT_ROOT, keys, tryResolveFromPath('npx'))
+    if (droppedUser.length || droppedProject.length) {
+      logger.info({ droppedUser, droppedProject }, 'worker: MCP servers left out of the worker config (only the allowlisted mail server stays)')
+    }
     writeFileSync(join(ctx.configDir, '.claude.json'), JSON.stringify(parsed, null, 2) + '\n', { mode: 0o600 })
   } catch (err) {
     logger.warn({ err }, 'worker: failed to materialise .claude.json (worker may park on a first-run modal)')
@@ -437,6 +684,162 @@ export function ensureWorkerCwd(ctx: WorkerCtx = ctxSlow): void {
  * Pure (mutates the parsed object only) so it is unit-testable; idempotent and
  * harmless on CC versions that do not know these keys.
  */
+// WORKERMCPSEND1104: the MCP servers a worker may keep. The only worker prompt that uses MCP is the heartbeat, and it
+// only READS mail (src/heartbeat.ts); no worker prompt uses any other server. A server stays only when its launch has
+// EXACTLY this shape: `npx` (or the host's resolved npx path), then only -y/--yes flags, then one of these packages
+// (an optional @version suffix allowed), and nothing after it (Dani's #2499 review: an "any argv word" match kept a
+// `sh -c ...` or another package that merely named this one), a plain version or `latest` only after the @, and no
+// env key or unknown config key (the #2499 delta). Every other server, and every non-stdio (url) server, drops out. Fail-closed: an install with another mail server loses mail in the heartbeat, visibly.
+export const WORKER_MAIL_MCP_PACKAGES: readonly string[] = ['@gongrzhe/server-gmail-autoauth-mcp']
+
+// What may follow `<package>@`: a plain semver version or the `latest` tag. Any other npm spec after the @ (an
+// `npm:` alias, a URL, `file:`, `github:`) installs something else under the allowlisted name (Dani's #2499 delta).
+const PLAIN_VERSION_RE = /^(?:[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?|latest)$/
+
+/** Is this npx argument exactly an allowlisted package, bare or with a plain @version / @latest? */
+function isAllowlistedPackageSpec(token: string): boolean {
+  return WORKER_MAIL_MCP_PACKAGES.some((pkg) =>
+    token === pkg || (token.startsWith(pkg + '@') && PLAIN_VERSION_RE.test(token.slice(pkg.length + 1))))
+}
+
+// The config keys a kept mail server may carry. An `env` with any key drops the entry: NODE_OPTIONS or
+// npm_config_* change what npx runs, and the mail server needs none (measured on this install: an empty env).
+const WORKER_MCP_CONFIG_KEYS = new Set(['type', 'command', 'args', 'env'])
+function hasOnlyPlainConfig(c: Record<string, unknown>): boolean {
+  if (!Object.keys(c).every((k) => WORKER_MCP_CONFIG_KEYS.has(k))) return false
+  if (c.env === undefined) return true
+  return !!c.env && typeof c.env === 'object' && !Array.isArray(c.env) && Object.keys(c.env as object).length === 0
+}
+
+const NPX_YES_FLAGS = new Set(['-y', '--yes'])
+
+/** Is this launch exactly `npx [-y|--yes]... <allowlisted package>[@version]`? */
+function isAllowlistedMailLaunch(command: string, args: unknown[], npxPath: string | null): boolean {
+  if (command !== 'npx' && !(npxPath && command === npxPath)) return false
+  if (!args.every((a) => typeof a === 'string')) return false
+  const words = args as string[]
+  let i = 0
+  while (i < words.length && NPX_YES_FLAGS.has(words[i])) i++
+  return i === words.length - 1 && isAllowlistedPackageSpec(words[i])
+}
+
+/**
+ * Splits project MCP servers into the ones a worker keeps (the allowlisted mail server) and the dropped names.
+ * npxPath: the host's resolved npx (an absolute path), accepted as the command besides the bare `npx`.
+ */
+export function filterWorkerMcpServers(servers: unknown, npxPath: string | null = null): { kept: Record<string, unknown>; dropped: string[] } {
+  const kept: Record<string, unknown> = {}
+  const dropped: string[] = []
+  if (!servers || typeof servers !== 'object' || Array.isArray(servers)) return { kept, dropped }
+  for (const [name, cfg] of Object.entries(servers as Record<string, unknown>)) {
+    const c = (cfg && typeof cfg === 'object' && !Array.isArray(cfg)) ? cfg as { type?: unknown; command?: unknown; args?: unknown; url?: unknown } : null
+    const stdio = !!c && (c.type === undefined || c.type === 'stdio') && c.url === undefined && typeof c.command === 'string'
+    const args = stdio ? (c!.args === undefined ? [] : c!.args) : null
+    if (stdio && Array.isArray(args) && hasOnlyPlainConfig(c as Record<string, unknown>) && isAllowlistedMailLaunch(c!.command as string, args, npxPath)) kept[name] = cfg
+    else dropped.push(name)
+  }
+  return { kept, dropped }
+}
+
+/**
+ * The worker's .claude.json from the host's (parsed ~/.claude.json): the first-run chrome pre-accepted, the
+ * user-scope MCP servers REMOVED (WORKERMCPSEND1104: they reached every worker), and projects[<worker home keys>]
+ * mirroring projects[projectRoot] trusted, with only the allowlisted mail server kept. Pure; mutates `parsed`.
+ * Returns the dropped server names (names only, for the log).
+ */
+export function buildWorkerClaudeJson(
+  parsed: { projects?: Record<string, unknown>; mcpServers?: unknown; hasCompletedOnboarding?: boolean; [k: string]: unknown },
+  projectRoot: string,
+  homeKeys: Iterable<string>,
+  npxPath: string | null = null,
+): { droppedUser: string[]; droppedProject: string[] } {
+  stampWorkerFirstRun(parsed)
+  const droppedUser = (parsed.mcpServers && typeof parsed.mcpServers === 'object' && !Array.isArray(parsed.mcpServers))
+    ? Object.keys(parsed.mcpServers as Record<string, unknown>)
+    : []
+  parsed.mcpServers = {}
+  const projects: Record<string, unknown> = (parsed.projects && typeof parsed.projects === 'object') ? parsed.projects : {}
+  const base = (projects[projectRoot] && typeof projects[projectRoot] === 'object')
+    ? projects[projectRoot] as Record<string, unknown>
+    : {}
+  const { kept, dropped } = filterWorkerMcpServers(base.mcpServers, npxPath)
+  const trusted = { ...base, mcpServers: kept, hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true, projectOnboardingSeenCount: 1 }
+  for (const k of homeKeys) projects[k] = { ...trusted }
+  parsed.projects = projects
+  return { droppedUser, droppedProject: dropped }
+}
+
+// WORKERMCPSEND1104 part 2: the kept mail server's tools, classified. A worker may only READ mail (the heartbeat's
+// search); every other tool of the server is denied by name in the worker's own settings. Deny binds in bypass mode,
+// an allow cannot carve out of a deny, so a per-tool deny list is the documented form; a test pins the server's
+// measured tool list against these two sets, and an unknown tool name fails it (fail-closed classification).
+export const WORKER_MAIL_READ_TOOLS: readonly string[] = ['search_emails', 'read_email', 'list_email_labels', 'list_filters', 'get_filter']
+export const WORKER_MAIL_DENIED_TOOLS: readonly string[] = [
+  'send_email', 'draft_email', 'modify_email', 'batch_modify_emails', 'delete_email', 'batch_delete_emails',
+  'create_label', 'update_label', 'delete_label', 'get_or_create_label',
+  'create_filter', 'create_filter_from_template', 'delete_filter', 'download_attachment',
+]
+
+/** 'read' or 'deny' for a known mail-server tool; 'unknown' otherwise (a test fails on it). */
+export function classifyWorkerMailTool(tool: string): 'read' | 'deny' | 'unknown' {
+  if (WORKER_MAIL_READ_TOOLS.includes(tool)) return 'read'
+  if (WORKER_MAIL_DENIED_TOOLS.includes(tool)) return 'deny'
+  return 'unknown'
+}
+
+/** The server segment of an MCP tool name as Claude Code builds it: characters other than [A-Za-z0-9_-] become `_`. */
+export function mcpServerSegment(server: string): string {
+  return server.replace(/[^A-Za-z0-9_-]/g, '_')
+}
+
+// The keys a worker's settings.json must not carry: disableAllHooks switches its gates off, env rewrites the
+// environment of the worker and of every MCP server it starts (NODE_OPTIONS, npm_config_*). The same two keys the
+// agent scaffold drops on spawn (#2497); here ensureWorkerCwd drops them on every worker start.
+export const WORKER_SETTINGS_STRIPPED_KEYS: readonly string[] = ['disableAllHooks', 'env']
+
+/**
+ * The worker settings with the stripped keys gone and permissions.deny carrying one entry per denied mail tool of each
+ * kept mail server. Earlier entries of that shape are replaced, never duplicated; every other deny entry is kept.
+ * Pure (returns a new object).
+ */
+export function withWorkerMailDeny(settings: WorkerSettings, mailServers: string[]): WorkerSettings {
+  const out: WorkerSettings = { ...settings }
+  for (const k of WORKER_SETTINGS_STRIPPED_KEYS) delete out[k]
+  const perms = (out.permissions && typeof out.permissions === 'object' && !Array.isArray(out.permissions)
+    ? { ...(out.permissions as Record<string, unknown>) }
+    : {}) as Record<string, unknown>
+  const isOurs = (e: unknown) => typeof e === 'string' && /^mcp__.+__(.+)$/.test(e) && WORKER_MAIL_DENIED_TOOLS.includes(e.replace(/^mcp__.+__/, ''))
+  const prev = Array.isArray(perms.deny) ? (perms.deny as unknown[]).filter((e) => !isOurs(e)) : []
+  const ours = mailServers.flatMap((srv) => WORKER_MAIL_DENIED_TOOLS.map((t) => `mcp__${mcpServerSegment(srv)}__${t}`))
+  perms.deny = [...prev, ...ours]
+  out.permissions = perms
+  return out
+}
+
+/** The MCP servers a worker keeps (the allowlisted mail server), from the host's ~/.claude.json; none on any error. */
+export function workerMcpServers(hostClaudeJson: string = join(homedir(), '.claude.json'), npxPath: string | null = tryResolveFromPath('npx')): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(readFileSync(hostClaudeJson, 'utf-8')) as { projects?: Record<string, { mcpServers?: unknown }> }
+    return filterWorkerMcpServers(parsed.projects?.[PROJECT_ROOT]?.mcpServers, npxPath).kept
+  } catch {
+    return {}
+  }
+}
+
+/** The names of the mail servers a worker keeps (none on any read error). */
+export function workerMailServerNames(hostClaudeJson: string = join(homedir(), '.claude.json'), npxPath: string | null = tryResolveFromPath('npx')): string[] {
+  return Object.keys(workerMcpServers(hostClaudeJson, npxPath))
+}
+
+/**
+ * WORKERMCPSEND1104 part 2 (measured 2026-11-04, work/workermcpsend-docs.md): the worker starts with
+ * --strict-mcp-config --mcp-config <this file>, which loads ONLY the servers in the file: no user-scope server, no
+ * project .mcp.json, no ancestor .mcp.json. ensureWorkerCwd writes it on every start with the kept mail server alone.
+ */
+export function workerMcpConfigPath(ctx: { configDir: string }): string {
+  return join(ctx.configDir, 'worker-mcp.json')
+}
+
 export function stampWorkerFirstRun(parsed: { hasCompletedOnboarding?: boolean; fullscreenUpsellSeenCount?: unknown; [k: string]: unknown }): void {
   parsed.hasCompletedOnboarding = true
   const seen = Number(parsed.fullscreenUpsellSeenCount)
@@ -462,7 +865,7 @@ function startWorkerSessionFor(ctx: WorkerCtx): void {
   // Gate BEFORE any side effect: in WEB_ONLY staging neither the tmux session
   // nor the ensureWorkerCwd config-dir writes may happen (WORKERHOME1).
   if (!workerStartAllowed()) {
-    logger.warn({ session: ctx.session }, 'agent-worker: WEB_ONLY mode -- refusing to start a worker session or write its config dir')
+    logger.warn({ session: ctx.session }, 'agent-worker: WEB_ONLY or second instance -- refusing to start a worker session or write its config dir')
     return
   }
   if (workerSessionExists(ctx)) return
@@ -480,14 +883,92 @@ function startWorkerSessionFor(ctx: WorkerCtx): void {
   // measured on vps47 during the WORKERHOME1 cold-start probe: session created,
   // gone before the first 5s poll). tryResolveFromPath probes the known install
   // dirs; fall back to the bare name so an exotic layout keeps the old behavior.
+  //
+  // CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false (2026-06-29): without it the
+  // worker's empty input box shows a DIM history-based ghost suggestion (e.g.
+  // `❯ Try "refactor channel-monitor.ts"`). isSessionReadyForPrompt scrapes the
+  // pane colourless via capture-pane, so PARKED_INPUT_RX matches the ghost and
+  // detectPaneState returns 'typing' -- the worker reads "not ready" FOREVER and
+  // every agent-create fails with "worker session not ready" (observed: agent-create
+  // failed 4x after a cold start). Mirror the agent-process.ts launcher,
+  // which already disables the suggestion for the same scrape-misread reason.
+  // Resolve model and optional custom-provider env prefix.
+  // Priority: MARVEEN_WORKER_MODEL override > main-agent custom provider > default.
+  let customEnvPrefix = ''
+  let customProviderModel: string | null = null
+  if (!WORKER_MODEL_OVERRIDE) {
+    try {
+      const cpEnv = buildCustomProviderLaunchEnv(MAIN_AGENT_ID)
+      if (cpEnv) {
+        customProviderModel = cpEnv.model
+        customEnvPrefix = cpEnv.envPrefix
+        if (cpEnv.customApiKeyForApproval) {
+          stampCustomApiKeyApproval(join(ctx.configDir, '.claude.json'), cpEnv.customApiKeyForApproval)
+        }
+      }
+    } catch (err) {
+      logger.warn({ err }, 'agent-worker: could not resolve main-agent custom provider; falling back to default model')
+    }
+  }
+  // WORKERMODELFAST1109: the fast session may carry its own model (MARVEEN_WORKER_MODEL_FAST).
+  // It is an explicit Claude model like MARVEEN_WORKER_MODEL, so the main agent's
+  // custom provider (model AND endpoint env) must not ride along with it.
+  const override = ctx.modelOverride ?? WORKER_MODEL_OVERRIDE
+  if (ctx.modelOverride) { customEnvPrefix = ''; customProviderModel = null }
+  // DEFAULTCLIGUARD927 keeps guarding the shipped default inside; WORKERMODEL1773
+  // flags an explicit value the measured CLI cannot run.
+  const decision = resolveWorkerModel({
+    override,
+    overrideSource: ctx.modelOverride ? 'env:MARVEEN_WORKER_MODEL_FAST' : 'env:MARVEEN_WORKER_MODEL',
+    customProviderModel,
+    configuredDefault: DEFAULT_AGENT_MODEL,
+    defaultIsDistribution: DEFAULT_AGENT_MODEL_IS_DISTRIBUTION,
+    launchableDefault: () => launchableInstallDefaultSync('worker'),
+    launchableFallback: () => launchableDistributionDefaultSync('worker'),
+    installedCli: () => measureClaudeCliVersionSync().version,
+  })
+  const workerModel = decision.model
+  if (decision.unlaunchable) {
+    logger.warn(
+      { session: ctx.session, model: decision.model, source: decision.source, ...decision.unlaunchable },
+      decision.unlaunchable.fallback
+        ? 'WORKERMODEL1773: the configured worker model is not launchable by the installed Claude Code CLI; this run falls back (the setting is unchanged)'
+        : 'WORKERMODEL1773: the configured worker model is not launchable by the installed Claude Code CLI, and neither is the fallback; launching it anyway, every prompt will be refused (400 unrecognized_model)',
+    )
+    notifyWorkerModelFallback(decision, Date.now())
+  }
+
   const claudeLaunchBin = tryResolveFromPath('claude') ?? 'claude'
+  const autoUpdaterEnv = workerAutoUpdaterEnv({
+    role: ctx === ctxSlow ? 'slow' : 'fast',
+    optIn: WORKER_AUTOUPDATE,
+    nativeInstall: isNativeClaudeBin(tryResolveFromPath('claude')),
+  })
+  if (WORKER_AUTOUPDATE && ctx === ctxSlow && autoUpdaterEnv.startsWith('export')) {
+    logger.warn({ session: ctx.session }, 'WORKERAUTOUPDATE1011: WORKER_AUTOUPDATE is on but claude is not a native install; the slow worker stays pinned')
+  }
   const launch =
     (hasFleetOauthToken() ? `export CLAUDE_CODE_OAUTH_TOKEN="$(cat ${shArg(FLEET_OAUTH_TOKEN_PATH)})"; ` : '') +
     `export CLAUDE_CONFIG_DIR=${shArg(ctx.configDir)}; ` +
+    autoUpdaterEnv +
+    `export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false; ` +
+    // CHANSPARE925: no Agent view (Left would background the worker into the daemon).
+    `export CLAUDE_CODE_DISABLE_AGENT_VIEW=1; ` +
+    // ROOTRESPAWN1001: IS_SANDBOX=1 on a root host (see root-sandbox-env.ts).
+    `${ROOT_SANDBOX_ENV}; ` +
+    customEnvPrefix +
     `cd ${shArg(ctx.home)} && ` +
-    `${shArg(claudeLaunchBin)} --permission-mode auto --model ${shArg(WORKER_MODEL)}`
+    `${shArg(claudeLaunchBin)} --permission-mode auto --model ${shArg(workerModel)} ` +
+    // WORKERMCPSEND1104 part 2: only the servers in the worker's own MCP config, nothing from any other source.
+    `--strict-mcp-config --mcp-config ${shArg(workerMcpConfigPath(ctx))}`
   execFileSync(TMUX, ['new-session', '-d', '-s', ctx.session, '-c', ctx.home, 'bash', '-lc', launch], { timeout: 8000 })
   logger.info({ session: ctx.session, cwd: ctx.home }, 'agent-worker: launched interactive worker session')
+  // APRO920 (c)(2): same rationale as startAgentProcess's model-resolved log --
+  // which config-chain element supplied the --model value.
+  logger.info(
+    { session: ctx.session, model: workerModel, source: decision.source },
+    'agent-worker: launch model resolved',
+  )
   logWorkerClaudeVersion(ctx)
 }
 
@@ -563,7 +1044,7 @@ function selfHealWorkerOnce(ctx: WorkerCtx): boolean {
   if (!shouldSelfHeal(cls)) return false
   logger.warn({ cls, session: ctx.session }, 'agent-worker: pane parked on unexpected chrome -- bounded Escape self-heal')
   for (let i = 0; i < WORKER_SELF_HEAL_MAX_ESCAPES; i++) {
-    try { execFileSync(TMUX, ['send-keys', '-t', ctx.session, 'Escape'], { timeout: 5000 }) } catch { break }
+    try { execFileSync(TMUX, ['send-keys', '-t', exactTmuxTarget(ctx.session), 'Escape'], { timeout: 5000 }) } catch { break }
     try { execFileSync('/bin/sleep', ['0.5'], { timeout: 2000 }) } catch { /* best effort */ }
     const now = classifyWorkerPane(capturePane(ctx.session))
     if (now === 'idle' || now === 'busy') {
@@ -576,13 +1057,58 @@ function selfHealWorkerOnce(ctx: WorkerCtx): boolean {
   return true
 }
 
+// WORKERMODEL1773 part 2: one operator signal per configured model and CLI
+// version per day. Every worker (re)start resolves the model again, and a
+// restart loop must not turn into a message loop; a CLI upgrade or a changed
+// setting is a new key and is announced at once.
+export const WORKER_MODEL_FALLBACK_NOTIFY_WINDOW_MS = 24 * 60 * 60 * 1000
+const workerModelFallbackNotified = new Map<string, number>()
+
+/** Pure: should this decision be announced now? Records the announcement when it says yes. */
+export function shouldNotifyWorkerModelFallback(
+  sent: Map<string, number>,
+  key: string,
+  nowMs: number,
+  windowMs: number = WORKER_MODEL_FALLBACK_NOTIFY_WINDOW_MS,
+): boolean {
+  const last = sent.get(key)
+  if (last !== undefined && nowMs - last < windowMs) return false
+  sent.set(key, nowMs)
+  return true
+}
+
+/** Pure: the rate-limit key -- the configured model AND the CLI version, so an upgrade announces again. */
+export function workerModelFallbackKey(d: WorkerModelDecision): string {
+  const u = d.unlaunchable!
+  return `${u.requested}|${u.installedCli}`
+}
+
+/** Pure: the operator text for an unlaunchable configured worker model. */
+export function workerModelFallbackText(d: WorkerModelDecision): string {
+  const u = d.unlaunchable!
+  const head = `⚠️ Marveen worker: a beállított worker-modellt (${u.requested}, forrás: ${d.source}) a telepített Claude Code ${u.installedCli} nem tudja elindítani (legalább ${u.minCli} kell).`
+  return u.fallback
+    ? `${head} Ez a futás helyette ezzel indult: ${u.fallback}. A beállítást nem írtuk át; Claude Code-frissítés után a beállított modell magától visszajön.`
+    : `${head} A tartalék modell sem indítható ezen a verzión, ezért a beállított modellel indult: minden kérés hibát fog adni. Frissítsd a Claude Code-ot, vagy állíts be indítható modellt.`
+}
+
+function notifyWorkerModelFallback(d: WorkerModelDecision, nowMs: number): void {
+  const u = d.unlaunchable
+  if (!u) return
+  if (!shouldNotifyWorkerModelFallback(workerModelFallbackNotified, workerModelFallbackKey(d), nowMs)) return
+  void notifyChannel(workerModelFallbackText(d)).catch(() => { /* notifyChannel logs internally */ })
+}
+
+/** Test hook: forget which fallbacks were already announced. */
+export function resetWorkerModelFallbackNotices(): void { workerModelFallbackNotified.clear() }
+
 /** Loud, rate-limited operator signal: the worker never became ready. */
 function alertWorkerStuck(ctx: WorkerCtx, paneTail: string): void {
   logger.error({ paneTail, session: ctx.session }, 'agent-worker: worker never became ready (agent-gen / capability-summary / heartbeat / digest consumers will fail)')
   if (Date.now() - ctx.lastStuckAlert < WORKER_STUCK_ALERT_COOLDOWN_MS) return
   ctx.lastStuckAlert = Date.now()
   void notifyChannel(
-    `⚠️ Marveen worker [${ctx.session}]: a hatter-worker session nem all keszen (beragadt dialogus vagy ismeretlen kepernyo). Onjavitas lefutott (Escape + restart), de a keszenlet nem allt helyre. Erintett: agens-generalas, capability-osszefoglalo, heartbeat, digest. Nezz ra: tmux attach -t ${ctx.session}`,
+    `⚠️ Marveen worker [${ctx.session}]: a háttér-worker session nem áll készen (beragadt dialógus vagy ismeretlen képernyő). Önjavítás lefutott (Escape + restart), de a készenlét nem állt helyre. Érintett: ágens-generálás, capability-összefoglaló, heartbeat, digest. Nézz rá: tmux attach -t ${ctx.session}`,
   ).catch(() => { /* notifyChannel logs internally */ })
 }
 
@@ -591,7 +1117,7 @@ async function ensureWorkerReady(ctx: WorkerCtx): Promise<boolean> {
   // session that the gated start never created, then alertWorkerStuck would
   // notifyChannel the LIVE channel from a staging instance.
   if (!workerStartAllowed()) {
-    logger.warn({ session: ctx.session }, 'agent-worker: WEB_ONLY mode -- worker disabled, failing the request fast')
+    logger.warn({ session: ctx.session }, 'agent-worker: WEB_ONLY or second instance -- worker disabled, failing the request fast')
     return false
   }
   startWorkerSessionFor(ctx)
@@ -616,20 +1142,39 @@ function restartWorkerSession(ctx: WorkerCtx): void {
   // gated upstream, but a restart here would kill-session a LIVE worker from a
   // staging instance -- never do that.
   if (!workerStartAllowed()) {
-    logger.warn({ session: ctx.session }, 'agent-worker: WEB_ONLY mode -- refusing to restart (kill) a worker session')
+    logger.warn({ session: ctx.session }, 'agent-worker: WEB_ONLY or second instance -- refusing to restart (kill) a worker session')
     return
   }
-  try { execFileSync(TMUX, ['kill-session', '-t', ctx.session], { timeout: 5000 }) } catch { /* not running */ }
+  // TMUXWINDOWATTR920: stderr piped; "not running" is the expected case here,
+  // so it is logged at debug with the site instead of copied onto stderr.
+  try { execFileSync(TMUX, ['kill-session', '-t', exactTmuxTarget(ctx.session)], { timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] }) } catch (err) { logger.debug({ site: 'agent-worker.restart', session: ctx.session, tmux: tmuxStderr(err) }, 'tmux kill-session: not running') }
   try { startWorkerSessionFor(ctx) } catch (err) { logger.warn({ err, session: ctx.session }, 'agent-worker: restart failed') }
 }
 
 // Reset context between requests so unrelated one-shots never share/grow context.
-function clearWorkerContext(ctx: WorkerCtx): void {
+async function clearWorkerContext(ctx: WorkerCtx): Promise<void> {
   try {
-    execFileSync(TMUX, ['send-keys', '-t', ctx.session, '-l', '/clear'], { timeout: 5000 })
+    execFileSync(TMUX, ['send-keys', '-t', exactTmuxTarget(ctx.session), '-l', '/clear'], { timeout: 5000 })
     execFileSync('/bin/sleep', ['0.2'], { timeout: 2000 })
-    execFileSync(TMUX, ['send-keys', '-t', ctx.session, 'Enter'], { timeout: 5000 })
-    execFileSync('/bin/sleep', ['0.5'], { timeout: 2000 })
+    execFileSync(TMUX, ['send-keys', '-t', exactTmuxTarget(ctx.session), 'Enter'], { timeout: 5000 })
+    // Typed-ahead floor (R1 review corner): see CLEAR_READY_SETTLE_MS. The pane can
+    // still show the pre-/clear idle prompt until the TUI reads the Enter, so the
+    // first readiness poll runs only after the old fixed-sleep floor has passed.
+    // Async on purpose: these waits are up to the 8s budget long, and a synchronous
+    // /bin/sleep here would block the dashboard event loop (42b085b3).
+    await sleepMs(CLEAR_READY_SETTLE_MS)
+    // Loaded TUIs can take ~3.5s to process /clear (0038ce9c), so poll the pane
+    // state instead of sleeping a fixed time. Fail open past the budget: a dispatch
+    // must deliver, the request is never dropped here (the exhaustion is logged).
+    const clearDeadline = Date.now() + CLEAR_READY_BUDGET_MS
+    let clearReady = false
+    while (Date.now() < clearDeadline) {
+      if (await isSessionReadyForPrompt(ctx.session)) { clearReady = true; break }
+      await sleepMs(CLEAR_READY_POLL_MS)
+    }
+    if (!clearReady) {
+      logger.warn({ session: ctx.session }, 'agent-worker: /clear did not return an idle prompt within budget (continuing)')
+    }
   } catch (err) {
     logger.warn({ err }, 'agent-worker: /clear failed (continuing)')
   }
@@ -661,6 +1206,11 @@ async function runWorkerAttempt(ctx: WorkerCtx, message: string, timeoutMs: numb
   const reqId = nextReqId()
   const outPath = join(ctx.scratchDir, `${reqId}.out`)
   const donePath = join(ctx.scratchDir, `${reqId}.done`)
+  // The whole request closes on the .done sentinel appearing in scratchDir; if
+  // that dir is missing (worker home wiped while the tmux session stayed up),
+  // the worker cannot ever write it and the request is silently lost to a
+  // timeout. Idempotent no-op when the dir is already there.
+  try { mkdirSync(ctx.scratchDir, { recursive: true }) } catch { /* best effort */ }
   for (const p of [outPath, donePath]) { try { rmSync(p, { force: true }) } catch { /* none */ } }
 
   // PANEWRITERS805: /clear + prompt-send is ONE atomic delivery. Unlocked, the
@@ -669,7 +1219,7 @@ async function runWorkerAttempt(ctx: WorkerCtx, message: string, timeoutMs: numb
   // cleared context ahead of ours. Deliver mode (not recover): a dispatch must
   // deliver; on a wedged holder we fail open past the budget, logged.
   const sendRes = await withSessionSendLock(ctx.session, null, 'deliver', async () => {
-    clearWorkerContext(ctx)
+    await clearWorkerContext(ctx)
     await sendPromptToSession(ctx.session, buildWorkerPrompt(message, outPath, donePath), null, { lockMode: 'held' })
   })
   if (sendRes.failedOpen) {

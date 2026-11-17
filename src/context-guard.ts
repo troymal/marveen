@@ -20,6 +20,13 @@
 // This module is dependency-free (no clock, tmux, or fs) so the state machine
 // is unit-testable. The I/O lives in src/web/context-guard-runner.ts.
 
+// The daily-handoff tier reuses the auto-restart module's PURE due-helpers
+// (parseHHMM / dailyDueAtMs / restartDue) rather than restating the schedule
+// arithmetic: two copies of "is this daily slot due" would be two places to
+// get a midnight boundary wrong. Those helpers touch no clock or fs, so the
+// dependency-free property above still holds.
+import { parseHHMM, dailyDueAtMs, restartDue } from './auto-restart.js'
+
 export interface ContextGuardConfig {
   /** Master toggle for the PROACTIVE tiers (actPct handoff / hardPct restart).
    *  Default FALSE: opt-in per agent. (The original rationale -- avoiding a
@@ -57,6 +64,48 @@ export interface ContextGuardConfig {
   idleFlushTokens: number
   /** How long the session must have been quiet before the idle tier acts. */
   idleMinutes: number
+  /** Daily-handoff tier: at a fixed wall-clock time, hand the session off and
+   *  restart it -- the scheduled counterpart of the three context-driven
+   *  tiers. Independent of `enabled` and default FALSE, like the idle tier:
+   *  it answers a third question (is this session a DAY old), and turning it
+   *  on ends a conversation on a timetable rather than on a measurement. */
+  dailyHandoffEnabled: boolean
+  /** Local wall-clock time (HH:MM) the daily tier fires at; null = unset.
+   *  Unset is NOT a silent no-op for the operator: dailyHandoffArmed() is
+   *  false, so the auto-restart runner keeps its own nightly restart instead
+   *  of standing aside for a tier that can never fire. */
+  dailyHandoffTime: string | null
+  /** How long (minutes) one restart need of the agent may be held while it
+   *  owns a live heavy-job gate job (scripts/heavy-job-gate.sh), running or
+   *  queued: at most this long per hold episode, an unbroken run of
+   *  restarting sweeps (src/web/heavy-job-hold.ts), however many jobs come
+   *  and go. A restart kills the agent's process tree, the gated job with it
+   *  (measured: a 36-minute gated test run ended in 143 with no result). Past
+   *  it the restart goes ahead. 0 = never hold. */
+  heavyJobDeferMaxMinutes: number
+  /** Periodic-handoff tier: hand off and restart on a fixed wall-clock
+   *  cadence, independent of context size -- the hourly counterpart of the
+   *  daily tier, for an operator who wants a session refreshed on a clock
+   *  rather than on a measurement. Independent of `enabled` and default
+   *  FALSE, like the other scheduled tiers. */
+  periodicHandoffEnabled: boolean
+  /** How often the periodic tier may fire, in minutes. */
+  periodicHandoffMinutes: number
+  /** Below this much context GROWTH since the tier's last run, a due slot is
+   *  skipped: a quiet agent whose context barely moved gets nothing from a
+   *  handoff/restart cycle but the cost of one (a handoff-writing turn plus a
+   *  restart). The clock is pushed a full interval out from now when this
+   *  skips it, so a quiet agent is not re-checked every sweep until growth
+   *  catches up (see periodicHandoffStep). */
+  periodicHandoffMinTokens: number
+  /** Task-close tier: hand off and restart when the agent's kanban queue
+   *  drains to empty (no in_progress/waiting card left) with no open owner
+   *  question -- a natural pause, not a measurement. Edge-triggered: fires
+   *  once when the queue goes from non-empty to empty, not on every sweep
+   *  that finds it empty, so a board that stays empty does not restart every
+   *  sweep and a single card closing while others stay open does not fire.
+   *  Independent of `enabled` and default FALSE, like the other tiers. */
+  taskCloseHandoffEnabled: boolean
 }
 
 export const DEFAULT_CONTEXT_GUARD: ContextGuardConfig = {
@@ -106,7 +155,39 @@ export const DEFAULT_CONTEXT_GUARD: ContextGuardConfig = {
   // "quieter than this is not a working turn" boundary rather than a second
   // invented figure.
   idleMinutes: 20,
+  dailyHandoffEnabled: false,
+  // No default time. A default here would be a schedule nobody chose, and the
+  // arming predicate treats null as "not armed", so an operator who enables
+  // the tier without naming a time keeps the old nightly restart rather than
+  // losing it to a tier that never fires.
+  dailyHandoffTime: null,
+  // 45 minutes: longer than the measured gated run that a restart killed
+  // (2182 s = 36 min), shorter than a saturated agent should stay
+  // unreachable. A job that outlives it is killed, loudly.
+  heavyJobDeferMaxMinutes: 45,
+  periodicHandoffEnabled: false,
+  periodicHandoffMinutes: 30,
+  // 50k: deliberately smaller than idleFlushTokens (400k) -- this tier is a
+  // cheap, scheduled insurance restart, not the cost-driven idle-flush, so
+  // the floor only needs to rule out "the clock came round but the agent did
+  // nothing at all", not the much larger expensive-session threshold.
+  periodicHandoffMinTokens: 50_000,
+  taskCloseHandoffEnabled: false,
 }
+
+/**
+ * Upper bound for every minutes field. Each one is turned into a millisecond
+ * deadline (nowMs + minutes * 60_000), and Number.isFinite(1e308) is true while
+ * 1e308 * 60_000 is Infinity: an infinite deadline is never reached, so the
+ * phase would never time out. This is a conversion limit, not a business one
+ * (about 5800 years): it keeps the latest possible Date plus two such durations
+ * a safe integer.
+ */
+/** Lowest accepted periodicHandoffMinutes; a smaller value is raised to this
+ *  (not reset to the default), so "as often as allowed" stays meaningful. */
+export const PERIODIC_HANDOFF_MIN_MINUTES = 15
+
+export const MAX_GUARD_MINUTES = Math.floor((Number.MAX_SAFE_INTEGER - 8.64e15) / (2 * 60_000))
 
 /** Coerce arbitrary parsed JSON into a safe, fully-populated config. */
 export function normalizeContextGuardConfig(raw: unknown): ContextGuardConfig {
@@ -114,7 +195,7 @@ export function normalizeContextGuardConfig(raw: unknown): ContextGuardConfig {
   const pct = (v: unknown, dflt: number): number =>
     (typeof v === 'number' && Number.isFinite(v) && v > 0 && v < 1) ? v : dflt
   const mins = (v: unknown, dflt: number): number =>
-    (typeof v === 'number' && Number.isFinite(v) && v > 0) ? v : dflt
+    (typeof v === 'number' && Number.isFinite(v) && v > 0) ? Math.min(v, MAX_GUARD_MINUTES) : dflt
   let actPct = pct(o.actPct, DEFAULT_CONTEXT_GUARD.actPct)
   let hardPct = pct(o.hardPct, DEFAULT_CONTEXT_GUARD.hardPct)
   if (hardPct < actPct) hardPct = actPct // hard tier can never sit below act
@@ -139,6 +220,33 @@ export function normalizeContextGuardConfig(raw: unknown): ContextGuardConfig {
     idleFlushEnabled: o.idleFlushEnabled === true, // default-off (opt-in), like `enabled`
     idleFlushTokens,
     idleMinutes: mins(o.idleMinutes, DEFAULT_CONTEXT_GUARD.idleMinutes),
+    dailyHandoffEnabled: o.dailyHandoffEnabled === true, // default-off (opt-in), like the other tiers
+    // Same shape as normalizeAutoRestartConfig's dailyTime: a value that does
+    // not parse as HH:MM becomes null rather than being carried through, so a
+    // typo disarms the tier instead of scheduling it at an unreadable time.
+    dailyHandoffTime: parseHHMM(o.dailyHandoffTime) !== null ? (o.dailyHandoffTime as string).trim() : null,
+    // 0 is a real value here (never defer), so not mins(): only a finite,
+    // non-negative number is taken, capped at a day so a typo cannot park a
+    // saturated agent indefinitely.
+    heavyJobDeferMaxMinutes:
+      (typeof o.heavyJobDeferMaxMinutes === 'number' && Number.isFinite(o.heavyJobDeferMaxMinutes) && o.heavyJobDeferMaxMinutes >= 0)
+        ? Math.min(o.heavyJobDeferMaxMinutes, 24 * 60)
+        : DEFAULT_CONTEXT_GUARD.heavyJobDeferMaxMinutes,
+    periodicHandoffEnabled: o.periodicHandoffEnabled === true, // default-off (opt-in), like the other scheduled tiers
+    // Floored at PERIODIC_HANDOFF_MIN_MINUTES: the shared token can lower this
+    // for another agent (contextGuardWeakenings reads a lower value as a
+    // strengthening), and without a floor 0.1 would arm a restart on every
+    // sweep -- the "no per-minute restart" rule this tier is built around.
+    periodicHandoffMinutes: Math.max(PERIODIC_HANDOFF_MIN_MINUTES, mins(o.periodicHandoffMinutes, DEFAULT_CONTEXT_GUARD.periodicHandoffMinutes)),
+    // 0 is a real value here (fire on the clock regardless of growth), so not
+    // the >= 10_000 typo-guard idleFlushTokens/limitTokens use: those gate
+    // "is this session big", this one gates "how much growth is enough to be
+    // worth a cycle", where an operator choosing 0 is not a typo.
+    periodicHandoffMinTokens:
+      (typeof o.periodicHandoffMinTokens === 'number' && Number.isFinite(o.periodicHandoffMinTokens) && o.periodicHandoffMinTokens >= 0)
+        ? Math.floor(o.periodicHandoffMinTokens)
+        : DEFAULT_CONTEXT_GUARD.periodicHandoffMinTokens,
+    taskCloseHandoffEnabled: o.taskCloseHandoffEnabled === true, // default-off (opt-in), like the other tiers
   }
 }
 
@@ -163,20 +271,60 @@ export const CONTEXT_LIMIT_TIERS = [200_000, 500_000, 1_000_000] as const
  *
  * Sonnet stays at 200k deliberately: this host has never observed a sonnet
  * session above 198k (sonnet-5 max 197,885 across 14 days), so 200k is the
- * evidenced effective window there. Haiku is 200k by spec. Unknown models
- * stay conservative at 200k -- calibrateLimit and the runner's persisted
- * high-water mark step the denominator up from live evidence, and
- * over-estimating would blind the proactive tiers (the 2026-07-26 failure
- * mode), while under-estimating is loud and self-correcting.
+ * evidenced effective window there. Sonnet 5.5 is the exception, measured
+ * 2026-10-12: its Claude Code status bar reports a 1M window (trinity
+ * 216k/1M, arnold 201k/1M) while the 200k guess read those sessions as
+ * 110% and ~100% and force-restarted both at ~20% real usage. Haiku 4.5 is
+ * 200k by spec. Unknown models stay conservative at 200k -- calibrateLimit
+ * and the runner's persisted high-water mark step the denominator up from
+ * live evidence, and over-estimating would blind the proactive tiers (the
+ * 2026-07-26 failure mode), while under-estimating is loud and
+ * self-correcting.
  */
-const ONE_MILLION_FAMILIES = [/fable-\d/, /mythos-\d/, /opus-4-[6-9]/, /opus-[5-9]\b/]
+const ONE_MILLION_FAMILIES = [/fable-\d/, /mythos-\d/, /opus-4-[6-9]/, /opus-[5-9]\b/, /sonnet-5-[5-9]/]
 
 export function contextLimitForModel(model: string | null | undefined): number {
   if (typeof model !== 'string') return 200_000
   const m = model.toLowerCase()
   if (m.includes('[1m]')) return 1_000_000
+  // Fable 5.2 (FABLE52SELECTOR1109, measured 2026-11-09): the model has a 1M
+  // window (official models overview), but Claude Code 2.1.319, the fleet's
+  // CLI, does not know the id yet: `claude -p --model claude-fable-5-2` warns
+  // [claude-code:unrecognized_model] and reports contextWindow 200000 /
+  // maxOutputTokens 32000 in modelUsage, where claude-fable-5-1 on the same CLI
+  // reports 1000000 / 64000. The CLI therefore reports a 200k window for the
+  // session (inferred from that metadata; a 200k+ session was not run to watch
+  // a cap), and reading it against 1M would blind the proactive tiers (the
+  // 2026-07-26 failure mode above) if the CLI acts on what it reports. Drop
+  // this line once the CLI reports 1M for the id.
+  if (/fable-5-2\b/.test(m)) return 200_000
   if (ONE_MILLION_FAMILIES.some(rx => rx.test(m))) return 1_000_000
+  // minimax-m3 is a special case, NOT a general "trust the vendor" precedent
+  // (see deepseek-v4-pro below, which stays 200_000 on live measurement).
+  // MiniMax's own /anthropic compat endpoint misreports 200K in its model
+  // metadata instead of M3's real 1M (MiniMax-AI/MiniMax-M2.7#46) -- but
+  // agent-process.ts's resolveProviderEnv forces
+  // CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000 for every minimax- launch, which a
+  // live restart confirmed actually works (pane went from "199k left" to
+  // "999k left"). This 1M and that env var override are a pair: dropping the
+  // override without reverting this would under-restart against a window the
+  // CLI no longer has.
+  if (m.startsWith('minimax-')) return 1_000_000
+  // Same pairing for OpenRouter's DeepSeek V4 family: OpenRouter lists a
+  // 1,048,576-token context for deepseek/deepseek-v4* (models API, 2026-10-12),
+  // but Claude Code does not know these ids and caps the session at 200k
+  // (dipike on deepseek/deepseek-v4.1-flash: status bar 165k/200k).
+  // agent-process.ts exports CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000 for exactly
+  // the ids this predicate accepts. The direct-API deepseek-v4-pro (no
+  // "deepseek/" prefix) is untouched and stays 200k.
+  if (isOpenRouterOneMillionModel(m)) return 1_000_000
   return 200_000
+}
+
+/** OpenRouter model ids that run a 1M window once Claude Code is told so via
+ *  CLAUDE_CODE_MAX_CONTEXT_TOKENS (set in agent-process.ts resolveProviderEnv). */
+export function isOpenRouterOneMillionModel(model: string): boolean {
+  return /^deepseek\/deepseek-v4/.test(model.toLowerCase())
 }
 
 /**
@@ -242,6 +390,11 @@ export interface GuardState {
   cooldownUntilMs: number
   /** Consecutive idle-phase sweeps that saw a saturated pane (debounce). */
   saturatedStreak: number
+  /** Stale-handoff refreshes already requested in THIS await-handoff sequence.
+   *  Bounded by MAX_STALE_REFRESHES: without a bound the refresh loop cannot
+   *  converge for an agent whose own scheduled task fires more often than the
+   *  staleness slack, and it runs to the handoff timeout every time. */
+  staleRefreshCount: number
   /** Set at restart time when HANDOFF.md predates the agent's last transcript
    *  activity by more than the slack: ~minutes of work the handoff does NOT
    *  cover. Carried into await-ready so the resume prompt can say so -- a
@@ -249,6 +402,29 @@ export interface GuardState {
    *  questions (2026-08-17: a merge-gate verdict on a payment PR was missing
    *  from a 20-minute-old handoff presented as current). */
   handoffStaleMinutes: HandoffStaleness
+  /** await-handoff only: a usage limit parked this sequence after the last
+   *  handoff request went out, so that request was answered by the limit and
+   *  never read. The first unlimited sweep re-sends it once (see
+   *  HANDOFF_RESEND_REASON_PREFIX) and clears this. Optional so every state
+   *  literal that never enters await-handoff reads as "not parked". */
+  handoffParkedByLimit?: boolean
+  /** await-handoff only: the reason of the handoff request this sequence last
+   *  sent. A re-send carries a reason of its own, and the runner needs the
+   *  original one to word the prompt the same way (act / idle / daily / stale). */
+  handoffRequestReason?: string
+  /** await-handoff only: this sequence was started by the idle-flush tier. Set
+   *  when the sequence starts and carried by `...state` through stale-refresh
+   *  and re-send requests, which overwrite handoffRequestReason. The restart
+   *  notice reads it: by the time the restart decision is made, the
+   *  decision reason is "handoff written" and the idle-flush origin is only
+   *  here. */
+  idleFlushSequence?: boolean
+
+  /** await-handoff only: the busy-pane deferral already reported, once, that
+   *  the pane stayed busy a whole handoffTimeoutMinutes past the deadline.
+   *  Optional, and absent from every state literal that starts a sequence, so
+   *  each new handoff sequence may report once again. */
+  busyOverdueWarned?: boolean
 }
 
 export const INITIAL_GUARD_STATE: GuardState = {
@@ -257,6 +433,7 @@ export const INITIAL_GUARD_STATE: GuardState = {
   deadlineMs: 0,
   cooldownUntilMs: 0,
   saturatedStreak: 0,
+  staleRefreshCount: 0,
   handoffStaleMinutes: null,
 }
 
@@ -266,6 +443,72 @@ export const INITIAL_GUARD_STATE: GuardState = {
  *  a scrollback quote scrolling through the footer region, a mid-render
  *  frame -- clears by the next sweep. */
 export const SATURATION_CONFIRM_SWEEPS = 2
+
+/**
+ * Below this MEASURED context fraction a PERCENTAGE-shaped saturation banner is
+ * not believable.
+ *
+ * The banner is a CLAIM the CLI computes with its OWN denominator; pct is a
+ * MEASUREMENT from the transcript over contextLimitForModel's denominator (the
+ * 1M families plus the runner's persisted high-water mark). When a model id
+ * reaches the CLI WITHOUT the [1m] marker the CLI sizes its status line to 200k
+ * and prints "100% context used" at ~179k, while the session keeps working --
+ * 998 856 tokens observed in one session on this host. Believing the claim
+ * there executes a WORKING agent mid-turn: 318 numeric "pane saturated" hard
+ * restarts over nine days across four agents, measured context min 18 / median
+ * 19 / max 43 percent, not one above 90.
+ *
+ * 0.5 sits in the EMPTY BAND between the measured false positives (max 0.43)
+ * and any believable genuine saturation: per the CALIBRATION_OVERSHOOT_TOLERANCE
+ * note, 11 sessions that the CLI itself flagged "100% context used" measured
+ * 0.89-1.07. The margin is deliberately asymmetric towards safety (16% of
+ * headroom towards the false readings, 78% towards the genuine ones): when in
+ * doubt we believe the banner. A standalone constant, NOT derived from
+ * cfg.actPct -- lowering actPct must never widen the band in which the net
+ * stands down.
+ */
+export const SATURATION_CREDIBLE_MIN_PCT = 0.5
+
+/**
+ * Does the measurement support the pane's saturation banner?
+ *
+ * `bannerIsHardError` is what keeps this safe, and it is why the parameter is
+ * required rather than defaulted. Only the PERCENTAGE-shaped banners ("100%
+ * context used", "Context low (N% remaining)") take their truth from the CLI's
+ * status-line denominator and can therefore be wrong. The error-shaped ones
+ * ("Context limit reached", "context ... full", "auto-compact required") are
+ * painted only after a turn ACTUALLY failed at the real limit -- in CLI 2.1.205
+ * "Context limit reached" renders in color:"error" off the API's own "input
+ * length and max_tokens exceed context limit" -- so no denominator is involved
+ * and nothing measured here may overrule them. Overruling one would stand the
+ * net down on a genuinely wedged pane AND open the dispatch gate to it, turning
+ * a ~10 minute rescue into silent message loss. See
+ * paneShowsContextSaturationHardError in pane-state.ts.
+ *
+ * `pct === null` (unreadable transcript) => TRUE: there is no evidence against
+ * the banner, and that is the case the net was originally built for (samu,
+ * 2026-07-18). Only a real measurement may overrule a real banner.
+ *
+ * There is deliberately NO time-based valve for the mirror-image failure (a
+ * denominator wrong UPWARDS, e.g. [1m] pinned on a genuinely 200k model),
+ * because that case self-corrects through bannerIsHardError: the gate is open
+ * for such a session, so the next dispatched prompt starts a turn, the turn
+ * fails at the real limit, the CLI paints "Context limit reached", and the
+ * following sweep restarts it. An idle-time valve was written and then removed:
+ * idleMs cannot tell a wedged session from a merely quiet one, so it would hard
+ * restart every healthy personal assistant that goes silent overnight -- which
+ * is the exact failure this function exists to remove.
+ */
+export function saturationBannerCredible(
+  paneSaturated: boolean,
+  bannerIsHardError: boolean,
+  pct: number | null,
+): boolean {
+  if (!paneSaturated) return false
+  if (bannerIsHardError) return true
+  if (pct === null) return true
+  return pct >= SATURATION_CREDIBLE_MIN_PCT
+}
 
 export interface GuardInputs {
   nowMs: number
@@ -281,6 +524,10 @@ export interface GuardInputs {
    *  working -- deferring on `!paneIdle` would protect wedged panes from
    *  the restart that is their only way out. */
   paneBusy: boolean
+  /** The idle-looking pane still runs background work: a BashTool background
+   *  shell, a Monitor or a sub-agent (pane-state hasBackgroundWork). Vetoes the
+   *  idle-flush tier, whose restart would kill that work (IDLEFLUSHVETO812). */
+  paneBackgroundWork: boolean
   /** Session is ready to receive a prompt (post-restart readiness). */
   sessionReady: boolean
   /** Current HANDOFF.md mtime (ms), or null when the file does not exist. */
@@ -296,6 +543,242 @@ export interface GuardInputs {
    *  writes nothing while it runs -- so it is only ever read together with
    *  paneIdle. See readTranscriptMtimeFromProjectDir. */
   idleMs: number | null
+  /** The configured daily slot has come round and has not been served yet.
+   *  Computed by the runner with dailyHandoffDue(), which needs a local
+   *  midnight and the last-served stamp -- neither of which belongs in this
+   *  clock-free module's decision function. */
+  dailyHandoffDue: boolean
+  /** The periodic-handoff tier's clock+token-floor slot has come round and
+   *  has not been served yet. Computed by the runner with
+   *  applyPeriodicHandoffSkipSweep(), which needs the per-agent last-run
+   *  record and the measured context growth -- neither belongs in this
+   *  clock-free module's decision function. */
+  periodicHandoffDue: boolean
+  /** The task-close tier's empty-queue edge fired and has not been served
+   *  yet. Computed by the runner with applyTaskCloseSkipSweep(), which needs
+   *  the kanban queue count -- a DB read that does not belong in this
+   *  dependency-free module. */
+  taskCloseHandoffDue: boolean
+  /** The session is CURRENTLY blocked by a plan usage limit, as decided by
+   *  usageLimitVerdict() from the session transcript -- NOT the pane banner,
+   *  which outlives the limit (see USAGE_LIMIT_REASON_PREFIX). */
+  usageLimited: boolean
+  /** When the persisted resume obligation for this agent expires (ms):
+   *  restartedAtMs + PENDING_RESUME_TTL_MS, the edge restorableResumeStates
+   *  applies after a dashboard restart. null = no obligation on record. Only
+   *  read by the await-ready usage-limit park, which must never outlive it. */
+  pendingResumeExpiresAtMs: number | null
+}
+
+/**
+ * Reason prefix for every non-action taken because the session is blocked by a
+ * plan usage limit.
+ *
+ * Measured 2026-09-27 ~21:00 on three live agent panes: the footer read
+ * "⚠ Usage limit reached · continuing automatically at 6am · esc to cancel"
+ * over an empty prompt, with the agent idle. To the idle-flush tier such a
+ * session is "heavy and quiet", so it would ask for a handoff the agent has no
+ * quota to write, force-restart it after handoffTimeoutMinutes, and type the
+ * resume prompt into a session that is still limited: the working context is
+ * thrown away and the resume is answered by the limit, i.e. lost as well. The
+ * act tier and the daily tier would do the same, and the hard tier would
+ * restart straight into the limit. None of them can achieve anything until the
+ * limit lifts, and a limited session is not growing its context either, so the
+ * guard parks: no new handoff request, no restart, no resume injection, with
+ * the running deadlines pushed out so the wait does not count against the
+ * agent. When the limit lifts, the normal logic resumes on the next sweep.
+ *
+ * WHY NOT THE BANNER. Measured the same evening: that footer stays on screen
+ * after the limit has lifted. one agent answered a message in ~10 s with
+ * the banner still up, and two other agents worked for ~2 hours under it. A
+ * banner-only signal would park every tier indefinitely on exactly the agents
+ * the idle tier exists for. The transcript is what records whether the
+ * session's last turn was refused; see usageLimitEvidenceFromTranscript.
+ *
+ * The saturation net is deliberately NOT parked. "Context limit reached" is a
+ * different condition (a turn failed at the real context window) and a
+ * saturated pane never recovers by waiting, limit or no limit; it keeps
+ * outranking this.
+ */
+export const USAGE_LIMIT_REASON_PREFIX = 'usage-limited'
+
+/**
+ * Safety bound on one parking episode, measured from the first refused turn of
+ * the episode. The transcript cannot see a limit lift early (measured
+ * 2026-09-27: a weekly-limit refusal at 06:30Z carried resetsAt = the next day
+ * 04:00Z, yet the agent worked normally from 18:32Z), so an idle agent that is
+ * not prompted again would stay parked until resetsAt -- up to a week for a
+ * weekly limit. Past this bound the guard stops trusting the evidence and
+ * falls back to normal behaviour (the runner logs a WARN). 12 h spans a
+ * 5-hour window with a wide margin and is short enough that a stuck verdict
+ * costs at most half a day of flushes.
+ */
+export const USAGE_LIMIT_MAX_PARK_MS = 12 * 60 * 60_000
+
+/**
+ * Reason prefix for the one-time re-send of a handoff request after a usage
+ * limit lifted.
+ *
+ * A request sent into a session that then turns out to be limited is answered
+ * by the limit and never read. The await-handoff park keeps the timeout from
+ * firing meanwhile, but when the limit lifts nothing would ask again: the agent
+ * does not know a handoff is owed, and the guard just waits out the timeout and
+ * force-restarts without one. So the first unlimited sweep that still finds no
+ * handoff re-sends the request, once per parking episode, and the timeout
+ * window starts over from that moment. The runner words the re-send exactly as
+ * the original (GuardState.handoffRequestReason) and never counts it as a new
+ * daily slot, which is why it has a prefix of its own.
+ */
+export const HANDOFF_RESEND_REASON_PREFIX = 'handoff-resend-after-usage-limit'
+
+/** What the transcript says about the session's current usage-limit episode. */
+export interface UsageLimitEvidence {
+  /** Timestamp (ms) of the FIRST refused turn since the last successful one. */
+  sinceMs: number
+  /** Timestamp (ms) of the newest refused turn. */
+  lastErrorMs: number
+  /** quotaLimits.resetsAt of the newest refusal (ms), when the CLI recorded it. */
+  resetsAtMs: number | null
+  /** The refusal text of the newest refused turn, for the log. */
+  text: string
+}
+
+// Fallback for entries WITHOUT quotaLimits (older CLI) only: the refusal
+// wordings actually observed on one install, anchored at the start of the text,
+// which is where the CLI puts them. Deliberately NOT the pane-banner detector
+// (detectsUsageLimit) or a bare "usage limit" arm: the CLI 2.1.280 writes
+// its transient subscriber 429 as "API Error: Server is temporarily limiting
+// requests (not your usage limit) · ...", and any loose wording match reads
+// that negation as a limit (found in review).
+const QUOTA_REFUSAL_TEXT_RX = /^\s*you(?:'|\u2019)(?:ve hit your (?:\w+ )?limit\b|re out of extra usage\b)/i
+// Never a refusal, whatever else the text says.
+const TRANSIENT_LIMIT_TEXT_RX = /not your usage limit|temporarily limiting/i
+
+function entryText(message: unknown): string {
+  const content = (message && typeof message === 'object') ? (message as { content?: unknown }).content : undefined
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content
+    .map((c) => (c && typeof c === 'object' && typeof (c as { text?: unknown }).text === 'string') ? (c as { text: string }).text : '')
+    .join(' ')
+    .trim()
+}
+
+/**
+ * Is this transcript entry a turn the API refused for a plan usage limit?
+ *
+ * Measured shape (CLI 2.1.280, a worksource agent, 2026-09-27T06:30:11Z), fields
+ * that matter: type "assistant", isApiErrorMessage true, error "rate_limit",
+ * apiErrorStatus 429, message.model "<synthetic>", message.content[0].text
+ * "You've hit your weekly limit · resets 6am (Europe/Budapest)", quotaLimits
+ * { status: "rejected", resetsAt: <unix s>, rateLimitType: "seven_day", ... }.
+ * The older CLI 2.1.110 wrote the same error/status pair with the text
+ * "You're out of extra usage · resets 6am (Europe/Budapest)" and no
+ * quotaLimits. Across every transcript on that install (2026-09-27) all 2838
+ * rate_limit/429 refusals have one of those two wordings.
+ *
+ * Structured fields outrank wording, in this order:
+ *   1. The error class must be rate_limit / 429.
+ *   2. apiErrorIsTransient === true is never a limit. The CLI sets it on its
+ *      transient subscriber 429 ("Server is temporarily limiting requests (not
+ *      your usage limit)"), which frees itself on the next request.
+ *   3. quotaLimits present: decided ONLY by quotaLimits.status === "rejected".
+ *   4. No quotaLimits (older CLI): only the positive refusal wordings observed
+ *      on that install, never a negated or transient one.
+ * "Prompt is too long" (error invalid_request) is the context-window refusal,
+ * not this; it never matches.
+ */
+export function isUsageLimitRefusal(entry: unknown): boolean {
+  if (!entry || typeof entry !== 'object') return false
+  const e = entry as Record<string, unknown>
+  if (e.type !== 'assistant' || e.isApiErrorMessage !== true) return false
+  if (e.error !== 'rate_limit' && e.apiErrorStatus !== 429) return false
+  if (e.apiErrorIsTransient === true) return false
+  const q = e.quotaLimits
+  if (q !== undefined && q !== null) {
+    return typeof q === 'object' && (q as { status?: unknown }).status === 'rejected'
+  }
+  const text = entryText(e.message)
+  if (TRANSIENT_LIMIT_TEXT_RX.test(text)) return false
+  return QUOTA_REFUSAL_TEXT_RX.test(text)
+}
+
+/**
+ * Usage-limit evidence from the tail of the session transcript (JSONL text),
+ * or null when the session is not currently refused.
+ *
+ * The rule: the NEWEST assistant entry must be a usage-limit refusal. Any
+ * successful assistant turn after a refusal means the limit has lifted, banner
+ * or no banner. Walking back from there, the episode runs until the last
+ * successful turn; other API errors inside it (overloaded, 5xx) neither end nor
+ * start it. Sidechain entries are ignored, and a malformed or partial first
+ * line (the tail may start mid-line) is skipped.
+ */
+export function usageLimitEvidenceFromTranscript(tail: string): UsageLimitEvidence | null {
+  const lines = tail.split('\n')
+  let newest: { ts: number; resetsAtMs: number | null; text: string } | null = null
+  let sinceMs: number | null = null
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim()
+    if (!line) continue
+    let entry: Record<string, unknown>
+    try { entry = JSON.parse(line) } catch { continue }
+    if (!entry || typeof entry !== 'object' || entry.type !== 'assistant' || entry.isSidechain === true) continue
+    if (isUsageLimitRefusal(entry)) {
+      const ts = typeof entry.timestamp === 'string' ? Date.parse(entry.timestamp) : NaN
+      if (!Number.isFinite(ts)) continue
+      if (newest === null) {
+        const q = entry.quotaLimits as { resetsAt?: unknown } | undefined
+        const resetsAt = q && typeof q.resetsAt === 'number' && Number.isFinite(q.resetsAt) ? q.resetsAt * 1000 : null
+        newest = { ts, resetsAtMs: resetsAt, text: entryText(entry.message) }
+      }
+      sinceMs = ts
+      continue
+    }
+    if (entry.isApiErrorMessage === true) {
+      // Another API error. Before any refusal was seen it is the newest
+      // assistant entry, and that is not a usage limit.
+      if (newest === null) return null
+      continue
+    }
+    // A successful turn: the episode (if any) started after it.
+    break
+  }
+  if (newest === null || sinceMs === null) return null
+  return { sinceMs, lastErrorMs: newest.ts, resetsAtMs: newest.resetsAtMs, text: newest.text }
+}
+
+export type UsageLimitVerdict =
+  | { limited: true; evidence: UsageLimitEvidence }
+  | { limited: false; reason: 'no-refusal' | 'reset-passed' | 'park-expired' | 'before-restart'; evidence: UsageLimitEvidence | null }
+
+/**
+ * Is the session blocked by a usage limit right now? Evidence alone is not
+ * enough: once the recorded resetsAt has passed the limit is over by the CLI's
+ * own word, and an episode older than USAGE_LIMIT_MAX_PARK_MS is no longer
+ * trusted (the runner WARNs on that transition).
+ *
+ * `sessionStartMs` (await-ready only: the restart time of the owed resume): a
+ * refusal recorded BEFORE it belongs to the session the restart replaced. The
+ * transcript reader picks the newest jsonl, and a fresh session writes its own
+ * file only at its first entry (measured once: ~16 s after the spawn, at the
+ * identity /rename; a session without one presumably writes nothing until its
+ * first prompt, not measured), so until then the newest file is the dead
+ * session's, where no successful turn can ever end the episode. Only the new
+ * session's own refusal parks its resume.
+ */
+export function usageLimitVerdict(evidence: UsageLimitEvidence | null, nowMs: number, sessionStartMs: number | null = null): UsageLimitVerdict {
+  if (evidence === null) return { limited: false, reason: 'no-refusal', evidence }
+  if (sessionStartMs !== null && evidence.lastErrorMs < sessionStartMs) {
+    return { limited: false, reason: 'before-restart', evidence }
+  }
+  if (evidence.resetsAtMs !== null && nowMs >= evidence.resetsAtMs) {
+    return { limited: false, reason: 'reset-passed', evidence }
+  }
+  if (nowMs - evidence.sinceMs >= USAGE_LIMIT_MAX_PARK_MS) {
+    return { limited: false, reason: 'park-expired', evidence }
+  }
+  return { limited: true, evidence }
 }
 
 /**
@@ -319,11 +802,497 @@ export const IDLE_FLUSH_REASON_PREFIX = 'idle-flush'
  */
 export const STALE_REFRESH_REASON_PREFIX = 'stale-handoff-refresh'
 
+/**
+ * Reason prefix for the scheduled daily handoff. A fourth wording again: this
+ * agent's session is neither near its limit nor expensive nor finished, it is
+ * simply a day old, and telling it otherwise would be false. The runner
+ * matches this constant to pick the prompt.
+ */
+export const DAILY_HANDOFF_REASON_PREFIX = 'daily-handoff'
+
+/**
+ * Reason prefix for the periodic-handoff tier. A fifth wording: this agent's
+ * session is not near its limit, expensive, finished, or a day old -- its
+ * clock slot simply came round. The runner matches this constant to pick the
+ * prompt (and, like the daily tier's pct is null here too, so the prompt must
+ * not claim a percentage that was never measured).
+ */
+export const PERIODIC_HANDOFF_REASON_PREFIX = 'periodic-handoff'
+
+/**
+ * Reason prefix for the task-close tier: the agent's kanban queue just
+ * drained to empty. A sixth wording, for the same reason as the others --
+ * none of "critical", "expensive", "a day old" or "a clock slot" is true of a
+ * session that simply ran out of open work.
+ */
+export const TASK_CLOSE_REASON_PREFIX = 'task-close'
+
+/**
+ * Reason prefix of the one-time busy-pane warning: the pane is still mid-turn a
+ * whole handoffTimeoutMinutes past the handoff deadline. The decision stays
+ * action 'none' (a busy pane is never restarted); the runner matches this
+ * prefix to log a warning, once per handoff sequence.
+ */
+export const BUSY_OVERDUE_REASON_PREFIX = 'busy-overdue'
+
+/**
+ * Reason for giving up on the resume injection: the restarted session did not
+ * become ready within READY_TIMEOUT_MS. The decision is action 'none', so the
+ * runner matches this constant to raise an alert instead of staying silent.
+ */
+export const RESUME_GIVE_UP_REASON = 'ready timeout -- giving up on resume injection'
+
+/**
+ * Whether the daily tier can actually fire for this config.
+ *
+ * ONE predicate, two readers: the tier itself, and the auto-restart runner
+ * deciding whether to stand aside. They must never disagree -- an auto-restart
+ * that stands down for a tier that cannot fire silently removes the nightly
+ * restart, which is strictly worse than the state this whole change is fixing.
+ * "Enabled" is therefore not enough: an unparseable or absent time disarms it.
+ */
+export function dailyHandoffArmed(cfg: ContextGuardConfig): boolean {
+  return cfg.dailyHandoffEnabled && parseHHMM(cfg.dailyHandoffTime) !== null
+}
+
+/**
+ * Is the configured daily slot due and unserved?
+ *
+ * `lastRunMs` is the last time this tier fired for the agent (null = never /
+ * not yet seeded). The comparison is delegated to restartDue, the same
+ * predicate the nightly auto-restart uses, so "due" means exactly what it
+ * already means elsewhere in the fleet: past the slot, and not already served
+ * for that slot.
+ */
+export function dailyHandoffDue(
+  cfg: ContextGuardConfig,
+  localMidnightMs: number,
+  lastRunMs: number | null,
+  nowMs: number,
+): boolean {
+  if (!dailyHandoffArmed(cfg)) return false
+  const mins = parseHHMM(cfg.dailyHandoffTime)
+  if (mins === null) return false
+  return restartDue(lastRunMs, nowMs, dailyDueAtMs(localMidnightMs, mins))
+}
+
+/**
+ * One sweep's step of the daily tier's "last served" record, for one agent.
+ *
+ * The record is seeded on first sight so that a guard process starting after
+ * today's slot does not fire it at once. But the seed must be taken while the
+ * tier is ARMED: seeded while disarmed, the record holds the moment the
+ * dashboard process first saw the agent (say 02:05), and arming the tier later
+ * the same day (say 12:53, slot 03:00) finds "last served 02:05, before today's
+ * slot, slot passed" -- due, and it fires on the very next sweep. Measured on
+ * a live fleet 2026-09-29: armed 12:53, four agents handed off at 12:56.
+ *
+ * So a disarmed tier forgets the record, and the first armed sight seeds it.
+ * Arming after today's slot then waits for tomorrow; arming before it fires at
+ * the slot, as configured.
+ *
+ * Returns whether the slot is due now, and the record to keep (undefined =
+ * forget it).
+ */
+export function dailyHandoffStep(
+  cfg: ContextGuardConfig,
+  lastRunMs: number | undefined,
+  localMidnightMs: number,
+  nowMs: number,
+): { due: boolean; record: number | undefined } {
+  if (!dailyHandoffArmed(cfg)) return { due: false, record: undefined }
+  if (lastRunMs === undefined) return { due: false, record: nowMs }
+  return { due: dailyHandoffDue(cfg, localMidnightMs, lastRunMs, nowMs), record: lastRunMs }
+}
+
+/**
+ * One sweep of the daily-tier bookkeeping for one agent, as the runner applies it.
+ *
+ * The order is the point. A disarmed tier forgets the record on EVERY sweep, before
+ * the eligibility gate: an agent that was never idle while the tier was off would
+ * otherwise keep its old armed record, and arming the tier after the slot would
+ * fire at once. Seeding and firing stay behind the gate (`eligible`: the agent is
+ * running and idle), where an ineligible sweep keeps the record untouched.
+ *
+ * Returns whether the slot is due on this sweep, and the record to keep
+ * (undefined = forget it).
+ */
+export function dailyHandoffSweep(
+  cfg: ContextGuardConfig,
+  lastRunMs: number | undefined,
+  eligible: boolean,
+  localMidnightMs: number,
+  nowMs: number,
+): { due: boolean; record: number | undefined } {
+  if (!dailyHandoffArmed(cfg)) return { due: false, record: undefined }
+  if (!eligible) return { due: false, record: lastRunMs }
+  return dailyHandoffStep(cfg, lastRunMs, localMidnightMs, nowMs)
+}
+
+/**
+ * dailyHandoffSweep applied to the runner's record map: an `undefined` record
+ * deletes the agent's entry, anything else replaces it. Returns whether the slot
+ * is due on this sweep.
+ *
+ * It exists so the runner's call is one expression with nowhere to put an early
+ * return: a gate in front of the sweep (`if (!running) return false`) is exactly
+ * the bug the sweep's order fixes -- the forget waits behind the idle gate again.
+ */
+export function applyDailyHandoffSweep(
+  records: Map<string, number>,
+  name: string,
+  cfg: ContextGuardConfig,
+  eligible: boolean,
+  localMidnightMs: number,
+  nowMs: number,
+): boolean {
+  const sweep = dailyHandoffSweep(cfg, records.get(name), eligible, localMidnightMs, nowMs)
+  if (sweep.record === undefined) records.delete(name)
+  else records.set(name, sweep.record)
+  return sweep.due
+}
+
+/**
+ * dailyHandoffSweep plus the open-question skip, for one agent.
+ *
+ * Why: the daily tier ends in a fresh restart, and an owner message the agent
+ * has not yet been shown or answered would be lost to it: the fresh session
+ * starts from a handoff note, not from the pending exchange. The nightly auto-restart already holds back for
+ * an open question (its own raw ledger check), but it stands aside whenever
+ * this tier is armed.
+ *
+ * The rule is deliberately small. When the slot is due and the owner has an
+ * open question, today's slot is skipped: recorded as served, so it is due
+ * again at its usual time tomorrow. The next due slot fires regardless if the
+ * previous one was skipped. So the tier only ever fires when it would have
+ * fired without this rule (never at an unusual hour, never into the exchange
+ * it waited for), and an open question costs at most one handoff in a row,
+ * whatever the owner's pattern. "Open" is the /clear gate's rule
+ * (ownerQuestionHolds: unanswered and not yet surfaced to the agent by the
+ * ledger drain). A failed ledger read counts as no question.
+ *
+ * The skip flag survives until a slot is actually served (the runner clears it
+ * when the daily reason wins the decision), so a forced slot pre-empted by a
+ * higher-ranked tier is still forced on the next sweep. Eligibility, seeding
+ * and the disarmed forget are dailyHandoffSweep's; a disarmed tier also forgets
+ * the flag. `readQuestionOpen` is called only on a due, eligible sweep that is
+ * not already forced, so ordinary sweeps read no ledger.
+ */
+export function dailyHandoffSkipSweep(
+  cfg: ContextGuardConfig,
+  lastRunMs: number | undefined,
+  skippedLast: boolean,
+  eligible: boolean,
+  localMidnightMs: number,
+  nowMs: number,
+  readQuestionOpen: () => boolean | undefined,
+): { due: boolean; record: number | undefined; skippedLast: boolean; skippedNow: boolean } {
+  const sweep = dailyHandoffSweep(cfg, lastRunMs, eligible, localMidnightMs, nowMs)
+  if (!dailyHandoffArmed(cfg)) return { due: false, record: sweep.record, skippedLast: false, skippedNow: false }
+  if (!sweep.due || skippedLast) return { ...sweep, skippedLast, skippedNow: false }
+  if (readQuestionOpen() === true) return { due: false, record: nowMs, skippedLast: true, skippedNow: true }
+  return { ...sweep, skippedLast: false, skippedNow: false }
+}
+
+/**
+ * dailyHandoffSkipSweep applied to the runner's record map and skip set, the
+ * way applyDailyHandoffSweep applies the sweep. Returns whether the slot is
+ * due; calls `onSkip` when this sweep skipped it.
+ */
+export function applyDailyHandoffSkipSweep(
+  records: Map<string, number>,
+  skipped: Set<string>,
+  name: string,
+  cfg: ContextGuardConfig,
+  eligible: boolean,
+  localMidnightMs: number,
+  nowMs: number,
+  readQuestionOpen: () => boolean | undefined,
+  onSkip: () => void,
+): boolean {
+  const r = dailyHandoffSkipSweep(cfg, records.get(name), skipped.has(name), eligible, localMidnightMs, nowMs, readQuestionOpen)
+  if (r.record === undefined) records.delete(name)
+  else records.set(name, r.record)
+  if (r.skippedLast) skipped.add(name)
+  else skipped.delete(name)
+  if (r.skippedNow) onSkip()
+  return r.due
+}
+
+/** One agent's periodic-handoff bookkeeping record: when the tier last ran,
+ *  and how much context the session had at that point (for the token-floor
+ *  check). */
+export interface PeriodicHandoffRecord {
+  atMs: number
+  tokens: number
+}
+
+/**
+ * One sweep's step of the periodic tier's "last served" record, for one agent.
+ *
+ * Mirrors dailyHandoffStep's seed-on-first-sight rule (a guard process that
+ * starts mid-interval must not fire at once), but on TWO conditions instead of
+ * one: the clock interval has elapsed, AND the context grew by at least the
+ * configured floor since the last run. The due:true branch deliberately
+ * leaves the record UNCHANGED, exactly like dailyHandoffStep -- the runner
+ * commits the advance only once the decision actually fires this reason (see
+ * the periodic bookkeeping in context-guard-runner.ts), so a higher-ranked
+ * tier winning this sweep leaves the slot due again next sweep instead of
+ * silently consuming it.
+ */
+export function periodicHandoffStep(
+  cfg: ContextGuardConfig,
+  lastRun: PeriodicHandoffRecord | undefined,
+  contextTokens: number,
+  nowMs: number,
+): { due: boolean; record: PeriodicHandoffRecord } {
+  if (lastRun === undefined) {
+    return { due: false, record: { atMs: nowMs, tokens: contextTokens } }
+  }
+  if (nowMs - lastRun.atMs < cfg.periodicHandoffMinutes * 60_000) {
+    return { due: false, record: lastRun }
+  }
+  if (contextTokens - lastRun.tokens < cfg.periodicHandoffMinTokens) {
+    // Due by the clock but not worth it (the token floor): push the clock a
+    // full interval out from NOW, token baseline unchanged, instead of
+    // re-checking every sweep until growth catches up.
+    return { due: false, record: { atMs: nowMs, tokens: lastRun.tokens } }
+  }
+  return { due: true, record: lastRun }
+}
+
+/**
+ * periodicHandoffStep plus the enabled/eligible gates, the way
+ * dailyHandoffSweep wraps dailyHandoffStep. A disarmed tier forgets its
+ * record on EVERY sweep, ahead of the eligibility gate, for the same reason
+ * as the daily tier: an agent that was never idle while the tier was off must
+ * not keep an old armed record that fires at once when the tier is armed
+ * later.
+ */
+export function periodicHandoffSweep(
+  cfg: ContextGuardConfig,
+  lastRun: PeriodicHandoffRecord | undefined,
+  eligible: boolean,
+  contextTokens: number,
+  nowMs: number,
+): { due: boolean; record: PeriodicHandoffRecord | undefined } {
+  if (!cfg.periodicHandoffEnabled) return { due: false, record: undefined }
+  if (!eligible) return { due: false, record: lastRun }
+  return periodicHandoffStep(cfg, lastRun, contextTokens, nowMs)
+}
+
+/**
+ * periodicHandoffSweep applied to the runner's record map: an `undefined`
+ * record deletes the agent's entry, anything else replaces it. Mirrors
+ * applyDailyHandoffSweep.
+ */
+export function applyPeriodicHandoffSweep(
+  records: Map<string, PeriodicHandoffRecord>,
+  name: string,
+  cfg: ContextGuardConfig,
+  eligible: boolean,
+  contextTokens: number,
+  nowMs: number,
+): boolean {
+  const sweep = periodicHandoffSweep(cfg, records.get(name), eligible, contextTokens, nowMs)
+  if (sweep.record === undefined) records.delete(name)
+  else records.set(name, sweep.record)
+  return sweep.due
+}
+
+/**
+ * periodicHandoffSweep plus the open-question hold. Unlike the daily tier
+ * (which skips at most one slot, then fires regardless), the periodic tier
+ * HOLDS a due slot for as long as an owner question is open, the way the
+ * task-close tier does: the record is left unchanged, so the slot stays due
+ * and the question is re-read on every sweep, and the handoff fires on the
+ * first sweep after the question clears. The daily rule ("the next slot fires
+ * regardless") would, on a 30-minute cadence, type a handoff into the agent
+ * mid-question whenever a question stays unanswered past one interval.
+ *
+ * `skippedLast` here means "currently holding": it stays true across the held
+ * sweeps so onSkip is logged once per hold, not once per sweep, and it clears
+ * as soon as the slot fires or stops being due.
+ */
+export function periodicHandoffSkipSweep(
+  cfg: ContextGuardConfig,
+  lastRun: PeriodicHandoffRecord | undefined,
+  skippedLast: boolean,
+  eligible: boolean,
+  contextTokens: number,
+  nowMs: number,
+  readQuestionOpen: () => boolean | undefined,
+): { due: boolean; record: PeriodicHandoffRecord | undefined; skippedLast: boolean; skippedNow: boolean } {
+  const sweep = periodicHandoffSweep(cfg, lastRun, eligible, contextTokens, nowMs)
+  if (!cfg.periodicHandoffEnabled) return { due: false, record: sweep.record, skippedLast: false, skippedNow: false }
+  if (!sweep.due) return { ...sweep, skippedLast: false, skippedNow: false }
+  if (readQuestionOpen() === true) return { due: false, record: sweep.record, skippedLast: true, skippedNow: !skippedLast }
+  return { ...sweep, skippedLast: false, skippedNow: false }
+}
+
+/**
+ * periodicHandoffSkipSweep applied to the runner's record map and skip set,
+ * mirroring applyDailyHandoffSkipSweep.
+ */
+export function applyPeriodicHandoffSkipSweep(
+  records: Map<string, PeriodicHandoffRecord>,
+  skipped: Set<string>,
+  name: string,
+  cfg: ContextGuardConfig,
+  eligible: boolean,
+  contextTokens: number,
+  nowMs: number,
+  readQuestionOpen: () => boolean | undefined,
+  onSkip: () => void,
+): boolean {
+  const r = periodicHandoffSkipSweep(cfg, records.get(name), skipped.has(name), eligible, contextTokens, nowMs, readQuestionOpen)
+  if (r.record === undefined) records.delete(name)
+  else records.set(name, r.record)
+  if (r.skippedLast) skipped.add(name)
+  else skipped.delete(name)
+  if (r.skippedNow) onSkip()
+  return r.due
+}
+
+/**
+ * One sweep's step of the task-close tier's arm/fire record, for one agent.
+ *
+ * Edge-triggered, unlike every other tier here: it fires once when the
+ * kanban queue goes from non-empty to empty, not on every sweep that finds it
+ * empty (a board that stays empty forever would otherwise restart every
+ * sweep -- the exact "percenkénti restart" the owner's requirement 4 rules
+ * out), and not at all while a single card closes but others stay open.
+ *
+ * The due:true branch deliberately returns `armed: true`, NOT false: the
+ * runner commits the actual disarm only once the decision produced by this
+ * sweep actually fires this reason (see the task-close bookkeeping in
+ * context-guard-runner.ts), exactly like the daily/periodic tiers never
+ * advance their "last served" record inside the pure step. Without this, a
+ * higher-ranked tier winning the very sweep this fired on (saturation, usage
+ * limit, a wedge tier, idle-flush) would disarm the edge here and the event
+ * would never be retried -- lost for good if the board then stays empty.
+ */
+export function taskCloseStep(
+  armed: boolean | undefined,
+  openCardsNow: boolean,
+): { due: boolean; armed: boolean } {
+  const wasArmed = armed ?? false // first sight: never fire even if a card happens to be open already
+  if (wasArmed && !openCardsNow) return { due: true, armed: true } // fires; stays armed until the runner commits the serve
+  return { due: false, armed: wasArmed || openCardsNow } // arms when work opens, stays armed while it is open
+}
+
+/**
+ * taskCloseStep plus the enabled/eligible gates, mirroring
+ * periodicHandoffSweep/dailyHandoffSweep. A disarmed tier forgets its arming
+ * on every sweep, ahead of the eligibility gate, for the same reason as the
+ * other tiers.
+ */
+export function taskCloseSweep(
+  cfg: ContextGuardConfig,
+  armed: boolean | undefined,
+  openCardsNow: boolean,
+  eligible: boolean,
+): { due: boolean; armed: boolean } {
+  if (!cfg.taskCloseHandoffEnabled) return { due: false, armed: false }
+  if (!eligible) return { due: false, armed: armed ?? false }
+  return taskCloseStep(armed, openCardsNow)
+}
+
+/**
+ * taskCloseSweep applied to the runner's arm-state map, mirroring
+ * applyDailyHandoffSweep/applyPeriodicHandoffSweep. The map always gets the
+ * new `armed` value (there is no "undefined means forget" shape here: false
+ * already means disarmed/never-armed, so there is nothing distinct to
+ * delete).
+ */
+export function applyTaskCloseSweep(
+  records: Map<string, boolean>,
+  name: string,
+  cfg: ContextGuardConfig,
+  openCardsNow: boolean,
+  eligible: boolean,
+): boolean {
+  const sweep = taskCloseSweep(cfg, records.get(name), openCardsNow, eligible)
+  records.set(name, sweep.armed)
+  return sweep.due
+}
+
+/**
+ * taskCloseSweep plus the open-question skip.
+ *
+ * DELIBERATELY DIFFERENT semantics from the daily/periodic skip: those tiers
+ * have a real "next slot" to defer to, so skipping records the slot as served
+ * and moves on. An edge has no such next slot -- if the board stays empty
+ * forever, deferring "to the next time this fires" would mean never -- so a
+ * question-open skip here stays armed and is retried on every following
+ * sweep (no separate skipped-set bookkeeping needed: `armed` staying true
+ * already is the retry) until the question clears.
+ */
+export function taskCloseSkipSweep(
+  cfg: ContextGuardConfig,
+  armed: boolean | undefined,
+  openCardsNow: boolean,
+  eligible: boolean,
+  readQuestionOpen: () => boolean | undefined,
+): { due: boolean; armed: boolean } {
+  const sweep = taskCloseSweep(cfg, armed, openCardsNow, eligible)
+  if (!sweep.due) return sweep
+  if (readQuestionOpen() === true) return { due: false, armed: sweep.armed }
+  return sweep
+}
+
+/**
+ * taskCloseSkipSweep applied to the runner's arm-state map, mirroring
+ * applyTaskCloseSweep.
+ */
+export function applyTaskCloseSkipSweep(
+  records: Map<string, boolean>,
+  name: string,
+  cfg: ContextGuardConfig,
+  openCardsNow: boolean,
+  eligible: boolean,
+  readQuestionOpen: () => boolean | undefined,
+): boolean {
+  const r = taskCloseSkipSweep(cfg, records.get(name), openCardsNow, eligible, readQuestionOpen)
+  records.set(name, r.armed)
+  return r.due
+}
+
 /** Slack between HANDOFF.md's mtime and the last transcript activity before
  *  the handoff counts as stale. The handoff-writing turn itself touches the
  *  transcript slightly AFTER the file write (tool result + closing reply), so
  *  a zero-slack comparison would flag every handoff as stale. */
 export const STALE_HANDOFF_SLACK_MS = 3 * 60_000
+
+/**
+ * How many stale-handoff refreshes one await-handoff sequence may ask for.
+ *
+ * Why a bound exists at all (measured 2026-09-20, cortex-ugypasztor): staleness
+ * is `last pane activity - handoff mtime`, so it measures WHEN the last activity
+ * was, not WHAT it was. An agent whose own scheduled task fires every 5 minutes
+ * is woken between every pair of guard sweeps, which puts fresh activity ~4
+ * minutes after each handoff write -- above the 3-minute slack, every single
+ * time. The refresh condition is then structurally always true and the loop
+ * cannot converge: the agent answered all four requests, and each answer was
+ * invalidated by its own next poll before the guard looked again. It ran to the
+ * 20-minute timeout and force-restarted at 94% (from 90%).
+ *
+ * Raising or lowering handoffTimeoutMinutes does not fix that -- it only moves
+ * the ceiling on a loop that never terminates on its own. Control group from the
+ * same night: two agents whose fastest task fires every 10 and ~14 minutes entered
+ * same phase and left it in 10 minutes with ONE refresh each.
+ *
+ * One refresh still covers the case the refresh was built for (2026-08-17: a
+ * merge-gate verdict landed in the 20 minutes after a handoff write). After
+ * that we ship the handoff we have -- never silently: restartDecision carries
+ * handoffStaleMinutes into await-ready, and the resume prompt spells out how
+ * many minutes the handoff does not cover.
+ *
+ * Deliberately a constant, not a config key. The measured failure is structural,
+ * not a tuning mistake, and a new knob would invite exactly the tuning that does
+ * not help.
+ */
+export const MAX_STALE_REFRESHES = 1
 
 /** Freshness verdict for HANDOFF.md at decision time: minutes of uncovered
  *  work, 'unknown', or null (= fresh enough / no artifact to judge). */
@@ -365,7 +1334,15 @@ export interface GuardDecision {
 // How long await-ready waits for the restarted session to accept the resume
 // prompt before giving up (the agent still comes up fine -- it just starts
 // without the injected pointer; kanban/memory hooks remain).
-export const READY_TIMEOUT_MS = 5 * 60_000
+//
+// 20 minutes, not 5: the runner sweeps every 5 minutes, so a
+// 5-minute deadline gave the fresh session exactly ONE readiness check, and a
+// session busy at that sweep lost its resume (3 of 13 restarts, 2026-09-28).
+// 20 minutes is four sweeps and stays inside PENDING_RESUME_TTL_MS (30 min),
+// the edge of the persisted obligation. A resume re-armed after a dashboard
+// restart gets that TTL edge as its deadline, so it may wait up to 10 minutes
+// longer than an uninterrupted one, but never past the TTL.
+export const READY_TIMEOUT_MS = 20 * 60_000
 
 function cooldown(nowMs: number, cfg: ContextGuardConfig, reason: string): GuardDecision {
   return {
@@ -377,6 +1354,7 @@ function cooldown(nowMs: number, cfg: ContextGuardConfig, reason: string): Guard
       deadlineMs: 0,
       cooldownUntilMs: nowMs + cfg.cooldownMinutes * 60_000,
       saturatedStreak: 0,
+      staleRefreshCount: 0,
       handoffStaleMinutes: null,
     },
   }
@@ -394,6 +1372,7 @@ function restartDecision(nowMs: number, reason: string, staleMinutes: HandoffSta
       deadlineMs: nowMs + READY_TIMEOUT_MS,
       cooldownUntilMs: 0,
       saturatedStreak: 0,
+      staleRefreshCount: 0,
       handoffStaleMinutes: staleMinutes,
     },
   }
@@ -412,7 +1391,18 @@ export function decideGuard(
   const none = (reason: string, next: GuardState = state): GuardDecision =>
     ({ action: 'none', reason, nextState: next })
 
-  if (!cfg.enabled && !cfg.saturationRestart && !cfg.idleFlushEnabled) {
+  // A busy pane is never restarted (both await-handoff deferrals wait for the
+  // turn to end). Once per handoff sequence, a whole handoffTimeoutMinutes past
+  // the deadline, the deferral says so: same action, same state otherwise.
+  const deferBusy = (reason: string): GuardDecision => {
+    if (!state.busyOverdueWarned && nowMs >= state.deadlineMs + cfg.handoffTimeoutMinutes * 60_000) {
+      const minutes = Math.floor((nowMs - state.deadlineMs) / 60_000)
+      return none(`${BUSY_OVERDUE_REASON_PREFIX}: ${reason} (${minutes}m past the handoff deadline)`, { ...state, busyOverdueWarned: true })
+    }
+    return none(reason)
+  }
+
+  if (!cfg.enabled && !cfg.saturationRestart && !cfg.idleFlushEnabled && !cfg.dailyHandoffEnabled && !cfg.periodicHandoffEnabled && !cfg.taskCloseHandoffEnabled) {
     return none('disabled', INITIAL_GUARD_STATE)
   }
 
@@ -439,8 +1429,15 @@ export function decideGuard(
         return none('pane saturated, awaiting confirmation sweep', { ...state, saturatedStreak: streak })
       }
       const cleared = state.saturatedStreak > 0 ? { ...state, saturatedStreak: 0 } : state
+      // Usage limit: below the saturation net, above every other tier. None of
+      // them can get a handoff written or a resume read while the limit holds
+      // (see USAGE_LIMIT_REASON_PREFIX). A due daily slot is NOT consumed by
+      // this non-decision, so it fires once the limit lifts.
+      if (inputs.usageLimited) {
+        return none(`${USAGE_LIMIT_REASON_PREFIX}: session blocked by a usage limit -- no handoff, flush or restart until it lifts`, cleared)
+      }
       if (cfg.enabled && inputs.pct !== null) {
-        const wedgeTier = decideWedgeTiers(nowMs, inputs, cfg, cleared, none)
+        const wedgeTier = decideWedgeTiers(nowMs, inputs, cfg)
         if (wedgeTier) return wedgeTier
       }
       // Idle-flush tier. Ranked BELOW the wedge tiers deliberately: those two
@@ -452,14 +1449,56 @@ export function decideGuard(
         const flush = decideIdleFlush(nowMs, inputs, cfg, cleared, none)
         if (flush) return flush
       }
+      // Task-close tier, ranked just below idle-flush: both answer "is this
+      // session finished", idle-flush by a quiet transcript, this one by an
+      // emptied kanban queue -- a more direct signal where it is available,
+      // so it gets the next slot in rank.
+      //
+      // Both this tier and the periodic one below ARE gated on a positively
+      // busy pane, unlike daily: neither has a slot to keep (a due periodic
+      // slot and an armed task-close edge both stay due until served), so
+      // there is no reason to type a handoff directive into a live reply --
+      // the next sweep that finds the turn over sends it. await-handoff still
+      // refuses to cut a turn that starts after the request.
+      if (cfg.taskCloseHandoffEnabled && inputs.taskCloseHandoffDue && !inputs.paneBusy) {
+        return handoffRequest(nowMs, inputs, cfg, `${TASK_CLOSE_REASON_PREFIX}: kanban queue emptied, no open owner question or pending inbound`)
+      }
+      // Periodic tier, ranked just below task-close: an hourly-ish clock is a
+      // weaker reason to hand off than "the work is actually done", but still
+      // a better one than "it is 04:00" below -- a 30-minute cadence runs far
+      // more often than the once-a-day tier, so it sits above it.
+      if (cfg.periodicHandoffEnabled && inputs.periodicHandoffDue && !inputs.paneBusy) {
+        return handoffRequest(nowMs, inputs, cfg, `${PERIODIC_HANDOFF_REASON_PREFIX} (every ${cfg.periodicHandoffMinutes}m)`)
+      }
+      // Daily tier, ranked LAST. The tiers above answer measured or observed
+      // questions -- is this session about to break, is it expensive, is it
+      // finished, has its clock slot come round -- and any of them is a
+      // better reason to state than "it is 04:00". This one exists for the
+      // sessions none of them ever reach: an agent below every threshold
+      // still carries a day of context into a nightly fresh restart that
+      // would otherwise drop it on the floor.
+      //
+      // Deliberately NOT gated on paneIdle. Unlike the idle tier, which only
+      // wants finished sessions, this one has a slot to keep: a busy agent
+      // gets the request and answers it after its turn, and await-handoff
+      // already refuses to cut a live turn.
+      if (cfg.dailyHandoffEnabled && inputs.dailyHandoffDue) {
+        return handoffRequest(
+          nowMs, inputs, cfg,
+          `${DAILY_HANDOFF_REASON_PREFIX} (scheduled ${cfg.dailyHandoffTime})`,
+        )
+      }
       if (!cfg.enabled) return none('proactive guard disabled (saturation net armed)', cleared)
       if (inputs.pct === null) return none('context unmeasurable', cleared)
       return none('below threshold', cleared)
     }
 
     case 'await-handoff': {
-      if (!cfg.enabled && !cfg.idleFlushEnabled) {
+      if (!cfg.enabled && !cfg.idleFlushEnabled && !cfg.dailyHandoffEnabled && !cfg.periodicHandoffEnabled && !cfg.taskCloseHandoffEnabled) {
         // Operator disabled the proactive guard mid-sequence; stand down.
+        // Every tier that can ENTER this phase has to appear here: omitting
+        // one would stand the sequence down on the sweep after it started,
+        // for an agent whose only armed tier is the missing one.
         return cooldown(nowMs, cfg, 'guard disabled during await-handoff')
       }
       if (!inputs.running) {
@@ -473,31 +1512,85 @@ export function decideGuard(
         // act-threshold pct already corroborates a near-full context).
         return restartDecision(nowMs, 'pane saturated during await-handoff', handoffStaleMinutes(inputs))
       }
+      if (inputs.usageLimited) {
+        // The agent cannot write (or finish writing) the handoff without
+        // quota, and neither the timeout nor the hard threshold may restart it
+        // meanwhile: the fresh session would be just as limited and the resume
+        // prompt would be lost. Park the deadline so the agent gets its full
+        // handoff window once the limit lifts. A handoff already on disk is
+        // not shipped either -- it would lead straight into a limited
+        // await-ready -- it is picked up by the first unlimited sweep.
+        return none(
+          `${USAGE_LIMIT_REASON_PREFIX}: during await-handoff -- deadline parked`,
+          {
+            ...state,
+            deadlineMs: Math.max(state.deadlineMs, nowMs + cfg.handoffTimeoutMinutes * 60_000),
+            handoffParkedByLimit: true,
+          },
+        )
+      }
       const handoffWritten =
         inputs.handoffMtime !== null &&
         (state.handoffMtimeAtRequest === null || inputs.handoffMtime > state.handoffMtimeAtRequest)
+      if (state.handoffParkedByLimit) {
+        // First sweep after a limit episode. The flag is consumed here either
+        // way, so the re-send happens at most once per episode.
+        const unparked: GuardState = { ...state, handoffParkedByLimit: false }
+        const atHard = inputs.pct !== null && inputs.pct >= cfg.hardPct
+        if (!handoffWritten && !atHard) {
+          // The request went into a limited session and was never read: ask
+          // again, and give the agent a full timeout window from now. At the
+          // hard threshold there is no waiting to restart, so the normal logic
+          // below restarts instead.
+          return {
+            action: 'request-handoff',
+            reason: `${HANDOFF_RESEND_REASON_PREFIX}: limit lifted with no handoff written -- re-sending (${state.handoffRequestReason ?? 'original reason unknown'})`,
+            nextState: { ...unparked, deadlineMs: nowMs + cfg.handoffTimeoutMinutes * 60_000 },
+          }
+        }
+        return decideGuard(unparked, inputs, cfg)
+      }
       if (handoffWritten && inputs.paneIdle) {
         // mtime-advanced is necessary but NOT sufficient: the agent may have
         // written the handoff and then kept working while we waited for an
         // idle pane (2026-08-17: 20 minutes of work, including a merge-gate
         // verdict, happened after the write). Existence is not freshness.
         const staleMin = handoffStaleMinutes(inputs)
-        if (typeof staleMin === 'number' && nowMs < state.deadlineMs && !(inputs.pct !== null && inputs.pct >= cfg.hardPct)) {
+        const refreshBudgetLeft = state.staleRefreshCount < MAX_STALE_REFRESHES
+        if (
+          typeof staleMin === 'number' &&
+          refreshBudgetLeft &&
+          nowMs < state.deadlineMs &&
+          !(inputs.pct !== null && inputs.pct >= cfg.hardPct)
+        ) {
           // There is still budget before the deadline and the context is not
           // yet at the hard threshold: ask for a refresh instead of shipping
           // a handoff that misses the last N minutes. Advancing the recorded
           // mtime makes the NEXT write count as fresh; the deadline is left
           // alone, so an agent that keeps working through refresh requests
           // still restarts on time (with the staleness said out loud).
+          const reason = `${STALE_REFRESH_REASON_PREFIX}: handoff written but ~${staleMin}m of work happened after it -- requesting refresh`
           return {
             action: 'request-handoff',
-            reason: `${STALE_REFRESH_REASON_PREFIX}: handoff written but ~${staleMin}m of work happened after it -- requesting refresh`,
-            nextState: { ...state, handoffMtimeAtRequest: inputs.handoffMtime },
+            reason,
+            nextState: {
+              ...state,
+              handoffMtimeAtRequest: inputs.handoffMtime,
+              staleRefreshCount: state.staleRefreshCount + 1,
+              handoffRequestReason: reason,
+            },
           }
         }
+        // Refresh budget spent (or never applicable): ship what we have. Saying
+        // the budget is spent out loud matters -- the previous behaviour looked
+        // identical in the log to "the agent never answered", which is the
+        // opposite diagnosis.
         return restartDecision(
           nowMs,
-          typeof staleMin === 'number' ? `handoff written but STALE (~${staleMin}m of work after it)` : 'handoff written',
+          typeof staleMin === 'number'
+            ? `handoff written but STALE (~${staleMin}m of work after it)` +
+              (refreshBudgetLeft ? '' : ` -- ${state.staleRefreshCount} refresh(es) already requested, accepting as-is`)
+            : 'handoff written',
           staleMin,
         )
       }
@@ -507,11 +1600,11 @@ export function decideGuard(
       // sweep that finds the pane no longer busy; a turn that saturates
       // mid-flight is caught by the paneSaturated branch above.
       if (inputs.pct !== null && inputs.pct >= cfg.hardPct) {
-        if (inputs.paneBusy) return none('hard threshold during await-handoff but agent mid-turn -- deferring restart')
+        if (inputs.paneBusy) return deferBusy('hard threshold during await-handoff but agent mid-turn -- deferring restart')
         return restartDecision(nowMs, 'hard threshold during await-handoff', handoffStaleMinutes(inputs))
       }
       if (nowMs >= state.deadlineMs) {
-        if (inputs.paneBusy) return none('handoff timeout but agent mid-turn -- deferring restart')
+        if (inputs.paneBusy) return deferBusy('handoff timeout but agent mid-turn -- deferring restart')
         // No handoff in time (agent wedged or ignored the prompt). Restart
         // anyway: taskstate + kanban + hot memories are the fallback context.
         // An OLD HANDOFF.md may still exist; measure how far behind it is so
@@ -522,6 +1615,26 @@ export function decideGuard(
     }
 
     case 'await-ready': {
+      const resumeEdge = inputs.pendingResumeExpiresAtMs
+      if (inputs.running && inputs.usageLimited && resumeEdge !== null && nowMs < resumeEdge) {
+        // A resume prompt typed into a limited session is answered by the
+        // limit and never read. Hold the obligation, and keep the ready
+        // deadline ahead of us so the wait cannot expire it; delivery happens
+        // on the first sweep after the limit lifts.
+        //
+        // BOUNDED by the persisted obligation's TTL edge (restartedAtMs +
+        // PENDING_RESUME_TTL_MS). The on-disk copy expires there, so a park
+        // past it would hold in memory a resume that a dashboard restart
+        // drops, and the two paths would disagree. The TTL's own rationale
+        // applies too: no "continue from your handoff" hours after the
+        // restart. Past the edge (or with no obligation on record) the park
+        // ends and the pre-change behaviour runs: inject when ready, give up
+        // at the ready deadline.
+        return none(
+          `${USAGE_LIMIT_REASON_PREFIX}: resume injection parked`,
+          { ...state, deadlineMs: Math.min(resumeEdge, Math.max(state.deadlineMs, nowMs + READY_TIMEOUT_MS)) },
+        )
+      }
       if (inputs.running && inputs.sessionReady) {
         return {
           action: 'inject-resume',
@@ -532,12 +1645,13 @@ export function decideGuard(
             deadlineMs: 0,
             cooldownUntilMs: nowMs + cfg.cooldownMinutes * 60_000,
             saturatedStreak: 0,
+            staleRefreshCount: 0,
             handoffStaleMinutes: null,
           },
         }
       }
       if (nowMs >= state.deadlineMs) {
-        return cooldown(nowMs, cfg, 'ready timeout -- giving up on resume injection')
+        return cooldown(nowMs, cfg, RESUME_GIVE_UP_REASON)
       }
       return none('waiting for restarted session')
     }
@@ -546,13 +1660,14 @@ export function decideGuard(
 
 type NoneFn = (reason: string, next?: GuardState) => GuardDecision
 
-/** The two wedge tiers (hardPct restart, actPct handoff). Null = neither applies. */
+/**
+ * The two wedge tiers (hardPct restart, actPct handoff). Null = neither applies.
+ * A busy pane past hardPct gets the handoff request, not the restart.
+ */
 function decideWedgeTiers(
   nowMs: number,
   inputs: GuardInputs,
   cfg: ContextGuardConfig,
-  cleared: GuardState,
-  none: NoneFn,
 ): GuardDecision | null {
   const pct = inputs.pct as number
   if (pct >= cfg.hardPct) {
@@ -561,11 +1676,22 @@ function decideWedgeTiers(
     // POSITIVELY busy pane is working, not wedged -- restarting it cuts
     // a live turn and destroys any queued/parked input with it (Szabi,
     // 2026-07-27: agents restarted mid-work, dispatched instructions
-    // lost). Defer while busy; the sweep re-decides every interval, and
-    // a turn that tips into saturation is caught by the saturation net,
-    // which deliberately ignores the busy signal.
+    // lost). Working also means it can still answer a handoff request
+    // after its turn, the way it answers the act tier's. So ask, and let
+    // await-handoff do the waiting: that phase never cuts a live turn
+    // either, restarts on the first sweep that finds the pane no longer
+    // busy, and warns once when the turn runs far past the deadline.
+    // Deferring here instead was silent, and the restart that ended it
+    // came with no handoff written. The usual way into this branch is a
+    // context that jumped from below actPct past hardPct between two
+    // sweeps (one parallel tool batch can), so the act tier never asked.
+    // A turn that tips into saturation is still caught by the saturation
+    // net, which deliberately ignores the busy signal.
     if (inputs.paneBusy) {
-      return none(`hard threshold (${Math.round(pct * 100)}%) but agent mid-turn -- deferring restart`, cleared)
+      return handoffRequest(
+        nowMs, inputs, cfg,
+        `hard threshold (${Math.round(pct * 100)}% >= ${Math.round(cfg.hardPct * 100)}%) but agent mid-turn -- requesting handoff, the restart waits for the turn`,
+      )
     }
     return restartDecision(
       nowMs,
@@ -624,6 +1750,16 @@ function decideIdleFlush(
       cleared,
     )
   }
+  // IDLEFLUSHVETO812: a quiet transcript and an idle footer are also what a
+  // session looks like while a background shell, a Monitor or a sub-agent runs
+  // (a long build, a gh poll, an await). The flush would restart it and kill
+  // that work, so this tier waits until the footer carries no such counter.
+  if (inputs.paneBackgroundWork) {
+    return none(
+      `idle-flush: heavy and quiet, but the pane still runs background work (shell, monitor or sub-agent) -- deferring`,
+      cleared,
+    )
+  }
   return handoffRequest(
     nowMs, inputs, cfg,
     `${IDLE_FLUSH_REASON_PREFIX} (${Math.round(inputs.contextTokens / 1000)}k tokens, quiet for ` +
@@ -656,7 +1792,84 @@ function handoffRequest(
       deadlineMs: nowMs + cfg.handoffTimeoutMinutes * 60_000,
       cooldownUntilMs: 0,
       saturatedStreak: 0,
+      // A NEW sequence starts with a fresh refresh budget.
+      staleRefreshCount: 0,
       handoffStaleMinutes: null,
+      handoffRequestReason: reason,
+      idleFlushSequence: reason.startsWith(IDLE_FLUSH_REASON_PREFIX),
     },
   }
+}
+
+/** OWNERGATE3-1104 (review, Samu 69602): which fields of a context-guard change make the guard WEAKER, comparing the
+ *  normalized config before and after the change. The shared access token (every sub-agent can read it) may only
+ *  strengthen a guard (the main agent arms other agents' guards with it); any weakening needs the owner, on any
+ *  agent, so a sub-agent cannot switch off or loosen another agent's guard. Weaker means:
+ *   - a switch going from on to off: enabled, saturationRestart, idleFlushEnabled, dailyHandoffEnabled,
+ *     periodicHandoffEnabled, taskCloseHandoffEnabled;
+ *   - a number going up (the guard acts later, waits longer or holds longer): actPct, hardPct, cooldownMinutes,
+ *     handoffTimeoutMinutes, idleFlushTokens, idleMinutes, heavyJobDeferMaxMinutes, periodicHandoffMinutes,
+ *     periodicHandoffMinTokens (a higher floor means the periodic tier skips more slots);
+ *   - limitTokens changing in any way except to a smaller explicit number (null means "infer from the model", which
+ *     may be a larger window, so clearing it is treated as weakening);
+ *   - dailyHandoffTime moved or cleared once set (a moved time can postpone the restart; setting it from null arms).
+ *  A reset to the shipped defaults is not special: the default enabled is false, so a reset can switch a guard off. */
+export function contextGuardWeakenings(before: ContextGuardConfig, after: ContextGuardConfig): string[] {
+  const out: string[] = []
+  for (const k of ['enabled', 'saturationRestart', 'idleFlushEnabled', 'dailyHandoffEnabled', 'periodicHandoffEnabled', 'taskCloseHandoffEnabled'] as const) {
+    if (before[k] === true && after[k] !== true) out.push(k)
+  }
+  for (const k of ['actPct', 'hardPct', 'cooldownMinutes', 'handoffTimeoutMinutes', 'idleFlushTokens', 'idleMinutes', 'heavyJobDeferMaxMinutes', 'periodicHandoffMinutes', 'periodicHandoffMinTokens'] as const) {
+    if (after[k] > before[k]) out.push(k)
+  }
+  if (after.limitTokens !== before.limitTokens) {
+    const smaller = before.limitTokens !== null && after.limitTokens !== null && after.limitTokens < before.limitTokens
+    if (!smaller) out.push('limitTokens')
+  }
+  if (before.dailyHandoffTime !== null && after.dailyHandoffTime !== before.dailyHandoffTime) out.push('dailyHandoffTime')
+  return out
+}
+
+/** OWNERGATE3-1104 (review, Dani 69657): every context-guard key, classified, so a new key cannot fall outside the
+ *  token gate silently (a test pins that this covers exactly the keys of DEFAULT_CONTEXT_GUARD). */
+export const CONTEXT_GUARD_FIELD_KIND: Record<keyof ContextGuardConfig, 'switch' | 'value'> = {
+  enabled: 'switch',
+  saturationRestart: 'switch',
+  idleFlushEnabled: 'switch',
+  dailyHandoffEnabled: 'switch',
+  actPct: 'value',
+  hardPct: 'value',
+  limitTokens: 'value',
+  cooldownMinutes: 'value',
+  handoffTimeoutMinutes: 'value',
+  idleFlushTokens: 'value',
+  idleMinutes: 'value',
+  dailyHandoffTime: 'value',
+  heavyJobDeferMaxMinutes: 'value',
+  periodicHandoffEnabled: 'switch',
+  periodicHandoffMinutes: 'value',
+  periodicHandoffMinTokens: 'value',
+  taskCloseHandoffEnabled: 'switch',
+}
+
+/** OWNERGATE3-1104 (review, Dani 69657): the fields of a context-guard change the shared access token may NOT make.
+ *  Strengthening without a bound is not harmless: a guard driven to actPct 0.01 or a cooldown of 0.01 minutes hands
+ *  the agent off and restarts it continuously, an availability attack a sub-agent could aim at any agent, the main
+ *  one included. So with the token:
+ *   - a switch may only be turned ON;
+ *   - any other field may only change to its SHIPPED DEFAULT, and only when that is not a weakening
+ *     (contextGuardWeakenings), e.g. a lowered threshold back to the default is a weakening and stays the owner's.
+ *  Everything else needs the owner. The arming skill (enabled:true with the shipped defaults) stays on the token. */
+export function contextGuardTokenRefusals(before: ContextGuardConfig, after: ContextGuardConfig): string[] {
+  const weak = new Set(contextGuardWeakenings(before, after))
+  const out: string[] = []
+  for (const k of Object.keys(CONTEXT_GUARD_FIELD_KIND) as (keyof ContextGuardConfig)[]) {
+    if (after[k] === before[k]) continue
+    if (CONTEXT_GUARD_FIELD_KIND[k] === 'switch') {
+      if (after[k] !== true) out.push(k)
+      continue
+    }
+    if (weak.has(k) || after[k] !== DEFAULT_CONTEXT_GUARD[k]) out.push(k)
+  }
+  return out
 }

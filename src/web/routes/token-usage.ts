@@ -4,8 +4,8 @@ import {
   getTokenTimeline,
   getTokenDetails,
   getModelDistribution,
+  getModelSourceBreakdown,
   getToolStats,
-  correlateWithKanban,
 } from '../token-usage.js'
 import { json, jsonMaybeGzip } from '../http-helpers.js'
 import { logger } from '../../logger.js'
@@ -17,7 +17,10 @@ export async function tryHandleTokenUsage(ctx: RouteContext): Promise<boolean> {
   if (path === '/api/token-usage/collect' && method === 'POST') {
     try {
       const result = await collectTokenUsage()
-      correlateWithKanban()
+      // DBSIZE1111: no card correlation here. The overview page calls this route every 5 minutes, and the
+      // correlation (one UPDATE per card window over every NULL-titled row) grew the DB from 704 to 1364 MB
+      // and held the event loop for 6.8 s on 2026-11-11 15:34. The card is worked out when the rows are read
+      // (getTokenDetails / getModelSourceBreakdown, from kanban_card_events); nothing is stored.
       json(res, { ok: true, ...result })
     } catch (err) {
       logger.error({ err }, 'Token usage collection failed')
@@ -56,6 +59,18 @@ export async function tryHandleTokenUsage(ctx: RouteContext): Promise<boolean> {
     const from = url.searchParams.get('from')
     const to = url.searchParams.get('to')
     const agent = url.searchParams.get('agent') || undefined
+    const model = url.searchParams.get('model') || undefined
+    // APRO920 (c)(1): ?model=<id> switches this endpoint from "how many rows
+    // per model" to "which agent/session/task drove THIS model's rows" --
+    // API only (spec D-3), no UI in this PR.
+    if (model) {
+      json(res, getModelSourceBreakdown(
+        model,
+        from ? parseInt(from) : undefined,
+        to ? parseInt(to) : undefined,
+      ))
+      return true
+    }
     json(res, getModelDistribution(
       from ? parseInt(from) : undefined,
       to ? parseInt(to) : undefined,

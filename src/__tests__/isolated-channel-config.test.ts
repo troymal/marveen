@@ -9,13 +9,18 @@ import { tmpdir } from 'node:os'
 // shared ~/.claude) and agentDir() (used to find the agent cwd) at the temp
 // sandbox built per test. tmpdir() stays real so we can create the sandbox.
 let SANDBOX = ''
+let AUTH_MODE: Record<string, string> = {}
 vi.mock('node:os', async (orig) => {
   const actual = await orig<typeof import('node:os')>()
   return { ...actual, homedir: () => join(SANDBOX, 'home') }
 })
 vi.mock('../web/agent-config.js', async (orig) => {
   const actual = await orig<typeof import('../web/agent-config.js')>()
-  return { ...actual, agentDir: (name: string) => join(SANDBOX, 'agents', name) }
+  return {
+    ...actual,
+    agentDir: (name: string) => join(SANDBOX, 'agents', name),
+    readAgentAuthMode: (name: string) => AUTH_MODE[name] ?? 'shared',
+  }
 })
 
 // Imported AFTER the mocks are registered.
@@ -48,6 +53,7 @@ function seedSharedClaude(home: string) {
 
 beforeEach(() => {
   SANDBOX = mkdtempSync(join(tmpdir(), 'isocfg-'))
+  AUTH_MODE = {}
   seedSharedClaude(join(SANDBOX, 'home'))
   mkdirSync(join(SANDBOX, 'agents', 'testagent'), { recursive: true })
 })
@@ -61,10 +67,23 @@ describe('ensureIsolatedChannelConfigDir', () => {
     expect(cfg).toBe(join(SANDBOX, 'agents', 'testagent', '.claude-config'))
   })
 
-  it('symlinks shared transcripts so --continue stays shared', () => {
+  // UPDATED 2026-08-18: `projects` is no longer symlinked, and that is the whole
+  // point of the change. That directory holds each session's transcript AND the
+  // auto-memory store, and the memory store is keyed by PROJECT ROOT rather than
+  // by cwd -- so a shared link gave every agent on the install ONE memory store,
+  // the main agent's. Measured on this install: an agent's note landed in the
+  // MAIN agent's MEMORY.md, and a second agent saw a memory written by the main
+  // agent appear in its own index minutes later. Live and bidirectional, not just
+  // shared history.
+  //
+  // It could not be fixed on disk either: the provisioner runs on EVERY spawn and,
+  // finding a real directory where it expected a symlink, deleted it and re-linked.
+  // A manual split survived seconds. Leaving the path alone is the fix.
+  it('does NOT provision projects at all, so each agent keeps its own memory store', () => {
     const cfg = ensureIsolatedChannelConfigDir('testagent', 'telegram')!
-    expect(lstatSync(join(cfg, 'projects')).isSymbolicLink()).toBe(true)
-    expect(readlinkSync(join(cfg, 'projects'))).toBe(join(SANDBOX, 'home', '.claude', 'projects'))
+    expect(existsSync(join(cfg, 'projects'))).toBe(false)
+    // The shared root's own transcripts must be left untouched by provisioning.
+    expect(existsSync(join(SANDBOX, 'home', '.claude', 'projects'))).toBe(true)
   })
 
   it('does NOT symlink or copy .credentials.json (auth via CLAUDE_CODE_OAUTH_TOKEN env)', () => {
@@ -84,6 +103,17 @@ describe('ensureIsolatedChannelConfigDir', () => {
     expect(existsSync(join(cfg, '.credentials.json'))).toBe(false)
   })
 
+  it('keeps an own_team agent\'s own .credentials.json (OWNTEAMCREDWIPE1008)', () => {
+    // own_team: the file is the agent's own `claude auth login` credential, not a
+    // stale copy -- deleting it on every spawn logged the agent out.
+    AUTH_MODE.testagent = 'own_team'
+    const cfg = join(SANDBOX, 'agents', 'testagent', '.claude-config')
+    mkdirSync(cfg, { recursive: true })
+    writeFileSync(join(cfg, '.credentials.json'), '{"own":true}')
+    ensureIsolatedChannelConfigDir('testagent', 'telegram')
+    expect(readFileSync(join(cfg, '.credentials.json'), 'utf-8')).toBe('{"own":true}')
+  })
+
   it('OWNS settings.json (real file) with only the agent provider plugin enabled', () => {
     const cfg = ensureIsolatedChannelConfigDir('testagent', 'telegram')!
     const sp = join(cfg, 'settings.json')
@@ -92,7 +122,7 @@ describe('ensureIsolatedChannelConfigDir', () => {
     expect(s.enabledPlugins[TG]).toBe(true)
     expect(s.enabledPlugins[SL]).toBe(false)
     expect(s.enabledPlugins[DI]).toBe(false)
-    expect(s.hooks).toEqual({ Stop: [] }) // shared non-plugin settings preserved
+    expect(s.hooks).toBeUndefined() // #1305: hooks never ride the clone (see isolated-config-hook-strip)
   })
 
   it('a slack agent enables ONLY slack in its isolated settings', () => {
@@ -111,6 +141,113 @@ describe('ensureIsolatedChannelConfigDir', () => {
     expect(inst.plugins[TG][0].projectPath).toBe(join(SANDBOX, 'agents', 'testagent'))
   })
 
+  it('PLUGINREGCLOBBER1107: a relaunch keeps the agent-owned registry entry the shared file lacks', () => {
+    const cfg = ensureIsolatedChannelConfigDir('testagent', 'telegram')!
+    const ip = join(cfg, 'plugins', 'installed_plugins.json')
+    // Claude Code maintained the agent's own registry after the first launch...
+    const own = JSON.parse(readFileSync(ip, 'utf-8'))
+    own.plugins[TG] = [{ scope: 'project', projectPath: join(SANDBOX, 'agents', 'testagent'), installPath: '/own', version: '0.0.7', installedAt: 'T0' }]
+    writeFileSync(ip, JSON.stringify(own))
+    // ...and the shared registry is (or became) empty, as measured live.
+    writeFileSync(join(SANDBOX, 'home', '.claude', 'plugins', 'installed_plugins.json'), '{"version":2,"plugins":{}}')
+    ensureIsolatedChannelConfigDir('testagent', 'telegram')
+    const after = JSON.parse(readFileSync(ip, 'utf-8'))
+    expect(after.plugins[TG]).toHaveLength(1)
+    expect(after.plugins[TG][0].installPath).toBe('/own')
+    expect(after.plugins[TG][0].installedAt).toBe('T0')
+  })
+
+  it('PLUGINREGCLOBBER1107: an id only the shared registry lists is still added, re-pointed', () => {
+    const cfg = ensureIsolatedChannelConfigDir('testagent', 'telegram')!
+    const ip = join(cfg, 'plugins', 'installed_plugins.json')
+    writeFileSync(ip, JSON.stringify({ version: 2, plugins: { 'other@m': [{ scope: 'user', installPath: '/o' }] } }))
+    ensureIsolatedChannelConfigDir('testagent', 'telegram')
+    const after = JSON.parse(readFileSync(ip, 'utf-8'))
+    expect(after.plugins['other@m'][0].installPath).toBe('/o')
+    expect(after.plugins[TG][0].projectPath).toBe(join(SANDBOX, 'agents', 'testagent'))
+  })
+
+  it.each(['{', '[]', 'null'])('PLUGINREGCLOBBER1107: a torn/non-object own registry (%s) is reseeded from the shared file, re-pointed', (torn) => {
+    const cfg = ensureIsolatedChannelConfigDir('testagent', 'telegram')!
+    const ip = join(cfg, 'plugins', 'installed_plugins.json')
+    writeFileSync(ip, torn)
+    ensureIsolatedChannelConfigDir('testagent', 'telegram')
+    const after = JSON.parse(readFileSync(ip, 'utf-8'))
+    expect(after.plugins[TG]).toHaveLength(1)
+    expect(after.plugins[TG][0].projectPath).toBe(join(SANDBOX, 'agents', 'testagent'))
+  })
+
+  it('PLUGINREGCLOBBER1107: an own entry that is an EMPTY array is refilled from the shared file', () => {
+    const cfg = ensureIsolatedChannelConfigDir('testagent', 'telegram')!
+    const ip = join(cfg, 'plugins', 'installed_plugins.json')
+    writeFileSync(ip, JSON.stringify({ version: 2, plugins: { [TG]: [] } }))
+    ensureIsolatedChannelConfigDir('testagent', 'telegram')
+    const after = JSON.parse(readFileSync(ip, 'utf-8'))
+    expect(after.plugins[TG]).toHaveLength(1)
+    expect(after.plugins[TG][0].projectPath).toBe(join(SANDBOX, 'agents', 'testagent'))
+  })
+
+  it('PLUGINREGCLOBBER1107: a KEPT own project entry with a stale projectPath is re-pointed, nothing else touched', () => {
+    const cfg = ensureIsolatedChannelConfigDir('testagent', 'telegram')!
+    const ip = join(cfg, 'plugins', 'installed_plugins.json')
+    writeFileSync(ip, JSON.stringify({ version: 2, plugins: {
+      [TG]: [{ scope: 'project', projectPath: '/old/root/agents/testagent', installPath: '/own', installedAt: 'T0' }],
+      'u@m': [{ scope: 'user', installPath: '/u' }],
+    } }))
+    ensureIsolatedChannelConfigDir('testagent', 'telegram')
+    const after = JSON.parse(readFileSync(ip, 'utf-8'))
+    expect(after.plugins[TG][0]).toEqual({ scope: 'project', projectPath: join(SANDBOX, 'agents', 'testagent'), installPath: '/own', installedAt: 'T0' })
+    expect(after.plugins['u@m'][0]).toEqual({ scope: 'user', installPath: '/u' })
+  })
+
+  // docs/agent-fleet.md, "Pluginok izolált config-mappában": what taking a plugin off the fleet takes.
+  it('PLUGINREGCLOBBER1107 (docs): a plugin removed only from the own registry comes back while the shared one lists it; removed from both, it stays gone', () => {
+    const sharedIp = join(SANDBOX, 'home', '.claude', 'plugins', 'installed_plugins.json')
+    const shared = JSON.parse(readFileSync(sharedIp, 'utf-8'))
+    shared.plugins['x@m'] = [{ scope: 'user', installPath: '/x-plugin' }]
+    writeFileSync(sharedIp, JSON.stringify(shared))
+    const cfg = ensureIsolatedChannelConfigDir('testagent', 'telegram')!
+    const ip = join(cfg, 'plugins', 'installed_plugins.json')
+    const drop = (path: string) => {
+      const reg = JSON.parse(readFileSync(path, 'utf-8'))
+      delete reg.plugins['x@m']
+      writeFileSync(path, JSON.stringify(reg))
+    }
+    expect(JSON.parse(readFileSync(ip, 'utf-8')).plugins['x@m']).toHaveLength(1)
+    // Own registry only: the next launch adds it back from the shared file.
+    drop(ip)
+    ensureIsolatedChannelConfigDir('testagent', 'telegram')
+    expect(JSON.parse(readFileSync(ip, 'utf-8')).plugins['x@m']).toHaveLength(1)
+    // Shared registry only: the agent keeps it.
+    drop(sharedIp)
+    ensureIsolatedChannelConfigDir('testagent', 'telegram')
+    expect(JSON.parse(readFileSync(ip, 'utf-8')).plugins['x@m']).toHaveLength(1)
+    // Both: gone, and it stays gone.
+    drop(ip)
+    ensureIsolatedChannelConfigDir('testagent', 'telegram')
+    expect(JSON.parse(readFileSync(ip, 'utf-8')).plugins).not.toHaveProperty('x@m')
+    expect(JSON.parse(readFileSync(ip, 'utf-8')).plugins[TG]).toHaveLength(1)
+  })
+
+  it('PLUGINREGCLOBBER1107 (docs): a non-channel plugin switched off in the shared settings.json is off in the isolated one at the next launch', () => {
+    const sharedSettings = join(SANDBOX, 'home', '.claude', 'settings.json')
+    const s = JSON.parse(readFileSync(sharedSettings, 'utf-8'))
+    s.enabledPlugins['x@m'] = true
+    writeFileSync(sharedSettings, JSON.stringify(s))
+    const cfg = ensureIsolatedChannelConfigDir('testagent', 'telegram')!
+    const own = () => JSON.parse(readFileSync(join(cfg, 'settings.json'), 'utf-8')).enabledPlugins
+    expect(own()['x@m']).toBe(true)
+    s.enabledPlugins['x@m'] = false
+    writeFileSync(sharedSettings, JSON.stringify(s))
+    ensureIsolatedChannelConfigDir('testagent', 'telegram')
+    expect(own()['x@m']).toBe(false)
+    // The isolated file's own older value does not survive: enabledPlugins is never inherited from it.
+    delete s.enabledPlugins['x@m']
+    writeFileSync(sharedSettings, JSON.stringify(s))
+    ensureIsolatedChannelConfigDir('testagent', 'telegram')
+    expect(own()).not.toHaveProperty('x@m')
+  })
+
   it('a CHANNEL-LESS agent (null provider) disables EVERY channel plugin', () => {
     // AUTHISO25: dani/geri-class agents have no bot token at all. Their
     // isolated settings.json must not enable any channel plugin -- a loaded
@@ -121,14 +258,16 @@ describe('ensureIsolatedChannelConfigDir', () => {
     expect(s.enabledPlugins[TG]).toBe(false)
     expect(s.enabledPlugins[SL]).toBe(false)
     expect(s.enabledPlugins[DI]).toBe(false)
-    expect(s.hooks).toEqual({ Stop: [] }) // shared non-plugin settings preserved
+    expect(s.hooks).toBeUndefined() // #1305: hooks never ride the clone (see isolated-config-hook-strip)
   })
 
   it('channel-less provisioning still carries NO .credentials.json', () => {
     const cfg = ensureIsolatedChannelConfigDir('testagent', null)!
     expect(existsSync(join(cfg, '.credentials.json'))).toBe(false)
-    // and the auth-independent parts are intact
-    expect(lstatSync(join(cfg, 'projects')).isSymbolicLink()).toBe(true)
+    // and the auth-independent parts are intact: settings.json is written, and
+    // projects is deliberately absent (see the memory-store note above).
+    expect(existsSync(join(cfg, 'settings.json'))).toBe(true)
+    expect(existsSync(join(cfg, 'projects'))).toBe(false)
   })
 
   it('is idempotent: a second call leaves a valid isolated dir', () => {
@@ -174,15 +313,79 @@ describe('isolated-config launcher wiring', () => {
     // The shared root's rotating credential (macOS Keychain /.credentials.json)
     // wins over a valid CLAUDE_CODE_OAUTH_TOKEN env var, so a shared-root agent
     // 401s whenever it rotates -- the gate must not be hasChannel-only.
-    expect(SRC).toMatch(/const needsFleetOauth = isClaude && authMode !== 'api'/)
-    expect(SRC).toMatch(/\(hasChannel \|\| needsFleetOauth\) && name !== MAIN_AGENT_ID/)
+    expect(SRC).toMatch(/const needsFleetOauth = isClaude && authMode !== 'api' && !isOwnTeam/)
+    expect(SRC).toMatch(/\(hasAnyChannel \|\| needsFleetOauth \|\| isOwnTeam\) && name !== MAIN_AGENT_ID/)
+  })
+
+  it('own_team never exports the fleet token (OWNTEAMVAK914)', () => {
+    // Both export sites must exclude own_team: the shared-home pre-export and
+    // the isolation branch. A fleet-token fallback would silently put the
+    // agent back on the shared identity whenever its own credential expires --
+    // exactly what the operator opted out of by picking own_team.
+    //
+    // own_team exclusion is folded into needsFleetOauth (BYOCUSTFOAUTH805:
+    // `isClaude && authMode !== 'api' && !isOwnTeam`) rather than spelled out
+    // as a separate `!isOwnTeam` at the export site -- the same guard also has
+    // to exclude BYO/custom-endpoint agents (Ollama/DeepSeek/OpenRouter/custom),
+    // and one shared boolean keeps both exclusions from drifting apart.
+    expect(SRC).toMatch(/const isOwnTeam = isClaude && authMode === 'own_team'/)
+    expect(SRC).toMatch(/const needsFleetOauth = isClaude && authMode !== 'api' && !isOwnTeam/)
+    expect(SRC).toMatch(/!claudeConfigDir && hasFleetOauthToken\(\) && needsFleetOauth/)
+    // The own_team isolation branch comes BEFORE the hasFleetOauthToken() gate
+    // (isolation must not require the fleet token for own_team) and contains
+    // no token export.
+    const ownTeamBranch = SRC.match(/if \(isOwnTeam\) \{[\s\S]*?\n {6}\} else if \(hasFleetOauthToken\(\)\) \{/)?.[0] ?? ''
+    expect(ownTeamBranch).not.toBe('')
+    expect(ownTeamBranch).not.toMatch(/CLAUDE_CODE_OAUTH_TOKEN/)
+    expect(ownTeamBranch).toMatch(/ensureIsolatedChannelConfigDir\(name, hasChannel \? agentProvider : null, extraLaunch\.pluginIds\)/)
+  })
+
+  it('own_team isolation failure falls back LOUDLY (shared root = host credential)', () => {
+    expect(SRC).toMatch(/own_team auth: isolated config dir provisioning failed/)
   })
 
   it('passes a null provider for channel-less agents so no plugin gets enabled', () => {
-    expect(SRC).toMatch(/ensureIsolatedChannelConfigDir\(name, hasChannel \? agentProvider : null\)/)
+    expect(SRC).toMatch(/ensureIsolatedChannelConfigDir\(name, hasChannel \? agentProvider : null, extraLaunch\.pluginIds\)/)
   })
 
   it('keeps the plugin-slot collision alert scoped to channel agents', () => {
-    expect(SRC).toMatch(/if \(hasChannel\) maybeAlertSharedConfigCollision\(name\)/)
+    expect(SRC).toMatch(/if \(hasAnyChannel\) maybeAlertSharedConfigCollision\(name\)/)
+  })
+
+  // Regression guard for the BYO/custom-provider + channel-agent 401 bug (2026-08-05).
+  // A BYO-endpoint agent (Ollama, DeepSeek, OpenRouter, generic custom) must NEVER
+  // receive CLAUDE_CODE_OAUTH_TOKEN in its env -- the Claude CLI forwards it to the
+  // third-party endpoint instead of the ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN
+  // the provider expects, resulting in a 401.  The CLAUDE_CONFIG_DIR isolation for
+  // channel agents is unrelated and must be preserved regardless of provider type.
+
+  it('shared-home token export is gated on needsFleetOauth so BYO/custom agents are never given the OAuth token', () => {
+    // The shared-home fallback block must export CLAUDE_CODE_OAUTH_TOKEN only when
+    // needsFleetOauth is true (i.e. isClaude && authMode !== 'api').
+    expect(SRC).toMatch(/hasFleetOauthToken\(\) && needsFleetOauth/)
+  })
+
+  it('channel-isolation token export is wrapped in if(needsFleetOauth): BYO channel agents keep CLAUDE_CONFIG_DIR but no OAuth token', () => {
+    // The oauthTokenEnv assignment inside the channel-isolation block must be
+    // wrapped in an if(needsFleetOauth) guard so BYO channel agents (hasChannel=true
+    // but isClaude=false) get the isolated CLAUDE_CONFIG_DIR for plugin-slot
+    // separation without the Claude OAuth token being forwarded to their provider.
+    expect(SRC).toMatch(/if \(needsFleetOauth\)\s*\{[^}]*CLAUDE_CODE_OAUTH_TOKEN/)
+  })
+
+  // Regression guard for the inherited-token layer of the BYO 401 bug (2026-08-05).
+  // The tmux server carries CLAUDE_CODE_OAUTH_TOKEN in its own env;
+  // every new agent pane inherits it regardless of whether the launch command exports
+  // it.  Not exporting is not enough: the token must be actively unset at launch for
+  // BYO/custom-endpoint agents so the CLI forwards ANTHROPIC_API_KEY to the provider
+  // instead.
+
+  it('launch command actively unsets CLAUDE_CODE_OAUTH_TOKEN for BYO agents (inherited tmux-server env)', () => {
+    // byoUnsetEnv must be defined and wired into the cmd string so the inherited
+    // token is removed before exec for non-Claude-OAuth agents.
+    // The decision now lives in inheritedAuthUnset (BYOSUBUNSET1018), executed
+    // per case in inherited-auth-unset.test.ts; a BYO agent still gets the unset.
+    expect(SRC).toMatch(/const byoUnsetEnv = inheritedAuthUnset\(\{ needsFleetOauth,/)
+    expect(SRC).toMatch(/\$\{byoUnsetEnv\}/)
   })
 })

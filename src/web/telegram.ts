@@ -1,8 +1,8 @@
 import { readFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { homedir } from 'node:os'
 import { PROJECT_ROOT } from '../config.js'
-import { resolveOwnerChatId } from '../owner-chat.js'
+import { channelStateDir } from '../channel-provider.js'
+import { ownerAlertChatOverride, resolveOwnerChatId } from '../owner-chat.js'
 import { logger } from '../logger.js'
 import { agentDir, readFileOr, findAvatarForAgent } from './agent-config.js'
 import { TOOL_TIMEOUTS } from '../tool-timeouts.js'
@@ -54,11 +54,11 @@ export function readAgentTeamsConfig(name: string): { hasTeams: boolean } {
   return { hasTeams: !!m?.[1]?.trim() }
 }
 
-// Marveen's Telegram channel lives under the global ~/.claude path, not
-// under agents/marveen, because the main agent reuses the system Claude
-// Code channel install. Read it the same way the plugin does.
+// Marveen's channel state is resolved by channelStateDir (#915): env
+// override, then the legacy shared ~/.claude path while unmigrated, then the
+// install-scoped dir. Read it the same way the plugin does.
 export function readMarveenTelegramConfig(): { hasTelegram: boolean; botUsername?: string } {
-  const envPath = join(homedir(), '.claude', 'channels', 'telegram', '.env')
+  const envPath = join(channelStateDir('telegram'), '.env')
   if (!existsSync(envPath)) return { hasTelegram: false }
   const content = readFileOr(envPath, '')
   const tokenMatch = content.match(/TELEGRAM_BOT_TOKEN=(.+)/)
@@ -67,34 +67,33 @@ export function readMarveenTelegramConfig(): { hasTelegram: boolean; botUsername
   return { hasTelegram: true, botUsername: marveenBotUsernameCache.value }
 }
 
-// Discord / Slack mirror of the above: same global ~/.claude/channels path
-// since Marveen's channel session reuses the system install. Lets the
-// dashboard answer "is Marveen connected?" per provider without per-agent
-// state lookup. botUsername omitted -- the Discord/Slack flows don't
+// Discord / Slack mirror of the above: same channelStateDir resolution as
+// the Telegram reader. Lets the dashboard answer "is Marveen connected?"
+// per provider without per-agent state lookup. botUsername omitted -- the Discord/Slack flows don't
 // surface a @username the same way Telegram does.
 export function readMarveenDiscordConfig(): { hasDiscord: boolean } {
-  const envPath = join(homedir(), '.claude', 'channels', 'discord', '.env')
+  const envPath = join(channelStateDir('discord'), '.env')
   if (!existsSync(envPath)) return { hasDiscord: false }
   const tokenMatch = readFileOr(envPath, '').match(/DISCORD_BOT_TOKEN=(.+)/)
   return { hasDiscord: !!tokenMatch?.[1]?.trim() }
 }
 
 export function readMarveenGooglechatConfig(): { hasGooglechat: boolean } {
-  const envPath = join(homedir(), '.claude', 'channels', 'googlechat', '.env')
+  const envPath = join(channelStateDir('googlechat'), '.env')
   if (!existsSync(envPath)) return { hasGooglechat: false }
   const m = readFileOr(envPath, '').match(/GOOGLECHAT_PROJECT_ID=(.+)/)
   return { hasGooglechat: !!m?.[1]?.trim() }
 }
 
 export function readMarveenTeamsConfig(): { hasTeams: boolean } {
-  const envPath = join(homedir(), '.claude', 'channels', 'teams', '.env')
+  const envPath = join(channelStateDir('teams'), '.env')
   if (!existsSync(envPath)) return { hasTeams: false }
   const m = readFileOr(envPath, '').match(/TEAMS_BOT_APP_ID=(.+)/)
   return { hasTeams: !!m?.[1]?.trim() }
 }
 
 export function readMarveenSlackConfig(): { hasSlack: boolean } {
-  const envPath = join(homedir(), '.claude', 'channels', 'slack', '.env')
+  const envPath = join(channelStateDir('slack'), '.env')
   if (!existsSync(envPath)) return { hasSlack: false }
   const tokenMatch = readFileOr(envPath, '').match(/SLACK_BOT_TOKEN=(.+)/)
   return { hasSlack: !!tokenMatch?.[1]?.trim() }
@@ -104,7 +103,7 @@ export function readMarveenSlackConfig(): { hasSlack: boolean } {
 export const marveenBotUsernameCache: { value?: string; fetchedAt: number } = { fetchedAt: 0 }
 
 export async function refreshMarveenBotUsername(): Promise<void> {
-  const envPath = join(homedir(), '.claude', 'channels', 'telegram', '.env')
+  const envPath = join(channelStateDir('telegram'), '.env')
   if (!existsSync(envPath)) return
   const tokenMatch = readFileOr(envPath, '').match(/TELEGRAM_BOT_TOKEN=(.+)/)
   const token = tokenMatch?.[1]?.trim()
@@ -196,7 +195,7 @@ export async function sendTelegramPhoto(token: string, chatId: string, photoPath
 }
 
 export async function sendWelcomeMessage(agentName: string, token: string): Promise<void> {
-  const chatId = resolveOwnerChatId()
+  const chatId = ownerAlertChatOverride('telegram') ?? resolveOwnerChatId()
   if (!chatId) { logger.warn('Telegram send skipped: no owner chat on this install') ; return }
   const dir = agentDir(agentName)
   const soulMd = readFileOr(join(dir, 'SOUL.md'), '')
@@ -224,7 +223,7 @@ export async function sendMarveenAvatarChange(avatarPath: string): Promise<void>
   const tokenMatch = envContent.match(/TELEGRAM_BOT_TOKEN=(.+)/)
   const token = tokenMatch?.[1]?.trim()
   if (!token) return
-  const chatId = resolveOwnerChatId()
+  const chatId = ownerAlertChatOverride('telegram') ?? resolveOwnerChatId()
   if (!chatId) { logger.warn('Telegram send skipped: no owner chat on this install') ; return }
 
   try {
@@ -247,7 +246,7 @@ export async function sendMarveenAvatarChange(avatarPath: string): Promise<void>
 export async function sendAvatarChangeMessage(agentName: string, avatarPath: string): Promise<void> {
   const token = parseTelegramToken(agentName)
   if (!token) return
-  const chatId = resolveOwnerChatId()
+  const chatId = ownerAlertChatOverride('telegram') ?? resolveOwnerChatId()
   if (!chatId) { logger.warn('Telegram send skipped: no owner chat on this install') ; return }
 
   try {
@@ -296,7 +295,7 @@ export async function sendMarveenAlert(text: string): Promise<void> {
     const tokenMatch = envContent.match(/TELEGRAM_BOT_TOKEN=(.+)/)
     const token = tokenMatch?.[1]?.trim()
     if (!token) return
-    const chatId = resolveOwnerChatId()
+    const chatId = ownerAlertChatOverride('telegram') ?? resolveOwnerChatId()
     if (!chatId) { logger.warn('Telegram send skipped: no owner chat on this install'); return }
     await sendTelegramMessage(token, chatId, text)
   } catch (err) {

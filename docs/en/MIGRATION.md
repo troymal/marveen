@@ -25,12 +25,21 @@ the Docker volumes (3) are **separate** and must be moved on their own.
 - `assets/meetings/**` — meeting transcripts/memos
 - `agents/*/CLAUDE.md`, `SOUL.md`, `.mcp.json` — per-agent identity
 - `agents/*/.claude/channels/*/.env`, `access.json` — sub-agent channel tokens + pairing
+- `agents/*/agent-config.json`, `.claude/settings.local.json`, `.claude/skills/` -- per-agent model/permission profile, deny rules and agent-private skills. Credential-like files inside a skill folder are left out unless `MARVEEN_BACKUP_AGENT_SECRETS=1` is set, but the filter is a deny-list by file name (`.env`, `.env.*`, `*.env`, `*.key`, `*.pem`, `*.p12`, `*.pfx`, `id_rsa*`, `id_ed25519*`, `credentials*`, `*token*`, `*secret*`, `.netrc`, `.npmrc`): a credential file whose name is not on the list is still archived. Keep credentials under `agents/<name>/secrets/` (covered by the opt-in below), not inside a skill folder
+- `agents/*/secrets/` -- per-agent credentials kept outside the channel dirs (SSH keys, CLI logins, mailbox config). **Opt-in, off by default:** only taken when `MARVEEN_BACKUP_AGENT_SECRETS=1` is set. For a manual run, put it in the environment (`MARVEEN_BACKUP_AGENT_SECRETS=1 bash scripts/backup.sh`); for a systemd unit that runs the backup, add `Environment=MARVEEN_BACKUP_AGENT_SECRETS=1` to the `[Service]` section. Any other value (`0`, `yes`, `true`) leaves it out. Same trust level as the channel `.env` files above: the archive is created 0600, so keep it (and any second copy) off cloud-synced folders
+- `agents/*/.claude-config/projects/*/memory/` and `.channels-config/projects/*/memory/` -- file memory of agents (and of the main agent) that run with their own `CLAUDE_CONFIG_DIR`; transcripts next to it are not taken
+- `local-commits.bundle`: every local git branch that `origin` does not have
+  (the source itself is NOT in the archive; it is expected on the remote). Restore:
+  clone the upstream repo, then
+  `git fetch <restored>/repo/local-commits.bundle 'refs/heads/*:refs/heads/*'`.
+  Absent when everything is already pushed.
 
 **(2) Home-relative — under `$HOME` (`home/` group in the archive)**
 - `~/.claude/skills/**` — the self-built skill library
 - `~/.claude/scheduled-tasks/**` — file-based scheduled tasks (SKILL.md + task-config.json)
 - `~/.claude/channels/*/.env` — MAIN orchestrator channel token
 - `~/.claude/channels/*/access.json`, `invites.json`, `approved/**` — pairing allowlist + approvals
+- `~/.config/systemd/user/<SERVICE_ID>-*` -- this fleet's systemd `--user` units (Linux): the services that start the dashboard and the channel session, with their drop-ins and enable links. `SERVICE_ID` is `MAIN_AGENT_ID` unless `.env` sets it apart. Other applications' units are not taken
 - `~/Library/LaunchAgents/com.<MAIN_AGENT_ID>.*.plist` — launchd jobs (prefix is your `MAIN_AGENT_ID`, `marveen` by default)
 
 **(3) Docker volumes — NOT in the tarball, migrate separately**
@@ -56,6 +65,11 @@ the Docker volumes (3) are **separate** and must be moved on their own.
    tar -tzf backups/claudeclaw-*.tar.gz | sed -E 's,(^[^/]+/[^/]+/).*,\1...,' | sort -u
    ```
    Confirm both `repo/...` and `home/...` groups and the `MANIFEST.txt` are present.
+   For a nightly run with an optional second copy of the newest archive, use
+   `scripts/backup-nightly.sh`. The second copy is off unless `MARVEEN_BACKUP_COPY_DIR`
+   is set (`MARVEEN_BACKUP_COPY_KEEP`, default 7, is how many archives stay there). The
+   archive holds live secrets, so point it at a location that is not cloud-synced; a
+   requested copy that cannot be made makes the wrapper exit non-zero.
 3. Export the Docker volumes (time-series + dashboards):
    ```bash
    cd <repo>/projects/loxonTSDB && docker compose down   # quiesce writers first
@@ -184,3 +198,97 @@ the Docker volumes (3) are **separate** and must be moved on their own.
       matches the old machine; Grafana dashboards render.
 - [ ] All your launchd jobs are loaded: `launchctl list | grep com.<MAIN_AGENT_ID>`.
 - [ ] Old machine's pollers are fully stopped (no 409).
+
+---
+
+## 7. Upgrade notes (updating an existing install)
+
+This runbook is about moving to a new machine. The notes below are about the
+other kind of migration: updating an install in place. Each entry says what a
+client, script or install sees after the update, and the way forward.
+
+### v1.45.0
+
+Eight changes in v1.45.0 alter what an existing install does after the update
+(reported in #2299). Two of them were changed again after the release; their
+entries say what v1.45.0 does and what the next release does.
+
+1. **An agent closing a card to `done` without `evidence` is held in `testing`.**
+   `POST /api/kanban/:id/move` and `PUT /api/kanban/:id` with `status: done`
+   from an agent and no `evidence` move the card to `testing` and answer HTTP
+   200 with `"status": "testing"` and `"evidence_required": true`. In v1.45.0
+   the answer also says `"ok": true`, so a client that reads only `ok` reports
+   the card as closed. From the next release (#2296) `ok` is `false` in that
+   case; the HTTP status and the other fields are unchanged. Forward: send
+   `evidence`, and read `status` or `evidence_required`, not only `ok`.
+
+2. **The vault resolver scripts ask the dashboard first.** In v1.45.0 the
+   resolver waits up to 10 s per request, as long as the scheduled-task
+   `preCheck` limit, so on a slow dashboard the `preCheck` is killed before it
+   reaches its fallback, and the task starts anyway. From the next release
+   (#2297) the default wait is 5 s for the whole call, and
+   `VAULT_RESOLVE_TIMEOUT_MS` (whole milliseconds, greater than 0) overrides it.
+   Also from the next release (#2308): `VAULT_RESOLVE_URL` must point to this
+   machine (`http` or `https`, host `127.0.0.1`, `::1` or `localhost`, no user
+   info). Any other URL is refused like an unreachable dashboard (audit mode:
+   the local fallback with a warning; enforce mode: exit 5), because the request
+   carries the dashboard token.
+
+3. **A scheduled task runs only while its files match the registry.** The runner
+   starts a task only if its `scheduled_task_registry` entry has the same
+   `sha256` as the task on disk. The hash covers `SKILL.md`, `task-config.json`,
+   the `preCheck` script and every other file in the task folder, recursively.
+   A log, backup or note written into the task folder changes the hash: the
+   next run is skipped with `hash-mismatch`, the folder is left as it is, and
+   the log warns once per task and hash. A task folder with more than 500
+   entries or more than 16 MiB has no hash and never runs. A task folder created
+   by hand (not through the dashboard API) is `unregistered` and does not run.
+   On the first start after the update, a one-time backfill registers every
+   task already on disk. Forward: keep logs and outputs outside the task folder;
+   after a reviewed hand edit, check `node dist/web/schedule-registry-cli.js status`
+   and accept the task's current files with its `register <name>` command. See
+   `docs/scheduled-tasks.md`.
+
+4. **Approving takes the owner's dashboard login.** `PATCH /api/approvals/:id`
+   with `status: approved`, and `POST /api/approvals` with
+   `owner_approved_message_id`, answer 403 for the shared dashboard token and
+   for a device key, whatever its scope. Rejecting and timing out still work
+   with the token. The token alone approves only on an install where no
+   dashboard login exists yet. So an integration that approved with the shared
+   token breaks, and an approval can no longer be closed by a chat reply
+   (`YES <id>` / `IGEN <id>`) relayed by the agent: the owner approves in the
+   dashboard. See `docs/security-hardening.md`.
+
+5. **Deleting a memory needs an approval.** With `data_delete` below level 3
+   (a missing config or key reads as level 1), `DELETE /api/memories/:id`
+   answers 409 `approval_required` with an `approval_id`, and the server files
+   the approval itself. The delete runs only with `?approval_id=<id>` of an
+   approved, unused approval bound to that memory in its current content; an
+   edit after the approval voids it. Before the update the delete ran at once.
+
+6. **Generated and imported skills wait for the owner.** `POST /api/skills`,
+   `POST /api/skills/import` and the per-agent routes write to
+   `store/skills-pending/<id>/` and answer `{ ok: true, name, pending: true, id }`
+   (import: `imported` plus `pending: true, ids`). `ok: true` no longer means
+   the skill is live. `POST /api/skills/pending/:id/approve` and `.../reject`
+   take the owner's dashboard login; the shared token works only before a login
+   exists, and a device key does not.
+
+7. **A suspicious message is flagged in its sender line.** An untrusted or
+   federated inter-agent message that matches a prompt-injection rule
+   (`src/skill-scan.ts`) gets `[!INJEKCIO-GYANU: <rules> ...]` after the
+   freshness label. A message longer than 262,144 characters (UTF-16 units)
+   with no match in the scanned part gets `[!INJEKCIO-VIZSGALAT: ...]` instead.
+   The content is still delivered. A parser that reads the sender line strictly
+   must allow these labels.
+
+8. **The Bash egress parser denies a `while IFS= read` loop that runs `$var`.**
+   The parser hook that runs on every sub-agent denies a command word that
+   starts with `$` when the command sets `IFS=` anywhere, so
+   `while IFS= read -r line; do $c "$line"; done < list` is denied as a network
+   call (rule `ifs-expanded-command`). A fix is open in #2298 and not ready yet.
+   Until then, name the command literally in the loop instead of `$c` (for
+   example `echo "$line"`); that passes the gate. Also new: `BASH_EGRESS_HOST_ALLOW` (default off). Off, `curl https://`
+   and `wget` stay denied on every agent as before; on, the parser judges them
+   by host (localhost, the local network and `store/egress-vendor-hosts.json`
+   pass). See `docs/bash-sandbox.md`.

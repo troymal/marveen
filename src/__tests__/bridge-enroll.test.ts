@@ -43,6 +43,13 @@ const HOST_KEY_B64 = Buffer.concat([
 
 let sshDir: string
 
+// The per-worker scratch seam installed by
+// src/__tests__/setup/default-ssh-dir-seam.ts. afterEach RESTORES this instead
+// of deleting the variable: a bare `delete` dropped the suite-wide default for
+// every later test in the worker, which would have re-opened the ENROLL813 hole
+// one test after the setup file closed it.
+const SUITE_DEFAULT_SSH_DIR = process.env.MARVEEN_SSH_DIR
+
 function testDeps(overrides: Partial<BridgeEnrollDeps> = {}): BridgeEnrollDeps {
   return {
     sshDir,
@@ -64,6 +71,12 @@ beforeAll(() => {
 
 beforeEach(() => {
   sshDir = mkdtempSync(join(tmpdir(), 'bridge-enroll-test-'))
+  // ENROLL813: point the seam at THIS test's scratch dir up front. Several
+  // cases below drive the HTTP routes, which call bridgeEnroll() with no deps
+  // and so resolve the ssh dir themselves -- previously homedir()/.ssh, i.e.
+  // the operator's real authorized_keys. Individual tests used to set this
+  // AFTER the first such case had already run.
+  process.env.MARVEEN_SSH_DIR = sshDir
   _clearDeviceKeyCacheForTest()
   getDb().prepare('DELETE FROM device_keys').run()
   getDb().prepare('DELETE FROM config_change_log').run()
@@ -71,7 +84,8 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(sshDir, { recursive: true, force: true })
-  delete process.env.MARVEEN_SSH_DIR
+  if (SUITE_DEFAULT_SSH_DIR === undefined) delete process.env.MARVEEN_SSH_DIR
+  else process.env.MARVEEN_SSH_DIR = SUITE_DEFAULT_SSH_DIR
 })
 
 describe('bridgeEnroll', () => {
@@ -214,10 +228,12 @@ describe('POST /api/security/bridge-enroll (HTTP)', () => {
     expect(listDeviceKeys()).toHaveLength(0)
   })
 
+  // OWNERGATE4-1104: the caller below is the owner's session; the bare token pairs only the FIRST device of an install
+  // with no login (owner-gate-first-run.test.ts), and these tests enroll and revoke repeatedly.
   it('400s on a missing name or invalid key line without side effects', async () => {
-    const bad1 = await call(tryHandleSecurity, 'POST', '/api/security/bridge-enroll', { auth: { kind: 'token' }, body: { key_line: makeKeyLine().line, name: '' } })
+    const bad1 = await call(tryHandleSecurity, 'POST', '/api/security/bridge-enroll', { auth: { kind: 'session', user: 'owner' }, body: { key_line: makeKeyLine().line, name: '' } })
     expect(bad1.statusCode).toBe(400)
-    const bad2 = await call(tryHandleSecurity, 'POST', '/api/security/bridge-enroll', { auth: { kind: 'token' }, body: { key_line: 'not a key', name: 'ok name' } })
+    const bad2 = await call(tryHandleSecurity, 'POST', '/api/security/bridge-enroll', { auth: { kind: 'session', user: 'owner' }, body: { key_line: 'not a key', name: 'ok name' } })
     expect(bad2.statusCode).toBe(400)
     expect(listDeviceKeys()).toHaveLength(0)
   })
@@ -230,7 +246,7 @@ describe('POST /api/security/bridge-enroll (HTTP)', () => {
     // would be worse than the original bug.
     const { line } = makeKeyLine()
     const r = await call(tryHandleSecurity, 'POST', '/api/security/bridge-enroll', {
-      auth: { kind: 'token' },
+      auth: { kind: 'session', user: 'owner' },
       body: { key_line: line, name: 'Route Phone', host: 'jaequas2605@gmail.com' },
     })
     expect(r.statusCode).toBe(400)
@@ -240,11 +256,32 @@ describe('POST /api/security/bridge-enroll (HTTP)', () => {
     // Positive control on the same route: a well-formed address must NOT be
     // refused by this check. Without it a validator that rejects everything
     // would pass the assertion above and quietly break every pairing.
+    //
+    // ENROLL813 -- this branch is also where 62 real keys came from. It drives
+    // the route with a VALID tailnet address, so enrollment actually runs; until
+    // beforeEach set the seam it ran against the operator's own ~/.ssh. And the
+    // single assertion below used to be the whole control, which is why nobody
+    // noticed: `not.toMatch(/Invalid host/)` is satisfied by a SUCCESSFUL
+    // enrollment exactly as well as by the refusal it meant to rule out. A
+    // control that passes on both outcomes is not a control, so the success and
+    // failure cases are now told apart explicitly.
     const ok = await call(tryHandleSecurity, 'POST', '/api/security/bridge-enroll', {
-      auth: { kind: 'token' },
+      auth: { kind: 'session', user: 'owner' },
       body: { key_line: line, name: 'Route Phone', host: '100.124.123.12' },
     })
     expect(String(ok.json().error ?? '')).not.toMatch(/Invalid host/)
+    if (ok.statusCode === 201) {
+      // Past host validation and enrolled -- into the seam directory, which is
+      // the point: the line exists HERE and not in anyone's real home.
+      expect(authKeysContent()).toContain('marveen-remote:')
+    } else {
+      // The only other outcome a host may legitimately produce is the documented
+      // hard fail when no ssh-ed25519 host key can be obtained (the same branch
+      // the seam test below tolerates). Any other status means this well-formed
+      // address was refused after all -- which is what this control exists to catch.
+      expect(ok.statusCode).toBe(400)
+      expect(String(ok.json().error ?? '')).toMatch(/host key/i)
+    }
   })
 
   it('enrolls end-to-end over the route (MARVEEN_SSH_DIR seam) and audits', async () => {
@@ -253,7 +290,7 @@ describe('POST /api/security/bridge-enroll (HTTP)', () => {
     // a host-key file candidate instead: point readFile via a real file the
     // resolver checks -- not injectable here, so accept either outcome:
     const { line, installId } = makeKeyLine()
-    const r = await call(tryHandleSecurity, 'POST', '/api/security/bridge-enroll', { auth: { kind: 'token' }, body: { key_line: line, name: 'Route Phone' } })
+    const r = await call(tryHandleSecurity, 'POST', '/api/security/bridge-enroll', { auth: { kind: 'session', user: 'owner' }, body: { key_line: line, name: 'Route Phone' } })
     if (r.statusCode === 400) {
       // No host key obtainable in this environment -- the documented hard-fail
       // path; assert it stayed side-effect-free.
@@ -277,7 +314,7 @@ describe('DELETE /api/auth/device-keys/:id for a paired key', () => {
     // (file deleted out-of-band), so removal cannot succeed.
     rmSync(join(sshDir, 'authorized_keys'), { force: true })
     process.env.MARVEEN_SSH_DIR = sshDir
-    const r = await call(tryHandleAuth, 'DELETE', `/api/auth/device-keys/${outcome.deviceKeyId}`, { auth: { kind: 'token' } })
+    const r = await call(tryHandleAuth, 'DELETE', `/api/auth/device-keys/${outcome.deviceKeyId}`, { auth: { kind: 'session', user: 'owner' } })
     expect(r.statusCode).toBe(200)
     // The key itself is revoked (dead) even though the ssh half failed...
     expect(listDeviceKeys()).toHaveLength(0)
@@ -292,7 +329,7 @@ describe('DELETE /api/auth/device-keys/:id for a paired key', () => {
     const { line, installId } = makeKeyLine()
     const outcome = await bridgeEnroll({ keyLine: line, name: 'Pair' }, testDeps())
     process.env.MARVEEN_SSH_DIR = sshDir
-    const r = await call(tryHandleAuth, 'DELETE', `/api/auth/device-keys/${outcome.deviceKeyId}`, { auth: { kind: 'token' } })
+    const r = await call(tryHandleAuth, 'DELETE', `/api/auth/device-keys/${outcome.deviceKeyId}`, { auth: { kind: 'session', user: 'owner' } })
     expect(r.statusCode).toBe(200)
     expect(r.json().ssh_removed).toBe(true)
     expect(authKeysContent()).toBe('')
