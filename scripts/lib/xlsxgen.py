@@ -8,9 +8,19 @@ def colname(i):
         s=chr(65+i%26)+s; i=i//26-1
     return s
 
+class Formula(str):
+    """Elo Excel-keplet. Hasznalat: F('=B2*B3') vagy F('B2*B3') -- a '=' elhagyhato.
+    A fajl fullCalcOnLoad-dal nyilik, tehat az Excel megnyitaskor kiszamolja."""
+    pass
+
+def F(expr):
+    return Formula(expr[1:] if expr.startswith('=') else expr)
+
 def cell(r,c,v,style=0):
     ref=f'{colname(c)}{r}'
     s=f' s="{style}"' if style else ''
+    if isinstance(v,Formula):
+        return f'<c r="{ref}"{s}><f>{escape(str(v))}</f></c>'
     if isinstance(v,(int,float)) and not isinstance(v,bool):
         return f'<c r="{ref}"{s}><v>{v}</v></c>'
     if v is None or v=='':
@@ -83,7 +93,7 @@ def write_xlsx(path, sheets):
     wb='<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>'
     for i,(nm,_,_,_) in enumerate(sheets):
         wb+=f'<sheet name="{escape(nm)}" sheetId="{i+1}" r:id="rId{i+1}"/>'
-    wb+='</sheets></workbook>'
+    wb+='</sheets><calcPr calcId="124519" fullCalcOnLoad="1"/></workbook>'
     wbr='<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
     for i in range(n):
         wbr+=f'<Relationship Id="rId{i+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i+1}.xml"/>'
